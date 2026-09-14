@@ -1,0 +1,4 @@
+# Generated protobuf code
+/gen/
+/sdk/src/lutra/_gen/
+/console/src/proto/
