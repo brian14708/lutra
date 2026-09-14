@@ -24,6 +24,8 @@
         {
           devShells.default = pkgs.mkShell {
             packages = with pkgs; [
+              nodejs_26
+              pnpm
               go_1_27
               just
             ];

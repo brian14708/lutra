@@ -1,20 +1,29 @@
 set shell := ["bash", "-eu", "-o", "pipefail", "-c"]
 
+default: test lint
+
+build: generate
+    pnpm --filter @lutra/console build
+
 generate:
     go tool buf generate
 
 fmt:
     go tool golangci-lint fmt
     uv run ruff format
+    pnpm format
 
 lint: generate
     go tool buf lint
-    go tool golangci-lint run ./...
+    go tool golangci-lint run
     uv run ruff check
     uv run --all-packages --directory sdk pyrefly check
+    pnpm --filter @lutra/console lint
 
 test:
     go test ./...
     uv run --package lutra pytest
 
-check: fmt lint test
+init:
+    uv sync
+    pnpm install

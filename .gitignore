@@ -1,11 +1,12 @@
-.venv/
 __pycache__/
 *.py[cod]
-.pytest_cache/
-.ruff_cache/
-.mypy_cache/
-.basedpyright/
-.basedmypy_cache/
+node_modules/
+/.venv/
+/.pytest_cache/
+/.ruff_cache/
+/console/.output/
+/console/dist/
+/console/file-routes.d.ts
 
 # Generated protobuf code
 /gen/

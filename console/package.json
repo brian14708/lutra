@@ -1,0 +1,36 @@
+{
+  "name": "@lutra/console",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "vite",
+    "dev": "vite",
+    "build": "vite build",
+    "serve": "vite preview",
+    "lint": "oxlint src",
+    "format": "oxfmt"
+  },
+  "dependencies": {
+    "@bufbuild/protobuf": "^2.15.0",
+    "@connectrpc/connect": "^2.2.0",
+    "@connectrpc/connect-web": "^2.2.0",
+    "@kobalte/core": "2.0.0-alpha.2",
+    "@solidjs/meta": "^1.0.0-next.2",
+    "@solidjs/router": "^2.0.0-next.24",
+    "@solidjs/web": "^2.0.0-rc.8",
+    "solid-js": "^2.0.0-rc.8"
+  },
+  "devDependencies": {
+    "@bufbuild/protoc-gen-es": "^2.15.0",
+    "@solidjs/diagnostics": "^2.0.0-rc.8",
+    "@solidjs/vite-plugin": "^3.0.0-next.43",
+    "@tailwindcss/vite": "^4.3.3",
+    "eslint-plugin-solid": "~0.18.0",
+    "filesystem-routing": "0.3.1",
+    "oxfmt": "^0.68.0",
+    "oxlint": "~1.83.0",
+    "tailwindcss": "^4.3.3",
+    "typescript": "^7.0.2",
+    "vite": "^8.3.0"
+  }
+}

@@ -18,3 +18,8 @@ plugins:
     out: sdk/src/lutra/_gen
     opt:
       - io=async
+  - local: [pnpm, --filter, "@lutra/console", exec, protoc-gen-es]
+    out: console/src/proto
+    include_imports: true
+    opt:
+      - target=ts

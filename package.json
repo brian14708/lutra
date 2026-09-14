@@ -1,0 +1,12 @@
+{
+  "name": "@lutra/workspace",
+  "private": true,
+  "scripts": {
+    "dev": "pnpm --filter @lutra/console dev",
+    "build": "pnpm --filter @lutra/console build",
+    "lint": "pnpm --filter @lutra/console lint",
+    "format": "pnpm --filter @lutra/console format",
+    "start": "pnpm --filter @lutra/console start"
+  },
+  "packageManager": "pnpm@12.4.1"
+}

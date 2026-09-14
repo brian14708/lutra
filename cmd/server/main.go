@@ -18,6 +18,7 @@ import (
 	"connectrpc.com/validate"
 	lutrav1connect "github.com/brian14708/lutra/gen/lutra/v1/lutrav1connect"
 	"github.com/brian14708/lutra/internal/lutra"
+	"github.com/brian14708/lutra/internal/lutra/web"
 )
 
 func main() {
@@ -35,11 +36,11 @@ func main() {
 	interceptors := connect.WithInterceptors(otelInterceptor)
 
 	mux := http.NewServeMux()
-	path, handler := lutrav1connect.NewLutraServiceHandler(
+	_, handler := lutrav1connect.NewLutraServiceHandler(
 		lutra.Service{},
 		connect.WithInterceptors(otelInterceptor, validate.NewInterceptor()),
 	)
-	mux.Handle(path, handler)
+	mux.Handle("/rpc/", http.StripPrefix("/rpc", handler))
 	healthPath, healthHandler := grpchealth.NewHandler(
 		grpchealth.NewStaticChecker(lutrav1connect.LutraServiceName),
 		interceptors,
@@ -50,6 +51,15 @@ func main() {
 	mux.Handle(reflectionPath, reflectionHandler)
 	reflectionAlphaPath, reflectionAlphaHandler := grpcreflect.NewHandlerV1Alpha(reflector, interceptors)
 	mux.Handle(reflectionAlphaPath, reflectionAlphaHandler)
+	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	})
+	// Serve the SPA build when LUTRA_CONSOLE_DIR points at it.
+	if consoleDir := os.Getenv("LUTRA_CONSOLE_DIR"); consoleDir != "" {
+		if info, err := os.Stat(consoleDir); err == nil && info.IsDir() {
+			mux.Handle("/", web.New(os.DirFS(consoleDir)))
+		}
+	}
 
 	server := &http.Server{Addr: addr, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
 	serverErr := make(chan error, 1)
