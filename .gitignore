@@ -1,14 +1,16 @@
 __pycache__/
 *.py[cod]
 node_modules/
+/.data/
 /.venv/
 /.pytest_cache/
 /.ruff_cache/
+
+# Generated files
+/sdk/src/lutra/_gen/
+/gen/
 /console/.output/
 /console/dist/
 /console/file-routes.d.ts
-
-# Generated protobuf code
-/gen/
-/sdk/src/lutra/_gen/
 /console/src/proto/
+/internal/db/*.sql.go

@@ -17,12 +17,17 @@ import (
 	"connectrpc.com/otelconnect"
 	"connectrpc.com/validate"
 	lutrav1connect "github.com/brian14708/lutra/gen/lutra/v1/lutrav1connect"
+	"github.com/brian14708/lutra/internal/db"
 	"github.com/brian14708/lutra/internal/lutra"
 	"github.com/brian14708/lutra/internal/lutra/web"
 )
 
 func main() {
 	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+	if err := db.Run(); err != nil {
+		logger.Error("database migration failed", "error", err)
+		os.Exit(1)
+	}
 	addr := os.Getenv("LUTRA_ADDR")
 	if addr == "" {
 		addr = ":8080"
@@ -36,24 +41,23 @@ func main() {
 	interceptors := connect.WithInterceptors(otelInterceptor)
 
 	mux := http.NewServeMux()
-	_, handler := lutrav1connect.NewLutraServiceHandler(
+	rpcMux := http.NewServeMux()
+	servicePath, serviceHandler := lutrav1connect.NewLutraServiceHandler(
 		lutra.Service{},
 		connect.WithInterceptors(otelInterceptor, validate.NewInterceptor()),
 	)
-	mux.Handle("/rpc/", http.StripPrefix("/rpc", handler))
+	rpcMux.Handle(servicePath, serviceHandler)
 	healthPath, healthHandler := grpchealth.NewHandler(
 		grpchealth.NewStaticChecker(lutrav1connect.LutraServiceName),
 		interceptors,
 	)
-	mux.Handle(healthPath, healthHandler)
+	rpcMux.Handle(healthPath, healthHandler)
 	reflector := grpcreflect.NewStaticReflector(lutrav1connect.LutraServiceName)
 	reflectionPath, reflectionHandler := grpcreflect.NewHandlerV1(reflector, interceptors)
-	mux.Handle(reflectionPath, reflectionHandler)
+	rpcMux.Handle(reflectionPath, reflectionHandler)
 	reflectionAlphaPath, reflectionAlphaHandler := grpcreflect.NewHandlerV1Alpha(reflector, interceptors)
-	mux.Handle(reflectionAlphaPath, reflectionAlphaHandler)
-	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusNoContent)
-	})
+	rpcMux.Handle(reflectionAlphaPath, reflectionAlphaHandler)
+	mux.Handle("/rpc/", http.StripPrefix("/rpc", rpcMux))
 	// Serve the SPA build when LUTRA_CONSOLE_DIR points at it.
 	if consoleDir := os.Getenv("LUTRA_CONSOLE_DIR"); consoleDir != "" {
 		if info, err := os.Stat(consoleDir); err == nil && info.IsDir() {

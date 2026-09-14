@@ -5,15 +5,16 @@ default: test lint
 build: generate
     pnpm --filter @lutra/console build
 
-generate:
+generate: init
     go tool buf generate
+    go tool sqlc generate
 
 fmt:
     go tool golangci-lint fmt
     uv run ruff format
     pnpm format
 
-lint: generate
+lint:
     go tool buf lint
     go tool golangci-lint run
     uv run ruff check
