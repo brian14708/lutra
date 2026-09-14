@@ -1,3 +1,12 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.basedpyright/
+.basedmypy_cache/
+
 # Generated protobuf code
 /gen/
 /sdk/src/lutra/_gen/

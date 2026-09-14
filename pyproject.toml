@@ -1,0 +1,47 @@
+[tool.uv.workspace]
+members = ["sdk"]
+
+[dependency-groups]
+dev = [
+  "protoc-gen-connectrpc>=0.12.1",
+  "protoc-gen-py>=0.4.0",
+  "pyrefly>=0.43.0",
+  "ruff>=0.9.0",
+]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+preview = true
+extend-exclude = ["sdk/src/lutra/_gen"]
+
+[tool.ruff.lint]
+select = ["ALL"]
+ignore = [
+  "missing-trailing-comma",
+  "missing-copyright-notice",
+  "D",
+  "assert",
+]
+extend-safe-fixes = ["TC", "unused-import"]
+
+[tool.ruff.lint.isort]
+extra-standard-library = ["typing_extensions"]
+split-on-trailing-comma = false
+
+[tool.ruff.lint.flake8-type-checking]
+runtime-evaluated-base-classes = ["typing_extensions.TypedDict"]
+exempt-modules = ["typing", "typing_extensions"]
+
+[tool.ruff.lint.flake8-tidy-imports]
+ban-relative-imports = "all"
+
+[tool.ruff.lint.flake8-tidy-imports.banned-api]
+"typing.TypedDict" = { msg = "Use typing_extensions.TypedDict instead." }
+"typing_extensions.AsyncContextManager" = { msg = "Use contextlib.AbstractAsyncContextManager instead." }
+"typing_extensions.AsyncGenerator" = { msg = "Use collections.abc.AsyncGenerator instead." }
+
+[tool.ruff.format]
+preview = true
+docstring-code-format = true
+skip-magic-trailing-comma = true

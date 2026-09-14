@@ -1,0 +1,36 @@
+[project]
+name = "lutra"
+version = "0.1.0"
+description = "Python client SDK for the Lutra API."
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Lutra contributors" }]
+dependencies = [
+    "connectrpc>=0.12.0,<0.13.0",
+]
+
+[dependency-groups]
+dev = [
+  "pytest>=8.0.0",
+  "pytest-asyncio>=0.24.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/lutra"]
+
+[tool.pytest.ini_options]
+addopts = ["-ra"]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.pyrefly]
+project-includes = ["src", "tests"]
+project-excludes = ["src/lutra/_gen"]
+python-version = "3.11"
+search-path = ["src"]
+preset = "strict"

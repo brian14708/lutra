@@ -9,3 +9,12 @@ plugins:
     out: gen
     opt:
       - paths=source_relative
+  - local: [uv, run, protoc-gen-py]
+    out: sdk/src/lutra/_gen
+    include_imports: true
+    opt:
+      - init_files=true
+  - local: [uv, run, protoc-gen-connectrpc]
+    out: sdk/src/lutra/_gen
+    opt:
+      - io=async
