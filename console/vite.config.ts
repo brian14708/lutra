@@ -11,14 +11,14 @@ export default defineConfig({
   plugins: [
     // `extensions` makes @solidjs/vite-plugin also compile the `?pick=` route
     // modules the fileRoutes plugin emits (their ids end in a query string).
-    solid({ start: { devtools: false }, extensions: [".jsx", ".tsx"], diagnostics: true }), // add `ssr: true` for streaming SSR
+    solid({ start: true, extensions: [".jsx", ".tsx"], diagnostics: true }), // add `ssr: true` when server-side auth is available
     tailwindcss(),
     fileRoutes({ types: true }),
   ],
   server: {
     port: 3000,
     proxy: {
-      "/rpc": {
+      "/api": {
         target: "http://localhost:8080",
         changeOrigin: true,
       },

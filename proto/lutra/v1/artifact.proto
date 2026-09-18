@@ -1,0 +1,118 @@
+syntax = "proto3";
+
+package lutra.v1;
+
+import "buf/validate/validate.proto";
+import "google/protobuf/timestamp.proto";
+
+option go_package = "github.com/brian14708/lutra/gen/lutra/v1;lutrav1";
+
+service ArtifactService {
+  rpc CreateArtifact(CreateArtifactRequest) returns (CreateArtifactResponse);
+  rpc AllocateChunk(AllocateChunkRequest) returns (AllocateChunkResponse);
+  rpc CompleteChunk(CompleteChunkRequest) returns (CompleteChunkResponse);
+  rpc SealArtifact(SealArtifactRequest) returns (SealArtifactResponse);
+  rpc DownloadArtifact(DownloadArtifactRequest) returns (DownloadArtifactResponse);
+}
+
+enum ArtifactState {
+  ARTIFACT_STATE_UNSPECIFIED = 0;
+  ARTIFACT_STATE_ALLOCATED = 1;
+  ARTIFACT_STATE_SEALED = 2;
+}
+
+message Artifact {
+  string project_id = 1 [(buf.validate.field).string.uuid = true];
+  string artifact_id = 2 [(buf.validate.field).string.uuid = true];
+  ArtifactState state = 3;
+  google.protobuf.Timestamp create_time = 4;
+  google.protobuf.Timestamp seal_time = 5;
+  // RFC 2046 media type for the artifact payload, when known.
+  string mime_type = 6 [(buf.validate.field).string.max_len = 255];
+  string digest = 7 [(buf.validate.field).string.pattern = "^[a-z0-9-]+:[0-9a-f]+$"];
+}
+
+message ArtifactChunk {
+  string artifact_id = 1 [(buf.validate.field).string.uuid = true];
+  // Chunk indexes are ordered append positions, starting at zero.
+  uint32 chunk_index = 2;
+  uint64 size_bytes = 3;
+  string digest = 4 [(buf.validate.field).string.pattern = "^[a-z0-9-]+:[0-9a-f]+$"];
+  ArtifactChunkState state = 5;
+  google.protobuf.Timestamp complete_time = 6;
+  // Only the latest allocation's upload ID is valid.
+  string upload_id = 7 [(buf.validate.field).string.uuid = true];
+}
+
+enum ArtifactChunkState {
+  ARTIFACT_CHUNK_STATE_UNSPECIFIED = 0;
+  ARTIFACT_CHUNK_STATE_ALLOCATED = 1;
+  ARTIFACT_CHUNK_STATE_COMPLETED = 2;
+}
+
+message CreateArtifactRequest {
+  string project_id = 1 [(buf.validate.field).string.uuid = true];
+  // Artifact IDs are allocated by the service and are never reused.
+  string mime_type = 2 [(buf.validate.field).string.max_len = 255];
+}
+
+message CreateArtifactResponse {
+  Artifact artifact = 1;
+}
+
+// While the artifact is unsealed, a new allocation for the same chunk index
+// replaces its size, hash, and upload intent.
+message AllocateChunkRequest {
+  string project_id = 1 [(buf.validate.field).string.uuid = true];
+  string artifact_id = 2 [(buf.validate.field).string.uuid = true];
+  uint32 chunk_index = 3;
+  uint64 size_bytes = 4;
+  string digest = 5 [(buf.validate.field).string.pattern = "^[a-z0-9-]+:[0-9a-f]+$"];
+}
+
+message AllocateChunkResponse {
+  ArtifactChunk chunk = 1;
+  string upload_url = 2 [(buf.validate.field).string.uri = true];
+  map<string, string> upload_headers = 3;
+  google.protobuf.Timestamp upload_expires_at = 4;
+}
+
+message CompleteChunkRequest {
+  string project_id = 1 [(buf.validate.field).string.uuid = true];
+  string artifact_id = 2 [(buf.validate.field).string.uuid = true];
+  uint32 chunk_index = 3;
+  string upload_id = 4 [(buf.validate.field).string.uuid = true];
+}
+
+message CompleteChunkResponse {
+  ArtifactChunk chunk = 1;
+}
+
+message SealArtifactRequest {
+  string project_id = 1 [(buf.validate.field).string.uuid = true];
+  string artifact_id = 2 [(buf.validate.field).string.uuid = true];
+  // Sealing requires every completed chunk index in [0, chunk_count).
+  uint32 chunk_count = 3;
+}
+
+message SealArtifactResponse {
+  Artifact artifact = 1;
+}
+
+message DownloadArtifactRequest {
+  string project_id = 1 [(buf.validate.field).string.uuid = true];
+  string artifact_id = 2 [(buf.validate.field).string.uuid = true];
+}
+
+message ArtifactDownloadChunk {
+  uint32 chunk_index = 1;
+  uint64 size_bytes = 2;
+  string digest = 3 [(buf.validate.field).string.pattern = "^[a-z0-9-]+:[0-9a-f]+$"];
+  string download_url = 4 [(buf.validate.field).string.uri = true];
+  google.protobuf.Timestamp download_expires_at = 5;
+}
+
+message DownloadArtifactResponse {
+  Artifact artifact = 1;
+  repeated ArtifactDownloadChunk chunks = 2;
+}

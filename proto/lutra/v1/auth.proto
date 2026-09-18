@@ -1,0 +1,138 @@
+syntax = "proto3";
+
+package lutra.v1;
+
+import "buf/validate/validate.proto";
+import "google/protobuf/timestamp.proto";
+
+option go_package = "github.com/brian14708/lutra/gen/lutra/v1;lutrav1";
+
+service AuthService {
+  rpc CreateUser(CreateUserRequest) returns (CreateUserResponse);
+  rpc ListUsers(ListUsersRequest) returns (ListUsersResponse);
+  rpc SetUserStatus(SetUserStatusRequest) returns (SetUserStatusResponse);
+  rpc LinkOIDCIdentity(LinkOIDCIdentityRequest) returns (LinkOIDCIdentityResponse);
+  rpc CreateAPIKey(CreateAPIKeyRequest) returns (CreateAPIKeyResponse);
+  rpc ListAPIKeys(ListAPIKeysRequest) returns (ListAPIKeysResponse);
+  rpc RevokeAPIKey(RevokeAPIKeyRequest) returns (RevokeAPIKeyResponse);
+  rpc RotateAPIKey(RotateAPIKeyRequest) returns (RotateAPIKeyResponse);
+  rpc SetProjectRole(SetProjectRoleRequest) returns (SetProjectRoleResponse);
+}
+
+enum UserStatus {
+  USER_STATUS_UNSPECIFIED = 0;
+  USER_STATUS_ACTIVE = 1;
+  USER_STATUS_SUSPENDED = 2;
+}
+
+enum ProjectRole {
+  PROJECT_ROLE_UNSPECIFIED = 0;
+  PROJECT_ROLE_VIEWER = 1;
+  PROJECT_ROLE_DEVELOPER = 2;
+  PROJECT_ROLE_RUNNER = 3;
+  PROJECT_ROLE_OPERATOR = 4;
+  PROJECT_ROLE_ADMIN = 5;
+}
+
+message User {
+  string user_id = 1 [(buf.validate.field).string.uuid = true];
+  string display_name = 2 [(buf.validate.field).string = {
+    min_len: 1
+    max_len: 256
+  }];
+  string email = 3 [(buf.validate.field).string.max_len = 320];
+  UserStatus status = 4;
+  google.protobuf.Timestamp create_time = 5;
+  google.protobuf.Timestamp update_time = 6;
+}
+
+message APIKey {
+  string api_key_id = 1 [(buf.validate.field).string.uuid = true];
+  string user_id = 2 [(buf.validate.field).string.uuid = true];
+  string name = 3 [(buf.validate.field).string = {
+    min_len: 1
+    max_len: 256
+  }];
+  string prefix = 4 [(buf.validate.field).string.min_len = 1];
+  google.protobuf.Timestamp create_time = 5;
+  google.protobuf.Timestamp expire_time = 6;
+  google.protobuf.Timestamp revoke_time = 7;
+}
+
+message ProjectMembership {
+  string project_id = 1 [(buf.validate.field).string.uuid = true];
+  string user_id = 2 [(buf.validate.field).string.uuid = true];
+  ProjectRole role = 3;
+}
+
+message CreateUserRequest {
+  string display_name = 1 [(buf.validate.field).string = {
+    min_len: 1
+    max_len: 256
+  }];
+  string email = 2 [(buf.validate.field).string.max_len = 320];
+}
+message CreateUserResponse {
+  User user = 1;
+}
+message ListUsersRequest {}
+message ListUsersResponse {
+  repeated User users = 1;
+}
+message SetUserStatusRequest {
+  string user_id = 1 [(buf.validate.field).string.uuid = true];
+  UserStatus status = 2;
+}
+message SetUserStatusResponse {
+  User user = 1;
+}
+
+message LinkOIDCIdentityRequest {
+  string issuer = 1 [(buf.validate.field).string.uri = true];
+  string subject = 2 [(buf.validate.field).string.min_len = 1];
+  string user_id = 3 [(buf.validate.field).string.uuid = true];
+}
+message LinkOIDCIdentityResponse {
+  User user = 1;
+}
+
+message CreateAPIKeyRequest {
+  string user_id = 1 [(buf.validate.field).string.uuid = true];
+  string name = 2 [(buf.validate.field).string = {
+    min_len: 1
+    max_len: 256
+  }];
+  google.protobuf.Timestamp expire_time = 3;
+}
+message CreateAPIKeyResponse {
+  APIKey api_key = 1;
+  string secret = 2;
+}
+message ListAPIKeysRequest {
+  string user_id = 1 [(buf.validate.field).string.uuid = true];
+}
+message ListAPIKeysResponse {
+  repeated APIKey api_keys = 1;
+}
+message RevokeAPIKeyRequest {
+  string api_key_id = 1 [(buf.validate.field).string.uuid = true];
+}
+message RevokeAPIKeyResponse {
+  APIKey api_key = 1;
+}
+message RotateAPIKeyRequest {
+  string api_key_id = 1 [(buf.validate.field).string.uuid = true];
+}
+message RotateAPIKeyResponse {
+  APIKey api_key = 1;
+  string secret = 2;
+}
+
+message SetProjectRoleRequest {
+  string project_id = 1 [(buf.validate.field).string.uuid = true];
+  string user_id = 2 [(buf.validate.field).string.uuid = true];
+  ProjectRole role = 3;
+}
+message SetProjectRoleResponse {
+  ProjectMembership membership = 1;
+}

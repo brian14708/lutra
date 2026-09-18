@@ -1,15 +1,25 @@
 @import "tailwindcss";
 
-.logo {
-  animation: logo-spin infinite 20s linear;
-  pointer-events: none;
+:root {
+  color-scheme: light dark;
+  font-family: "DM Sans", "Inter", ui-sans-serif, system-ui, sans-serif;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
 }
 
-@keyframes logo-spin {
-  from {
-    transform: rotate(0deg);
+body {
+  min-width: 320px;
+  margin: 0;
+  background: #f8fafc;
+}
+
+@media (prefers-color-scheme: dark) {
+  body {
+    background: #020617;
   }
-  to {
-    transform: rotate(360deg);
-  }
+}
+
+button,
+input {
+  font: inherit;
 }

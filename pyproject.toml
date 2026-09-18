@@ -25,6 +25,13 @@ ignore = [
 ]
 extend-safe-fixes = ["TC", "unused-import"]
 
+[tool.ruff.lint.per-file-ignores]
+"sdk/src/lutra/client.py" = ["global-statement"]
+"sdk/src/lutra/task.py" = ["builtin-variable-shadowing"]
+"sdk/src/lutra/_runtime.py" = ["blind-except"]
+"sdk/src/lutra/__init__.py" = ["builtin-import-shadowing"]
+"sdk/examples/*.py" = ["print"]
+
 [tool.ruff.lint.isort]
 extra-standard-library = ["typing_extensions"]
 split-on-trailing-comma = false

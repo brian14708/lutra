@@ -7,6 +7,11 @@ license = { text = "MIT" }
 authors = [{ name = "Lutra contributors" }]
 dependencies = [
     "connectrpc>=0.12.0,<0.13.0",
+    "connectrpc-otel>=0.2.0,<0.3.0",
+    "opentelemetry-api>=1.44.0,<2.0.0",
+    "opentelemetry-exporter-otlp-proto-http>=1.44.0,<2.0.0",
+    "opentelemetry-sdk>=1.44.0,<2.0.0",
+    "pyqwest>=0.10.0,<0.11.0",
 ]
 
 [dependency-groups]
@@ -34,3 +39,4 @@ project-excludes = ["src/lutra/_gen"]
 python-version = "3.11"
 search-path = ["src"]
 preset = "strict"
+errors = { explicit-any = "error" }

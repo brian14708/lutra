@@ -11,11 +11,13 @@ generate: init
 
 fmt:
     go tool golangci-lint fmt
+    go tool sqlc fmt
     uv run ruff format
     pnpm format
 
 lint:
     go tool buf lint
+    go tool sqlc vet
     go tool golangci-lint run
     uv run ruff check
     uv run --all-packages --directory sdk pyrefly check

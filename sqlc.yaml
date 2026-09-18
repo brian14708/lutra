@@ -1,11 +1,40 @@
 version: "2"
 
+rules:
+  - name: no-delete
+    message: "don't use DELETE statements; use soft-delete (status, revoke_time, etc.) instead"
+    rule: |
+      query.sql.matches("(?i)\\bDELETE\\b")
+  - name: update-must-have-where
+    message: "UPDATE statements must have a WHERE clause"
+    rule: |
+      query.sql.matches("(?im)^\\s*UPDATE\\s") && !query.sql.matches("(?i)\\bWHERE\\b")
+  - name: no-select-star
+    message: "don't use SELECT *; list columns explicitly"
+    rule: |
+      query.sql.matches("(?i)\\bSELECT\\s+\\*") || query.sql.matches("\\b[a-zA-Z_][a-zA-Z0-9_]*\\.\\*")
+
 sql:
   - engine: "postgresql"
     schema: "db/migrations"
     queries: "db/queries"
+    rules:
+      - no-delete
+      - update-must-have-where
+      - no-select-star
     gen:
       go:
         package: "db"
         out: "internal/db"
         sql_package: "pgx/v5"
+        overrides:
+          - db_type: "uuid"
+            nullable: true
+            go_type:
+              import: "uuid"
+              type: "UUID"
+              pointer: true
+          - db_type: "uuid"
+            go_type:
+              import: "uuid"
+              type: "UUID"

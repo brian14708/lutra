@@ -2,6 +2,7 @@
 package s3
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net/url"
@@ -66,25 +67,45 @@ func NewFromEnv() (*minio.Client, Config, error) {
 	return client, config, nil
 }
 
+// EnsureBucket creates the configured bucket when it does not exist. It is
+// safe for multiple server replicas to call this concurrently.
+func EnsureBucket(ctx context.Context, client *minio.Client, config Config) error {
+	exists, err := client.BucketExists(ctx, config.Bucket)
+	if err != nil {
+		return fmt.Errorf("check object bucket %q: %w", config.Bucket, err)
+	}
+	if exists {
+		return nil
+	}
+	if err := client.MakeBucket(ctx, config.Bucket, minio.MakeBucketOptions{Region: config.Region}); err != nil {
+		response := minio.ToErrorResponse(err)
+		if response.Code == "BucketAlreadyExists" || response.Code == "BucketAlreadyOwnedByYou" {
+			return nil
+		}
+		return fmt.Errorf("create object bucket %q: %w", config.Bucket, err)
+	}
+	return nil
+}
+
 // New creates an S3-compatible client from explicit settings.
 func New(config Config) (*minio.Client, error) {
 	endpoint := config.Endpoint
-	if parsed, err := url.Parse(endpoint); err == nil && parsed.Host != "" {
-		if parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" || (parsed.Path != "" && parsed.Path != "/") {
-			return nil, fmt.Errorf("invalid S3 endpoint %q", endpoint)
-		}
-		switch parsed.Scheme {
-		case "https":
-			config.Secure = true
-		case "http":
-			config.Secure = false
-		default:
-			return nil, fmt.Errorf("invalid S3 endpoint scheme in %q", endpoint)
-		}
-		endpoint = parsed.Host
-	} else {
+	parsed, err := url.Parse(endpoint)
+	if err != nil || parsed.Host == "" {
 		return nil, fmt.Errorf("invalid S3 endpoint %q", endpoint)
 	}
+	if parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" || (parsed.Path != "" && parsed.Path != "/") {
+		return nil, fmt.Errorf("invalid S3 endpoint %q", endpoint)
+	}
+	switch parsed.Scheme {
+	case "https":
+		config.Secure = true
+	case "http":
+		config.Secure = false
+	default:
+		return nil, fmt.Errorf("invalid S3 endpoint scheme in %q", endpoint)
+	}
+	endpoint = parsed.Host
 	endpoint = strings.TrimSuffix(endpoint, "/")
 	return minio.New(endpoint, &minio.Options{
 		Creds:  credentials.NewStaticV4(config.AccessKeyID, config.SecretAccessKey, config.SessionToken),

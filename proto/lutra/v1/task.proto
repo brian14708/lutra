@@ -1,0 +1,102 @@
+syntax = "proto3";
+
+package lutra.v1;
+
+import "buf/validate/validate.proto";
+import "google/protobuf/timestamp.proto";
+
+option go_package = "github.com/brian14708/lutra/gen/lutra/v1;lutrav1";
+
+service TaskService {
+  rpc CreateTask(CreateTaskRequest) returns (CreateTaskResponse);
+  rpc GetTask(GetTaskRequest) returns (GetTaskResponse);
+  rpc ListTasks(ListTasksRequest) returns (ListTasksResponse);
+}
+
+enum TaskSlotKind {
+  TASK_SLOT_KIND_UNSPECIFIED = 0;
+  TASK_SLOT_KIND_VALUE = 1;
+  TASK_SLOT_KIND_ARTIFACT = 2;
+}
+
+message TaskSlot {
+  string name = 1 [(buf.validate.field).string = {
+    min_len: 1
+    max_len: 256
+  }];
+  TaskSlotKind kind = 2;
+  string serializer_schema_id = 3 [(buf.validate.field).string.uuid = true];
+  string serializer_version = 4 [(buf.validate.field).string.min_len = 1];
+  string serializer_configuration_digest = 5 [(buf.validate.field).string.pattern = "^[a-z0-9-]+:[0-9a-f]+$"];
+}
+
+message Task {
+  string project_id = 1 [(buf.validate.field).string.uuid = true];
+  string task_id = 2 [(buf.validate.field).string.uuid = true];
+  string name = 3 [(buf.validate.field).string = {
+    min_len: 1
+    max_len: 256
+  }];
+  string version = 4 [(buf.validate.field).string = {
+    min_len: 1
+    max_len: 256
+  }];
+  repeated string entrypoint_argv = 5 [(buf.validate.field).repeated = {
+    min_items: 1
+    items: {
+      string: {
+        min_len: 1
+        max_len: 2048
+      }
+    }
+  }];
+  string code_bundle_artifact_id = 6 [(buf.validate.field).string.uuid = true];
+  repeated TaskSlot input_slots = 8;
+  repeated TaskSlot output_slots = 9;
+  google.protobuf.Timestamp create_time = 10;
+}
+
+message CreateTaskRequest {
+  string project_id = 1 [(buf.validate.field).string.uuid = true];
+  string name = 2 [(buf.validate.field).string = {
+    min_len: 1
+    max_len: 256
+  }];
+  string version = 3 [(buf.validate.field).string = {
+    min_len: 1
+    max_len: 256
+  }];
+  repeated string entrypoint_argv = 4 [(buf.validate.field).repeated = {
+    min_items: 1
+    items: {
+      string: {
+        min_len: 1
+        max_len: 2048
+      }
+    }
+  }];
+  string code_bundle_artifact_id = 5 [(buf.validate.field).string.uuid = true];
+  repeated TaskSlot input_slots = 7;
+  repeated TaskSlot output_slots = 8;
+}
+
+message CreateTaskResponse {
+  Task task = 1;
+}
+
+message GetTaskRequest {
+  string project_id = 1 [(buf.validate.field).string.uuid = true];
+  string task_id = 2 [(buf.validate.field).string.uuid = true];
+}
+
+message GetTaskResponse {
+  Task task = 1;
+}
+
+message ListTasksRequest {
+  string project_id = 1 [(buf.validate.field).string.uuid = true];
+}
+
+message ListTasksResponse {
+  repeated Task tasks = 1;
+}

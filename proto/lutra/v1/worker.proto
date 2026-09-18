@@ -1,0 +1,76 @@
+syntax = "proto3";
+
+package lutra.v1;
+
+import "buf/validate/validate.proto";
+import "google/protobuf/timestamp.proto";
+import "lutra/v1/run.proto";
+
+option go_package = "github.com/brian14708/lutra/gen/lutra/v1;lutrav1";
+
+// WorkerService is bound only to the server's internal listener. Calls carry
+// an attempt-scoped capability token in the Authorization header.
+service WorkerService {
+  rpc CreateChildAction(CreateChildActionRequest) returns (CreateChildActionResponse);
+  rpc GetActionOutputs(GetActionOutputsRequest) returns (GetActionOutputsResponse);
+  rpc DownloadActionArtifact(DownloadActionArtifactRequest) returns (DownloadActionArtifactResponse);
+  rpc RefreshAttemptToken(RefreshAttemptTokenRequest) returns (RefreshAttemptTokenResponse);
+}
+
+message CreateChildActionRequest {
+  string project_id = 1 [(buf.validate.field).string.uuid = true];
+  string run_id = 2 [(buf.validate.field).string.uuid = true];
+  string parent_action_id = 3 [(buf.validate.field).string.uuid = true];
+  optional string task_id = 4 [(buf.validate.field).string.uuid = true];
+  repeated InputBinding inputs = 5;
+  // Task ID is preferred. Name/version let a bundled SDK task resolve its
+  // immutable registration without embedding server-generated IDs in code.
+  string task_name = 6;
+  string task_version = 7;
+  // Stable logical call identity within the parent action.
+  string operation_id = 8 [(buf.validate.field).string = {
+    min_len: 1
+    max_len: 512
+  }];
+}
+
+message CreateChildActionResponse {
+  Action action = 1;
+}
+
+message GetActionOutputsRequest {
+  string project_id = 1 [(buf.validate.field).string.uuid = true];
+  string run_id = 2 [(buf.validate.field).string.uuid = true];
+  string parent_action_id = 3 [(buf.validate.field).string.uuid = true];
+  string action_id = 4 [(buf.validate.field).string.uuid = true];
+}
+
+message GetActionOutputsResponse {
+  Action action = 1;
+  repeated InputBinding outputs = 2;
+}
+
+message DownloadActionArtifactRequest {
+  string project_id = 1 [(buf.validate.field).string.uuid = true];
+  string run_id = 2 [(buf.validate.field).string.uuid = true];
+  string parent_action_id = 3 [(buf.validate.field).string.uuid = true];
+  string action_id = 4 [(buf.validate.field).string.uuid = true];
+  string artifact_id = 5 [(buf.validate.field).string.uuid = true];
+}
+
+message DownloadActionArtifactResponse {
+  bytes data = 1 [(buf.validate.field).bytes.max_len = 16777216];
+}
+
+message RefreshAttemptTokenRequest {
+  string project_id = 1 [(buf.validate.field).string.uuid = true];
+  string run_id = 2 [(buf.validate.field).string.uuid = true];
+  string parent_action_id = 3 [(buf.validate.field).string.uuid = true];
+  uint32 attempt = 4 [(buf.validate.field).uint32.gt = 0];
+  string fencing_token = 5 [(buf.validate.field).string.min_len = 1];
+}
+
+message RefreshAttemptTokenResponse {
+  string token = 1;
+  google.protobuf.Timestamp expires_at = 2;
+}

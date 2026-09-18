@@ -14,3 +14,4 @@ node_modules/
 /console/file-routes.d.ts
 /console/src/proto/
 /internal/db/*.sql.go
+/internal/db/models.go

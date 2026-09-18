@@ -2,17 +2,51 @@ version: "2"
 
 linters:
   enable:
+    - asciicheck
+    - bidichk
+    - bodyclose
+    - copyloopvar
+    - durationcheck
+    - errname
+    - errorlint
+    - gocritic
     - govet
     - errcheck
+    - loggercheck
+    - nilerr
+    - nilnil
+    - predeclared
+    - rowserrcheck
+    - spancheck
     - staticcheck
+    - unconvert
     - unused
     - ineffassign
     - revive
+    - wastedassign
+    - whitespace
   settings:
     revive:
       rules:
         - name: exported
-          disabled: true
+        - name: package-comments
+        - name: var-naming
+        - name: receiver-naming
+        - name: indent-error-flow
+        - name: error-strings
+        - name: error-naming
+        - name: if-return
+        - name: time-naming
+        - name: range
+        - name: unnecessary-stmt
+        - name: unreachable-code
+        - name: superfluous-else
+        - name: confusing-naming
+        - name: confusing-results
+        - name: deep-exit
+        - name: early-return
+        - name: redefines-builtin-id
+        - name: struct-tag
 
 formatters:
   enable:
