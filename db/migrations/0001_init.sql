@@ -48,7 +48,46 @@ CREATE TABLE lutra.settings (
 CREATE INDEX settings_project_path_idx ON lutra.settings (project_id, path);
 CREATE INDEX settings_domain_path_idx ON lutra.settings (project_id, domain_id, path);
 
+CREATE TABLE lutra.task_specs (
+    project text NOT NULL,
+    domain text NOT NULL,
+    name text NOT NULL,
+    version text NOT NULL,
+    source_sha256 bytea NOT NULL REFERENCES lutra.blobs(sha256),
+    image text NOT NULL,
+    module text NOT NULL,
+    qualname text NOT NULL,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (project, domain, name, version)
+);
+
+CREATE TABLE lutra.runs (
+    id uuid PRIMARY KEY,
+    parent_id uuid REFERENCES lutra.runs(id),
+    idempotency_key text,
+    project text NOT NULL,
+    domain text NOT NULL,
+    name text NOT NULL,
+    version text NOT NULL,
+    input_cbor bytea NOT NULL,
+    output_cbor bytea,
+    status text NOT NULL CHECK (status IN ('queued', 'running', 'waiting', 'succeeded', 'failed', 'canceled')),
+    attempts integer NOT NULL DEFAULT 0,
+    claim_token uuid,
+    lease_until timestamptz,
+    error text NOT NULL DEFAULT '',
+    next_attempt_at timestamptz NOT NULL DEFAULT now(),
+    created_at timestamptz NOT NULL DEFAULT now(),
+    updated_at timestamptz NOT NULL DEFAULT now(),
+    FOREIGN KEY (project, domain, name, version) REFERENCES lutra.task_specs(project, domain, name, version)
+);
+CREATE INDEX runs_status_idx ON lutra.runs (status, created_at);
+CREATE INDEX runs_parent_idx ON lutra.runs (parent_id);
+CREATE UNIQUE INDEX runs_idempotency_idx ON lutra.runs (project, domain, idempotency_key) WHERE idempotency_key IS NOT NULL;
+
 -- +goose Down
+DROP TABLE IF EXISTS lutra.runs;
+DROP TABLE IF EXISTS lutra.task_specs;
 DROP TABLE IF EXISTS lutra.blob_uploads;
 DROP TABLE IF EXISTS lutra.blobs;
 DROP TABLE IF EXISTS lutra.settings;

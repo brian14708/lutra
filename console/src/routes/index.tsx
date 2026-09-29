@@ -11,14 +11,14 @@ import { encodeHelloParameters } from "@/lib/hello";
 import { transport } from "@/lib/rpc";
 import { BlobService } from "@/proto/lutra/v1/blob_pb";
 import { SettingsService } from "@/proto/lutra/v1/settings_pb";
-import { runTask as runTaskMethod } from "@/proto/lutra/v1/lutra-LutraService_connectquery";
+import { greet as greetMethod } from "@/proto/lutra/v1/lutra-LutraService_connectquery";
 
 export const Route = createFileRoute("/")({ component: Home });
 const blobRpc = createClient(BlobService, transport);
 const settingsRpc = createClient(SettingsService, transport);
 
 function Home() {
-  const runTask = useMutation(runTaskMethod);
+  const greet = useMutation(greetMethod);
   const [parameters, setParameters] = useState('{"name":"world"}');
   const [result, setResult] = useState<{ value: unknown; contents?: string } | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -88,7 +88,7 @@ function Home() {
     setBusy(true);
     try {
       const parametersCbor = encodeHelloParameters(parameters);
-      const response = await runTask.mutateAsync({ taskName: "hello", parametersCbor });
+      const response = await greet.mutateAsync({ parametersCbor });
       const value = await decode(response.resultCbor, async (uri) => downloadBlob(blobRpc, uri));
       setResult({ value });
       if (typeof value === "string") setResult({ value, contents: value });
@@ -106,9 +106,7 @@ function Home() {
           Workspace
         </p>
         <h1 className="text-[29px] leading-tight font-bold">Overview</h1>
-        <p className="mt-2 text-[13px] text-slate-500">
-          Run a Python task and view its blob result.
-        </p>
+        <p className="mt-2 text-[13px] text-slate-500">Run a greeting and view its result.</p>
       </div>
       <section
         aria-labelledby="hello-title"
@@ -118,7 +116,7 @@ function Home() {
           Hello task
         </h2>
         <p className="mt-1 text-[13px] text-slate-500">
-          Send JSON parameters as CBOR to Python and store the greeting as a blob.
+          Send JSON parameters as CBOR and view the greeting.
         </p>
         <form onSubmit={(event) => void submit(event)} className="mt-5 space-y-3">
           <label htmlFor="hello-parameters" className="block text-[13px] font-semibold">

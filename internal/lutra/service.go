@@ -3,61 +3,35 @@ package lutra
 
 import (
 	"context"
-	"errors"
-	"net/http"
-	"os"
-	"os/exec"
-	"time"
+	"strings"
+	"unicode/utf8"
 
 	"connectrpc.com/connect"
-	taskv1 "github.com/brian14708/lutra/gen/lutra/task/v1"
 	lutrav1 "github.com/brian14708/lutra/gen/lutra/v1"
-	"github.com/brian14708/lutra/internal/taskstdio"
-	"github.com/google/uuid"
+	"github.com/fxamacker/cbor/v2"
 )
 
 // Service implements the core Lutra ConnectRPC API.
 type Service struct {
-	PythonPath     string
-	ReverseHandler http.Handler
+	Worker *Worker
 }
 
-// RunTask executes the built-in hello task in a fresh Python subprocess.
-func (s Service) RunTask(ctx context.Context, req *connect.Request[lutrav1.RunTaskRequest]) (*connect.Response[lutrav1.RunTaskResponse], error) {
-	if req.Msg.GetTaskName() != "hello" {
-		return nil, connect.NewError(connect.CodeInvalidArgument, errors.New("unknown task name"))
+// Greet serves the console's built-in greeting.
+func (s Service) Greet(_ context.Context, req *connect.Request[lutrav1.GreetRequest]) (*connect.Response[lutrav1.GreetResponse], error) {
+	var parameters map[string]cbor.RawMessage
+	if err := cbor.Unmarshal(req.Msg.GetParametersCbor(), &parameters); err != nil || parameters == nil {
+		return nil, invalidTask("parameters must be an object")
 	}
-	parameters := req.Msg.GetParametersCbor()
-	if s.ReverseHandler == nil {
-		return nil, connect.NewError(connect.CodeUnavailable, errors.New("blob service unavailable to task"))
+	var name string
+	if err := cbor.Unmarshal(parameters["name"], &name); err != nil || strings.TrimSpace(name) == "" || utf8.RuneCountInString(name) > 100 {
+		return nil, invalidTask("name must be a nonempty string of at most 100 characters")
 	}
-	pythonPath := s.PythonPath
-	if pythonPath == "" {
-		pythonPath = ".venv/bin/python"
-	}
-	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	defer cancel()
-	command := exec.CommandContext(ctx, pythonPath, "-c", "from lutra.task_host import main; main()", "lutra.hello:hello")
-	command.Stderr = os.Stderr
-	process, err := taskstdio.Start(command)
+	result, err := cbor.Marshal("Hello, " + name + "!")
 	if err != nil {
-		return nil, connect.NewError(connect.CodeUnavailable, err)
+		return nil, err
 	}
-	process.Transport.SetReverseHandler(s.ReverseHandler)
-	result, callErr := process.Client().Execute(ctx, connect.NewRequest(&taskv1.ExecuteRequest{
-		InvocationId: uuid.NewString(),
-		ContentType:  "application/cbor",
-		Input:        parameters,
-	}))
-	closeErr := process.Close()
-	if callErr != nil {
-		return nil, callErr
-	}
-	if closeErr != nil {
-		return nil, connect.NewError(connect.CodeUnavailable, closeErr)
-	}
-	return connect.NewResponse(&lutrav1.RunTaskResponse{
-		ContentType: result.Msg.GetContentType(),
-		ResultCbor:  result.Msg.GetOutput(),
+	return connect.NewResponse(&lutrav1.GreetResponse{
+		ContentType: "application/cbor",
+		ResultCbor:  result,
 	}), nil
 }

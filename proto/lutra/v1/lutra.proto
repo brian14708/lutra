@@ -5,15 +5,80 @@ package lutra.v1;
 option go_package = "github.com/brian14708/lutra/gen/lutra/v1;lutrav1";
 
 service LutraService {
-  rpc RunTask(RunTaskRequest) returns (RunTaskResponse);
+  rpc Greet(GreetRequest) returns (GreetResponse);
+  rpc CreateRun(CreateRunRequest) returns (CreateRunResponse);
+  rpc GetRun(GetRunRequest) returns (GetRunResponse);
+  rpc CancelRun(CancelRunRequest) returns (CancelRunResponse);
+  rpc WatchRun(WatchRunRequest) returns (stream WatchRunResponse);
 }
 
-message RunTaskRequest {
-  string task_name = 1;
-  bytes parameters_cbor = 2;
+// SourceBundle is a blob containing the task's source archive and lockfile.
+message SourceBundle {
+  string uri = 1;
 }
 
-message RunTaskResponse {
+// TaskImage selects the worker environment used to execute a task.
+message TaskImage {
+  string name = 1;
+}
+
+// TaskSpec is an immutable version of a task.
+message TaskSpec {
+  string project = 1;
+  string domain = 2;
+  string name = 3;
+  string module = 4;
+  string qualname = 5;
+  string version = 6;
+  SourceBundle source = 7;
+  TaskImage image = 8;
+}
+
+message CreateRunRequest {
+  TaskSpec spec = 1;
+  bytes input_cbor = 2;
+  string parent_id = 3;
+  string idempotency_key = 4;
+}
+message CreateRunResponse {
+  Run run = 1;
+}
+message GetRunRequest {
+  string id = 1;
+  bool wait = 2;
+}
+message GetRunResponse {
+  Run run = 1;
+}
+message CancelRunRequest {
+  string id = 1;
+}
+message CancelRunResponse {
+  Run run = 1;
+}
+message WatchRunRequest {
+  string id = 1;
+}
+message WatchRunResponse {
+  Run run = 1;
+}
+message Run {
+  string id = 1;
+  string parent_id = 2;
+  TaskSpec spec = 3;
+  string status = 4;
+  int32 attempts = 5;
+  bytes output_cbor = 6;
+  string error = 7;
+  string created_at = 8;
+  string updated_at = 9;
+}
+
+message GreetRequest {
+  bytes parameters_cbor = 1;
+}
+
+message GreetResponse {
   string content_type = 1;
   bytes result_cbor = 2;
 }

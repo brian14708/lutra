@@ -34,13 +34,15 @@ type Service struct {
 	Bucket string
 }
 
-func blobKey(id uuid.UUID) string { return "blobs/" + id.String() }
+// ObjectKey returns the storage key of an existing blob.
+func ObjectKey(id uuid.UUID) string { return "blobs/" + id.String() }
 
 func partCount(size int64) int32 {
 	return int32((size + partSize - 1) / partSize)
 }
 
-func parseBlobURI(uri string) ([]byte, string, error) {
+// ParseURI returns the content digest and MIME type in a blob URI.
+func ParseURI(uri string) ([]byte, string, error) {
 	if !strings.HasPrefix(uri, "blob:") {
 		return nil, "", errors.New("blob URI must start with blob")
 	}
@@ -104,7 +106,7 @@ func (s Service) CreateUpload(ctx context.Context, req *connect.Request[lutrav1.
 	if err != nil {
 		return nil, connect.NewError(connect.CodeInternal, err)
 	}
-	key := blobKey(objectID)
+	key := ObjectKey(objectID)
 	parts := int32(1)
 	multipart := pgtype.Text{}
 	if size > partSize {
@@ -163,7 +165,7 @@ func (s Service) PresignPart(ctx context.Context, req *connect.Request[lutrav1.P
 	var headers map[string]string
 	if session.MultipartID.Valid {
 		params := url.Values{"partNumber": {strconv.Itoa(int(number))}, "uploadId": {session.MultipartID.String}}
-		signed, err = s.Signer.Presign(ctx, http.MethodPut, s.Bucket, blobKey(session.ObjectKey), urlLifetime, params)
+		signed, err = s.Signer.Presign(ctx, http.MethodPut, s.Bucket, ObjectKey(session.ObjectKey), urlLifetime, params)
 	} else {
 		header := http.Header{
 			"If-None-Match":         {"*"},
@@ -174,7 +176,7 @@ func (s Service) PresignPart(ctx context.Context, req *connect.Request[lutrav1.P
 		for key, values := range header {
 			headers[key] = values[0]
 		}
-		signed, err = s.Signer.PresignHeader(ctx, http.MethodPut, s.Bucket, blobKey(session.ObjectKey), urlLifetime, nil, header)
+		signed, err = s.Signer.PresignHeader(ctx, http.MethodPut, s.Bucket, ObjectKey(session.ObjectKey), urlLifetime, nil, header)
 	}
 	if err != nil {
 		return nil, connect.NewError(connect.CodeUnavailable, err)
@@ -204,7 +206,7 @@ func (s Service) CompleteUpload(ctx context.Context, req *connect.Request[lutrav
 		return nil, connect.NewError(connect.CodeInternal, err)
 	}
 	parts := req.Msg.GetParts()
-	key := blobKey(session.ObjectKey)
+	key := ObjectKey(session.ObjectKey)
 	if !session.MultipartID.Valid {
 		if len(parts) != 0 {
 			return nil, connect.NewError(connect.CodeInvalidArgument, errors.New("single PUT requires no parts"))
@@ -298,7 +300,7 @@ func (s Service) abortSession(ctx context.Context, session db.LutraBlobUpload) e
 		return err
 	}
 	session = row
-	key := blobKey(session.ObjectKey)
+	key := ObjectKey(session.ObjectKey)
 	if session.MultipartID.Valid {
 		_ = s.Store.AbortMultipartUpload(ctx, s.Bucket, key, session.MultipartID.String)
 	}
@@ -342,7 +344,7 @@ func (s Service) GetDownload(ctx context.Context, req *connect.Request[lutrav1.G
 	if err := s.ready(); err != nil {
 		return nil, err
 	}
-	digest, _, parseErr := parseBlobURI(req.Msg.GetUri())
+	digest, _, parseErr := ParseURI(req.Msg.GetUri())
 	if parseErr != nil {
 		return nil, connect.NewError(connect.CodeInvalidArgument, parseErr)
 	}
@@ -353,7 +355,7 @@ func (s Service) GetDownload(ctx context.Context, req *connect.Request[lutrav1.G
 	if err != nil {
 		return nil, connect.NewError(connect.CodeInternal, err)
 	}
-	key := blobKey(record.ObjectKey)
+	key := ObjectKey(record.ObjectKey)
 	_, err = s.Store.StatObject(ctx, s.Bucket, key, minio.StatObjectOptions{})
 	if objectMissing(err) {
 		return nil, connect.NewError(connect.CodeNotFound, errors.New("blob not found"))

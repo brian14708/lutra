@@ -20,7 +20,7 @@ func TestParseBlobURI(t *testing.T) {
 		{"data:text/plain," + name, "", false},
 		{"blob:application/cbor," + name + "x", "", false},
 	} {
-		got, mime, err := parseBlobURI(tc.uri)
+		got, mime, err := ParseURI(tc.uri)
 		if (err == nil) != tc.valid {
 			t.Errorf("parseBlobURI(%q) error = %v", tc.uri, err)
 		}

@@ -42,10 +42,7 @@ def _parse_blob_name(name: str) -> bytes:
         digest = _base64.b64decode(digest_name, validate=True)
     except binascii.Error:
         digest = b""
-    if (
-        _base64.b64encode(digest).decode("ascii") != digest_name
-        or len(digest) != _DIGEST_LENGTH
-    ):
+    if _base64.b64encode(digest).decode("ascii") != digest_name or len(digest) != _DIGEST_LENGTH:
         msg = "invalid blob digest name"
         raise ValueCodecError(msg)
     return digest

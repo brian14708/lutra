@@ -4,14 +4,11 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import base64
-import hashlib
 import importlib
 import inspect
 import json
 import struct
 import sys
-from contextlib import suppress
 from typing import TYPE_CHECKING, Any
 
 import httpx
@@ -20,17 +17,11 @@ from connectrpc.code import Code
 from connectrpc.codec import proto_json_codec
 from connectrpc.errors import ConnectError
 
+from lutra._blob import upload_blob
 from lutra._gen.lutra.task.v1.task_connect import TaskService, TaskServiceASGIApplication
 from lutra._gen.lutra.task.v1.task_pb import ExecuteRequest, ExecuteResponse
 from lutra._gen.lutra.v1.blob_connect import BlobServiceClient
-from lutra._gen.lutra.v1.blob_pb import (
-    AbortUploadRequest,
-    BlobPart,
-    CompleteUploadRequest,
-    CreateUploadRequest,
-    GetDownloadRequest,
-    PresignPartRequest,
-)
+from lutra._gen.lutra.v1.blob_pb import GetDownloadRequest
 from lutra.value import BlobRef, _parse_blob_name, dumps
 
 if TYPE_CHECKING:
@@ -74,7 +65,7 @@ def _envelope(value: object) -> bytes:
 class _TaskService:
     def __init__(self, handler: Callable[..., Any]) -> None:
         self._handler = handler
-        self.reverse: ReverseClient | None = None
+        self.api_client: TaskAPIClient | None = None
 
     @classmethod
     def desc(cls) -> DescService:
@@ -85,78 +76,25 @@ class _TaskService:
     ) -> ExecuteResponse:
         if not request.invocation_id:
             raise ConnectError(Code.INVALID_ARGUMENT, "invocation_id is required")
-        if self.reverse is None:
-            raise ConnectError(Code.INTERNAL, "reverse client is unavailable")
-        args = (request.invocation_id, request.content_type, request.input, self.reverse)
+        if self.api_client is None:
+            raise ConnectError(Code.INTERNAL, "task API client is unavailable")
+        args = (request.invocation_id, request.content_type, request.input, self.api_client)
         if inspect.iscoroutinefunction(self._handler):
             result = self._handler(*args)
         else:
             result = await asyncio.to_thread(self._handler, *args)
         if inspect.isawaitable(result):
             result = await result
-        content_type, output = await normalize_result(result, self.reverse)
+        content_type, output = await normalize_result(result, self.api_client)
         return ExecuteResponse(content_type=content_type, output=output)
 
 
-async def _put(url: str, headers: dict[str, str], contents: bytes) -> str:
-    async with httpx.AsyncClient() as http:
-        response = await http.put(url, content=contents, headers=headers)
-        response.raise_for_status()
-        return response.headers.get("etag", "")
+async def _store_result(api_client: TaskAPIClient, contents: bytes, mime_type: str) -> BlobRef:
+    uri = await upload_blob(api_client.blob, contents, mime_type)
+    return BlobRef(uri, resolve=True, mime_type=mime_type)
 
 
-async def _upload(
-    client: BlobServiceClient, session_id: str, contents: bytes, part_size: int, part_count: int
-) -> str:
-    async def send_parts() -> list[BlobPart]:
-        parts = []
-        for number in range(1, part_count + 1):
-            part = await client.presign_part(
-                PresignPartRequest(session_id=session_id, part_number=number)
-            )
-            chunk = contents[(number - 1) * part_size : number * part_size]
-            etag = await _put(part.url, part.headers, chunk)
-            if part_count > 1:
-                if not etag:
-                    msg = "multipart upload returned no ETag"
-                    raise ValueError(msg)
-                parts.append(BlobPart(number=number, etag=etag))
-        return parts
-
-    try:
-        parts = await send_parts()
-        completed = await client.complete_upload(
-            CompleteUploadRequest(session_id=session_id, parts=parts)
-        )
-    except BaseException:
-        with suppress(Exception):
-            await client.abort_upload(AbortUploadRequest(session_id=session_id))
-        raise
-    else:
-        return completed.uri
-
-
-async def _store_result(reverse: ReverseClient, contents: bytes, mime_type: str) -> BlobRef:
-    digest = hashlib.sha256(contents).digest()
-    client = reverse.blob
-    name = base64.b64encode(digest).decode("ascii")
-    uri = f"blob:{mime_type},{name}"
-    created = await client.create_upload(
-        CreateUploadRequest(content_sha256=digest, size=len(contents), mime_type=mime_type)
-    )
-    if not created.already_exists:
-        returned_uri = await _upload(
-            client, created.session_id, contents, created.part_size, created.part_count
-        )
-    else:
-        returned_uri = uri
-    if returned_uri != uri:
-        msg = "blob service returned a different URI"
-        raise ValueError(msg)
-    return BlobRef(returned_uri, resolve=True, mime_type=mime_type)
-
-
-async def normalize_result(result: object, reverse: ReverseClient) -> tuple[str, bytes]:  # ruff: ignore[too-many-return-statements]
+async def normalize_result(result: object, api_client: TaskAPIClient) -> tuple[str, bytes]:  # ruff: ignore[too-many-return-statements]
     """Encode a task result and spill large values to the blob service.
 
     Returns:
@@ -172,21 +110,21 @@ async def normalize_result(result: object, reverse: ReverseClient) -> tuple[str,
         if content_type != "application/cbor":
             return content_type, raw
         if len(raw) > _RESULT_THRESHOLD:
-            return _RESULT_MIME, dumps(await _store_result(reverse, raw, _RESULT_MIME))
+            return _RESULT_MIME, dumps(await _store_result(api_client, raw, _RESULT_MIME))
         return _RESULT_MIME, raw
     content_type, value = _RESULT_MIME, result
     if isinstance(value, bytes):
         if len(value) > _RESULT_THRESHOLD:
-            stored = await _store_result(reverse, value, "application/octet-stream")
+            stored = await _store_result(api_client, value, "application/octet-stream")
             return _RESULT_MIME, dumps(stored)
         return content_type, dumps(value)
     encoded = dumps(value)
     if len(encoded) > _RESULT_THRESHOLD:
-        return _RESULT_MIME, dumps(await _store_result(reverse, encoded, _RESULT_MIME))
+        return _RESULT_MIME, dumps(await _store_result(api_client, encoded, _RESULT_MIME))
     return content_type, encoded
 
 
-class ReverseClient:
+class TaskAPIClient:
     """Make unary Connect JSON calls to the Go process on the task stdio link."""
 
     def __init__(self, host: _Host) -> None:
@@ -232,9 +170,9 @@ class ReverseClient:
                     response = frame.get("value")
                 if failure is not None:
                     code = Code(failure.get("code", "unknown"))
-                    raise ConnectError(code, failure.get("message", "reverse call failed"))
+                    raise ConnectError(code, failure.get("message", "task API call failed"))
                 if response is None:
-                    raise ConnectError(Code.INTERNAL, "reverse call has no response")
+                    raise ConnectError(Code.INTERNAL, "task API call has no response")
                 return response
 
     async def resolve_blob(self, uri: str) -> bytes:
@@ -247,10 +185,10 @@ class ReverseClient:
 
 
 class StdioTransport:
-    """A pyqwest transport that routes HTTP requests over the stdio reverse link."""
+    """A pyqwest transport that routes task API calls over stdio."""
 
-    def __init__(self, reverse: ReverseClient) -> None:
-        self._reverse = reverse
+    def __init__(self, api_client: TaskAPIClient) -> None:
+        self._api_client = api_client
 
     async def execute(self, request: pyqwest.Request) -> pyqwest.Response:
         if request.method != "POST":
@@ -263,7 +201,7 @@ class StdioTransport:
             chunks = [chunk async for chunk in content]
             content = b"".join(chunks)
         path = "/" + request.url.split("/", 3)[-1]
-        response = await self._reverse.unary(path, json.loads(content))
+        response = await self._api_client.unary(path, json.loads(content))
         return pyqwest.Response(
             status=200,
             headers=pyqwest.Headers({"content-type": "application/json"}),
@@ -410,9 +348,9 @@ class _Host:
         if not isinstance(call_id, str) or not call_id:
             message = "frame requires a nonempty id"
             raise ValueError(message)
-        reverse = self.reverse_calls.get(call_id)
-        if reverse is not None:
-            await reverse.put(frame)
+        queue = self.reverse_calls.get(call_id)
+        if queue is not None:
+            await queue.put(frame)
             return
         if kind == "open":
             if call_id in self.calls:
@@ -463,7 +401,7 @@ async def serve(handler: Callable[..., Any]) -> None:
     print("task host started")  # ruff: ignore[print]
     service = _TaskService(handler)
     host = _Host(TaskServiceASGIApplication(service, read_max_bytes=_MAX_LINE, compressions=()))
-    service.reverse = ReverseClient(host)
+    service.api_client = TaskAPIClient(host)
     reader = asyncio.StreamReader(limit=_MAX_LINE)
     loop = asyncio.get_running_loop()
     await loop.connect_read_pipe(lambda: asyncio.StreamReaderProtocol(reader), sys.stdin.buffer)

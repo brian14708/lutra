@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -76,7 +77,8 @@ func main() {
 
 	mux := http.NewServeMux()
 	rpcMux := http.NewServeMux()
-	blobService := blob.Service{DB: db, Store: &minio.Core{Client: storeClient}, Signer: signer, Bucket: storeConfig.Bucket}
+	blobStore := &minio.Core{Client: storeClient}
+	blobService := blob.Service{DB: db, Store: blobStore, Signer: signer, Bucket: storeConfig.Bucket}
 	cleanupCtx, cancelCleanup := context.WithCancel(context.Background())
 	defer cancelCleanup()
 	go blobService.RunCleanup(cleanupCtx, time.Hour)
@@ -85,9 +87,13 @@ func main() {
 		connect.WithInterceptors(otelInterceptor),
 	)
 	rpcMux.Handle(blobPath, blobHandler)
+	capacity, _ := strconv.Atoi(os.Getenv("LUTRA_WORKER_CONCURRENCY"))
+	worker := &lutra.Worker{DB: db, Capacity: capacity, TaskAPIHandler: rpcMux, Store: blobStore, Bucket: storeConfig.Bucket}
+	worker.Start(cleanupCtx)
 	servicePath, serviceHandler := lutrav1connect.NewLutraServiceHandler(
-		lutra.Service{PythonPath: os.Getenv("LUTRA_TASK_PYTHON"), ReverseHandler: blobHandler},
+		lutra.Service{Worker: worker},
 		connect.WithInterceptors(otelInterceptor),
+		connect.WithReadMaxBytes(64<<20),
 	)
 	rpcMux.Handle(servicePath, serviceHandler)
 	settingsPath, settingsHandler := lutrav1connect.NewSettingsServiceHandler(
