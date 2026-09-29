@@ -21,6 +21,7 @@ import (
 	"github.com/brian14708/lutra/internal/lutra"
 	"github.com/brian14708/lutra/internal/lutra/web"
 	"github.com/brian14708/lutra/internal/s3"
+	"github.com/brian14708/lutra/internal/settings"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/jackc/pgx/v5/stdlib"
 	"github.com/minio/minio-go/v7"
@@ -89,12 +90,17 @@ func main() {
 		connect.WithInterceptors(otelInterceptor),
 	)
 	rpcMux.Handle(servicePath, serviceHandler)
+	settingsPath, settingsHandler := lutrav1connect.NewSettingsServiceHandler(
+		settings.Service{DB: db},
+		connect.WithInterceptors(otelInterceptor),
+	)
+	rpcMux.Handle(settingsPath, settingsHandler)
 	healthPath, healthHandler := grpchealth.NewHandler(
-		grpchealth.NewStaticChecker(lutrav1connect.LutraServiceName, lutrav1connect.BlobServiceName),
+		grpchealth.NewStaticChecker(lutrav1connect.LutraServiceName, lutrav1connect.BlobServiceName, lutrav1connect.SettingsServiceName),
 		interceptors,
 	)
 	rpcMux.Handle(healthPath, healthHandler)
-	reflector := grpcreflect.NewStaticReflector(lutrav1connect.LutraServiceName, lutrav1connect.BlobServiceName)
+	reflector := grpcreflect.NewStaticReflector(lutrav1connect.LutraServiceName, lutrav1connect.BlobServiceName, lutrav1connect.SettingsServiceName)
 	reflectionPath, reflectionHandler := grpcreflect.NewHandlerV1(reflector, interceptors)
 	rpcMux.Handle(reflectionPath, reflectionHandler)
 	reflectionAlphaPath, reflectionAlphaHandler := grpcreflect.NewHandlerV1Alpha(reflector, interceptors)

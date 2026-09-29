@@ -1,0 +1,92 @@
+syntax = "proto3";
+
+package lutra.v1;
+
+option go_package = "github.com/brian14708/lutra/gen/lutra/v1;lutrav1";
+
+service SettingsService {
+  rpc CreateProject(CreateProjectRequest) returns (CreateProjectResponse);
+  rpc ListProjects(ListProjectsRequest) returns (ListProjectsResponse);
+  rpc CreateDomain(CreateDomainRequest) returns (CreateDomainResponse);
+  rpc ListDomains(ListDomainsRequest) returns (ListDomainsResponse);
+  rpc UpsertSetting(UpsertSettingRequest) returns (UpsertSettingResponse);
+  rpc DeleteSetting(DeleteSettingRequest) returns (DeleteSettingResponse);
+  rpc ListSettings(ListSettingsRequest) returns (ListSettingsResponse);
+  rpc ResolveSettings(ResolveSettingsRequest) returns (ResolveSettingsResponse);
+}
+
+message Project {
+  string id = 1;
+  string slug = 2;
+  string name = 3;
+  string created_at = 4;
+}
+message Domain {
+  string id = 1;
+  string project_id = 2;
+  string slug = 3;
+  string name = 4;
+  string created_at = 5;
+}
+message Setting {
+  string project_id = 1;
+  string domain_id = 2;
+  string path = 3;
+  bytes value_cbor = 4;
+  string updated_at = 5;
+}
+message CreateProjectRequest {
+  string slug = 1;
+  string name = 2;
+}
+message CreateProjectResponse {
+  Project project = 1;
+}
+message ListProjectsRequest {}
+message ListProjectsResponse {
+  repeated Project projects = 1;
+}
+message CreateDomainRequest {
+  string project_id = 1;
+  string slug = 2;
+  string name = 3;
+}
+message CreateDomainResponse {
+  Domain domain = 1;
+}
+message ListDomainsRequest {
+  string project_id = 1;
+}
+message ListDomainsResponse {
+  repeated Domain domains = 1;
+}
+message UpsertSettingRequest {
+  string project_id = 1;
+  string domain_id = 2;
+  string path = 3;
+  bytes value_cbor = 4;
+}
+message UpsertSettingResponse {
+  Setting setting = 1;
+}
+message DeleteSettingRequest {
+  string project_id = 1;
+  string domain_id = 2;
+  string path = 3;
+}
+message DeleteSettingResponse {}
+message ListSettingsRequest {
+  string project_id = 1;
+  string domain_id = 2;
+}
+message ListSettingsResponse {
+  repeated Setting settings = 1;
+}
+message ResolveSettingsResponse {
+  repeated Setting settings = 1;
+}
+message ResolveSettingsRequest {
+  string project_id = 1;
+  string domain_id = 2;
+  repeated string paths = 3;
+}
