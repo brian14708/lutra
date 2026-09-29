@@ -1,0 +1,66 @@
+syntax = "proto3";
+
+package lutra.v1;
+
+option go_package = "github.com/brian14708/lutra/gen/lutra/v1;lutrav1";
+
+service BlobService {
+  rpc CreateUpload(CreateUploadRequest) returns (CreateUploadResponse);
+  rpc PresignPart(PresignPartRequest) returns (PresignPartResponse);
+  rpc CompleteUpload(CompleteUploadRequest) returns (CompleteUploadResponse);
+  rpc AbortUpload(AbortUploadRequest) returns (AbortUploadResponse);
+  rpc GetDownload(GetDownloadRequest) returns (GetDownloadResponse) {
+    option idempotency_level = NO_SIDE_EFFECTS;
+  }
+}
+
+message CreateUploadRequest {
+  bytes content_sha256 = 1;
+  int64 size = 2;
+  string mime_type = 3;
+}
+
+message CreateUploadResponse {
+  string session_id = 1;
+  int64 part_size = 2;
+  int32 part_count = 3;
+  bool already_exists = 4;
+}
+
+message PresignPartRequest {
+  string session_id = 1;
+  int32 part_number = 2;
+}
+
+message PresignPartResponse {
+  string url = 1;
+  map<string, string> headers = 2;
+}
+
+message BlobPart {
+  int32 number = 1;
+  string etag = 2;
+}
+
+message CompleteUploadRequest {
+  string session_id = 1;
+  repeated BlobPart parts = 2;
+}
+
+message CompleteUploadResponse {
+  string uri = 1;
+}
+
+message AbortUploadRequest {
+  string session_id = 1;
+}
+
+message AbortUploadResponse {}
+
+message GetDownloadRequest {
+  string uri = 1;
+}
+
+message GetDownloadResponse {
+  string url = 1;
+}

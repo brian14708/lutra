@@ -11,6 +11,7 @@ generate: init
     go tool sqlc generate
 
 fmt:
+    go tool buf format -w
     go tool golangci-lint fmt
     uv run ruff format
     pnpm format
@@ -25,6 +26,7 @@ lint:
 test:
     go test ./...
     uv run --package lutra pytest
+    pnpm --filter @lutra/console test
 
 init:
     uv sync

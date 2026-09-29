@@ -3,16 +3,11 @@ package main
 
 import (
 	"context"
-	"database/sql"
 	"errors"
-	"io"
-	"io/fs"
 	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
-	"path"
-	"strings"
 	"syscall"
 	"time"
 
@@ -20,18 +15,50 @@ import (
 	"connectrpc.com/grpchealth"
 	"connectrpc.com/grpcreflect"
 	"connectrpc.com/otelconnect"
-	"connectrpc.com/validate"
-	dbmigrations "github.com/brian14708/lutra/db/migrations"
+	"github.com/brian14708/lutra/db/migrations"
 	lutrav1connect "github.com/brian14708/lutra/gen/lutra/v1/lutrav1connect"
+	"github.com/brian14708/lutra/internal/blob"
 	"github.com/brian14708/lutra/internal/lutra"
-	_ "github.com/jackc/pgx/v5/stdlib"
-	"github.com/pressly/goose/v3"
+	"github.com/brian14708/lutra/internal/lutra/web"
+	"github.com/brian14708/lutra/internal/s3"
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/jackc/pgx/v5/stdlib"
+	"github.com/minio/minio-go/v7"
 )
 
 func main() {
 	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
-	if err := runMigrations(); err != nil {
+	db, err := pgxpool.New(context.Background(), os.Getenv("DATABASE_URL"))
+	if err != nil {
+		logger.Error("database connection failed", "error", err)
+		os.Exit(1)
+	}
+	defer db.Close()
+	if err := db.Ping(context.Background()); err != nil {
+		logger.Error("database unavailable", "error", err)
+		os.Exit(1)
+	}
+	if err := migrations.Run(context.Background(), stdlib.OpenDBFromPool(db)); err != nil {
 		logger.Error("database migration failed", "error", err)
+		os.Exit(1)
+	}
+	storeClient, storeConfig, err := s3.NewFromEnv()
+	if err != nil {
+		logger.Error("blob store configuration failed", "error", err)
+		os.Exit(1)
+	}
+	exists, err := storeClient.BucketExists(context.Background(), storeConfig.Bucket)
+	if err != nil {
+		logger.Error("blob bucket check failed", "error", err)
+		os.Exit(1)
+	}
+	if !exists {
+		logger.Error("blob bucket does not exist", "bucket", storeConfig.Bucket)
+		os.Exit(1)
+	}
+	signer, err := s3.New(storeConfig.SignerConfig())
+	if err != nil {
+		logger.Error("blob signer configuration failed", "error", err)
 		os.Exit(1)
 	}
 	addr := os.Getenv("LUTRA_ADDR")
@@ -48,17 +75,26 @@ func main() {
 
 	mux := http.NewServeMux()
 	rpcMux := http.NewServeMux()
+	blobService := blob.Service{DB: db, Store: &minio.Core{Client: storeClient}, Signer: signer, Bucket: storeConfig.Bucket}
+	cleanupCtx, cancelCleanup := context.WithCancel(context.Background())
+	defer cancelCleanup()
+	go blobService.RunCleanup(cleanupCtx, time.Hour)
+	blobPath, blobHandler := lutrav1connect.NewBlobServiceHandler(
+		blobService,
+		connect.WithInterceptors(otelInterceptor),
+	)
+	rpcMux.Handle(blobPath, blobHandler)
 	servicePath, serviceHandler := lutrav1connect.NewLutraServiceHandler(
-		lutra.Service{},
-		connect.WithInterceptors(otelInterceptor, validate.NewInterceptor()),
+		lutra.Service{PythonPath: os.Getenv("LUTRA_TASK_PYTHON"), ReverseHandler: blobHandler},
+		connect.WithInterceptors(otelInterceptor),
 	)
 	rpcMux.Handle(servicePath, serviceHandler)
 	healthPath, healthHandler := grpchealth.NewHandler(
-		grpchealth.NewStaticChecker(lutrav1connect.LutraServiceName),
+		grpchealth.NewStaticChecker(lutrav1connect.LutraServiceName, lutrav1connect.BlobServiceName),
 		interceptors,
 	)
 	rpcMux.Handle(healthPath, healthHandler)
-	reflector := grpcreflect.NewStaticReflector(lutrav1connect.LutraServiceName)
+	reflector := grpcreflect.NewStaticReflector(lutrav1connect.LutraServiceName, lutrav1connect.BlobServiceName)
 	reflectionPath, reflectionHandler := grpcreflect.NewHandlerV1(reflector, interceptors)
 	rpcMux.Handle(reflectionPath, reflectionHandler)
 	reflectionAlphaPath, reflectionAlphaHandler := grpcreflect.NewHandlerV1Alpha(reflector, interceptors)
@@ -67,7 +103,7 @@ func main() {
 	// Serve the SPA build when it is present.
 	const consoleDir = "console/dist"
 	if info, err := os.Stat(consoleDir); err == nil && info.IsDir() {
-		mux.Handle("/", spaHandler(os.DirFS(consoleDir)))
+		mux.Handle("/", web.New(os.DirFS(consoleDir)))
 	}
 
 	server := &http.Server{Addr: addr, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
@@ -93,75 +129,4 @@ func main() {
 			os.Exit(1)
 		}
 	}
-}
-
-func runMigrations() error {
-	db, err := sql.Open("pgx", os.Getenv("DATABASE_URL"))
-	if err != nil {
-		return err
-	}
-	defer func() { _ = db.Close() }()
-
-	provider, err := goose.NewProvider(
-		goose.DialectPostgres,
-		db,
-		dbmigrations.FS,
-		goose.WithTableName("lutra_migrations"),
-	)
-	if err != nil {
-		return err
-	}
-
-	_, err = provider.Up(context.Background())
-	return err
-}
-
-// spaHandler serves the Vite build and falls back to index.html for client routes.
-func spaHandler(fsys fs.FS) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet && r.Method != http.MethodHead {
-			w.Header().Set("Allow", "GET, HEAD")
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		name := strings.TrimPrefix(path.Clean("/"+r.URL.Path), "/")
-		if name == "" {
-			name = "index.html"
-		}
-		if serveSPAFile(w, r, fsys, name) {
-			return
-		}
-		// Missing hashed assets must remain 404s instead of returning HTML.
-		if strings.HasPrefix(name, "assets/") {
-			http.NotFound(w, r)
-			return
-		}
-		if name != "index.html" && serveSPAFile(w, r, fsys, "index.html") {
-			return
-		}
-		http.NotFound(w, r)
-	})
-}
-
-func serveSPAFile(w http.ResponseWriter, r *http.Request, fsys fs.FS, name string) bool {
-	f, err := fsys.Open(name)
-	if err != nil {
-		return false
-	}
-	defer func() { _ = f.Close() }()
-	info, err := f.Stat()
-	if err != nil || info.IsDir() {
-		return false
-	}
-	rs, ok := f.(io.ReadSeeker)
-	if !ok {
-		return false
-	}
-	if strings.HasPrefix(name, "assets/") {
-		w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
-	} else if name == "index.html" {
-		w.Header().Set("Cache-Control", "no-cache")
-	}
-	http.ServeContent(w, r, info.Name(), info.ModTime(), rs)
-	return true
 }

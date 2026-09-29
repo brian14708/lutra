@@ -18,6 +18,7 @@ import (
 // be shared with AWS tooling and SDKs.
 type Config struct {
 	Endpoint        string
+	PublicEndpoint  string
 	Bucket          string
 	AccessKeyID     string
 	SecretAccessKey string
@@ -30,6 +31,7 @@ type Config struct {
 func ConfigFromEnv() (Config, error) {
 	config := Config{
 		Endpoint:        os.Getenv("AWS_ENDPOINT_URL_S3"),
+		PublicEndpoint:  os.Getenv("AWS_S3_PUBLIC_ENDPOINT_URL"),
 		Bucket:          os.Getenv("AWS_S3_BUCKET"),
 		AccessKeyID:     os.Getenv("AWS_ACCESS_KEY_ID"),
 		SecretAccessKey: os.Getenv("AWS_SECRET_ACCESS_KEY"),
@@ -64,6 +66,16 @@ func NewFromEnv() (*minio.Client, Config, error) {
 		return nil, Config{}, err
 	}
 	return client, config, nil
+}
+
+// SignerConfig returns the configuration for presigning URLs: when a public
+// endpoint is configured, signatures must be created for the host clients
+// actually reach.
+func (c Config) SignerConfig() Config {
+	if c.PublicEndpoint != "" {
+		c.Endpoint = c.PublicEndpoint
+	}
+	return c
 }
 
 // New creates an S3-compatible client from explicit settings.

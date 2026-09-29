@@ -2,22 +2,18 @@ syntax = "proto3";
 
 package lutra.v1;
 
-import "buf/validate/validate.proto";
-import "google/protobuf/timestamp.proto";
-
 option go_package = "github.com/brian14708/lutra/gen/lutra/v1;lutrav1";
 
 service LutraService {
-  rpc Ping(PingRequest) returns (PingResponse) {
-    option idempotency_level = NO_SIDE_EFFECTS;
-  }
+  rpc RunTask(RunTaskRequest) returns (RunTaskResponse);
 }
 
-message PingRequest {
-  string message = 1 [(buf.validate.field).string.max_len = 1024];
+message RunTaskRequest {
+  string task_name = 1;
+  bytes parameters_cbor = 2;
 }
 
-message PingResponse {
-  string message = 1;
-  google.protobuf.Timestamp timestamp = 2;
+message RunTaskResponse {
+  string content_type = 1;
+  bytes result_cbor = 2;
 }

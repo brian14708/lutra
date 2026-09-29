@@ -12,6 +12,7 @@
     "moduleResolution": "bundler",
     "paths": { "@/*": ["./src/*"] },
     "noEmit": true,
+    "allowImportingTsExtensions": true,
 
     // Type Checking & Safety
     "strict": true,

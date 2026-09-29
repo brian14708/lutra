@@ -5,12 +5,14 @@ from lutra._gen.lutra.v1.lutra_connect import (
     LutraServiceASGIApplication,
     LutraServiceClient,
 )
-from lutra._gen.lutra.v1.lutra_pb import PingRequest, PingResponse
+from lutra._gen.lutra.v1.lutra_pb import RunTaskRequest, RunTaskResponse
+from lutra.task_host import StdioTransport
 
 __all__ = [
     "LutraService",
     "LutraServiceASGIApplication",
     "LutraServiceClient",
-    "PingRequest",
-    "PingResponse",
+    "RunTaskRequest",
+    "RunTaskResponse",
+    "StdioTransport",
 ]
