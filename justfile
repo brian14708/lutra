@@ -7,6 +7,7 @@ build: generate
 
 generate: init
     go tool buf generate
+    rm -rf internal/db/
     go tool sqlc generate
 
 fmt:

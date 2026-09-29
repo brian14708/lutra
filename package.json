@@ -8,5 +8,9 @@
     "format": "pnpm --filter @lutra/console format",
     "start": "pnpm --filter @lutra/console start"
   },
-  "packageManager": "pnpm@12.4.1"
+  "packageManager": "pnpm@12.4.1",
+  "devDependencies": {
+    "@bufbuild/protoc-gen-es": "^2.15.0",
+    "@connectrpc/protoc-gen-connect-query": "^2.3.1"
+  }
 }

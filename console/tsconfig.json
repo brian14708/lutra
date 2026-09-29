@@ -1,8 +1,7 @@
 {
   "compilerOptions": {
     // General
-    "jsx": "preserve",
-    "jsxImportSource": "@solidjs/web",
+    "jsx": "react-jsx",
     "target": "ESNext",
 
     // Modules
@@ -11,11 +10,12 @@
     "isolatedModules": true,
     "module": "ESNext",
     "moduleResolution": "bundler",
+    "paths": { "@/*": ["./src/*"] },
     "noEmit": true,
 
     // Type Checking & Safety
     "strict": true,
     "skipLibCheck": true,
-    "types": ["vite/client"]
+    "types": ["vite/client", "node"]
   }
 }

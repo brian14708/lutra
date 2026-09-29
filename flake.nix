@@ -3,17 +3,12 @@
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     flake-parts.url = "github:hercules-ci/flake-parts";
     process-compose-flake.url = "github:Platonic-Systems/process-compose-flake";
-    treefmt-nix = {
-      url = "github:numtide/treefmt-nix";
-      inputs.nixpkgs.follows = "nixpkgs";
-    };
   };
 
   outputs =
     inputs@{
       flake-parts,
       process-compose-flake,
-      treefmt-nix,
       ...
     }:
     flake-parts.lib.mkFlake { inherit inputs; } {
@@ -25,40 +20,11 @@
 
       imports = [
         process-compose-flake.flakeModule
-        treefmt-nix.flakeModule
       ];
 
       perSystem =
-        { pkgs, ... }:
-        let
-          sqlFormatterConfig = pkgs.writeText "sql-formatter.json" (
-            builtins.toJSON {
-              language = "postgresql";
-              paramTypes.named = [ "@" ];
-            }
-          );
-          sqlFormatter = pkgs.writeShellScriptBin "sql-formatter" ''
-            exec ${pkgs.sql-formatter}/bin/sql-formatter --config ${sqlFormatterConfig} "$@"
-          '';
-        in
+        { pkgs, config, ... }:
         {
-          treefmt = {
-            projectRootFile = "flake.nix";
-            settings.excludes = [
-              "pnpm-lock.yaml"
-            ];
-            programs.buf.enable = true;
-            programs.nixfmt.enable = true;
-            programs.gofumpt.enable = true;
-            programs.oxfmt.enable = true;
-            programs.ruff-format.enable = true;
-            programs.sql-formatter = {
-              enable = true;
-              package = sqlFormatter;
-              dialect = "postgresql";
-            };
-          };
-
           devShells.default = pkgs.mkShell {
             shellHook = ''
               export DATABASE_URL="postgres://$USER@127.0.0.1:5432/postgres?sslmode=disable"
@@ -73,13 +39,9 @@
             ];
           };
 
-          process-compose.default = {
+          process-compose.dev = {
             cli.options.no-server = true;
             settings.processes = {
-              generate = {
-                command = "just generate";
-              };
-
               pgsql = {
                 command = ''
                   data_dir="$(pwd)/.data/postgres"
@@ -106,27 +68,38 @@
                 };
                 readiness_probe.exec.command = "${pkgs.curl}/bin/curl -fsS http://127.0.0.1:9000/health/ready";
               };
-
-              api = {
-                command = "go run ./cmd/server";
-                depends_on.generate.condition = "process_completed_successfully";
-                depends_on.pgsql.condition = "process_healthy";
-                depends_on.rustfs.condition = "process_healthy";
-                environment = {
-                  AWS_ENDPOINT_URL_S3 = "http://127.0.0.1:9000";
-                  AWS_S3_BUCKET = "lutra";
-                  AWS_ACCESS_KEY_ID = "lutra";
-                  AWS_SECRET_ACCESS_KEY = "lutra-secret";
-                  AWS_REGION = "us-east-1";
-                  AWS_S3_SECURE = "false";
-                };
-              };
-              ui = {
-                command = "pnpm --filter @lutra/console dev";
-                depends_on.generate.condition = "process_completed_successfully";
-              };
             };
           };
+
+          process-compose.integration =
+            let
+              dev = config.process-compose.dev.settings.processes;
+            in
+            {
+              cli.options.no-server = true;
+              settings.environment.DATABASE_URL = "postgres://127.0.0.1:5432/postgres?sslmode=disable";
+              settings.processes = {
+                build.command = "just build";
+                pgsql = dev.pgsql;
+                rustfs = dev.rustfs;
+                server = {
+                  command = "go run ./cmd/server";
+                  depends_on = {
+                    build.condition = "process_completed_successfully";
+                    pgsql.condition = "process_healthy";
+                    rustfs.condition = "process_healthy";
+                  };
+                  environment = {
+                    AWS_ENDPOINT_URL_S3 = "http://127.0.0.1:9000";
+                    AWS_S3_BUCKET = "lutra";
+                    AWS_ACCESS_KEY_ID = "lutra";
+                    AWS_SECRET_ACCESS_KEY = "lutra-secret";
+                    AWS_REGION = "us-east-1";
+                    AWS_S3_SECURE = "false";
+                  };
+                };
+              };
+            };
         };
     };
 }

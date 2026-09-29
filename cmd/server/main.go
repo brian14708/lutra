@@ -5,10 +5,14 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"io"
+	"io/fs"
 	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
+	"path"
+	"strings"
 	"syscall"
 	"time"
 
@@ -20,7 +24,6 @@ import (
 	dbmigrations "github.com/brian14708/lutra/db/migrations"
 	lutrav1connect "github.com/brian14708/lutra/gen/lutra/v1/lutrav1connect"
 	"github.com/brian14708/lutra/internal/lutra"
-	"github.com/brian14708/lutra/internal/lutra/web"
 	_ "github.com/jackc/pgx/v5/stdlib"
 	"github.com/pressly/goose/v3"
 )
@@ -60,12 +63,11 @@ func main() {
 	rpcMux.Handle(reflectionPath, reflectionHandler)
 	reflectionAlphaPath, reflectionAlphaHandler := grpcreflect.NewHandlerV1Alpha(reflector, interceptors)
 	rpcMux.Handle(reflectionAlphaPath, reflectionAlphaHandler)
-	mux.Handle("/rpc/", http.StripPrefix("/rpc", rpcMux))
-	// Serve the SPA build when LUTRA_CONSOLE_DIR points at it.
-	if consoleDir := os.Getenv("LUTRA_CONSOLE_DIR"); consoleDir != "" {
-		if info, err := os.Stat(consoleDir); err == nil && info.IsDir() {
-			mux.Handle("/", web.New(os.DirFS(consoleDir)))
-		}
+	mux.Handle("/api/", http.StripPrefix("/api", rpcMux))
+	// Serve the SPA build when it is present.
+	const consoleDir = "console/dist"
+	if info, err := os.Stat(consoleDir); err == nil && info.IsDir() {
+		mux.Handle("/", spaHandler(os.DirFS(consoleDir)))
 	}
 
 	server := &http.Server{Addr: addr, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
@@ -112,4 +114,54 @@ func runMigrations() error {
 
 	_, err = provider.Up(context.Background())
 	return err
+}
+
+// spaHandler serves the Vite build and falls back to index.html for client routes.
+func spaHandler(fsys fs.FS) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet && r.Method != http.MethodHead {
+			w.Header().Set("Allow", "GET, HEAD")
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		name := strings.TrimPrefix(path.Clean("/"+r.URL.Path), "/")
+		if name == "" {
+			name = "index.html"
+		}
+		if serveSPAFile(w, r, fsys, name) {
+			return
+		}
+		// Missing hashed assets must remain 404s instead of returning HTML.
+		if strings.HasPrefix(name, "assets/") {
+			http.NotFound(w, r)
+			return
+		}
+		if name != "index.html" && serveSPAFile(w, r, fsys, "index.html") {
+			return
+		}
+		http.NotFound(w, r)
+	})
+}
+
+func serveSPAFile(w http.ResponseWriter, r *http.Request, fsys fs.FS, name string) bool {
+	f, err := fsys.Open(name)
+	if err != nil {
+		return false
+	}
+	defer func() { _ = f.Close() }()
+	info, err := f.Stat()
+	if err != nil || info.IsDir() {
+		return false
+	}
+	rs, ok := f.(io.ReadSeeker)
+	if !ok {
+		return false
+	}
+	if strings.HasPrefix(name, "assets/") {
+		w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+	} else if name == "index.html" {
+		w.Header().Set("Cache-Control", "no-cache")
+	}
+	http.ServeContent(w, r, info.Name(), info.ModTime(), rs)
+	return true
 }

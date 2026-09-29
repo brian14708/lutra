@@ -11,6 +11,6 @@ node_modules/
 /gen/
 /console/.output/
 /console/dist/
-/console/file-routes.d.ts
+/console/src/routeTree.gen.ts
 /console/src/proto/
 /internal/db/*.go
