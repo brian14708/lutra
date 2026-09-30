@@ -17,6 +17,7 @@ from lutra._gen.lutra.v1.lutra_pb import (
     CreateRunRequest,
     GetRunRequest,
     Run,
+    TaskAction,
     TaskSpec,
     WatchRunRequest,
 )
@@ -35,6 +36,13 @@ def _require_run(run: Run | None) -> Run:
         message = "server returned no run"
         raise RuntimeError(message)
     return run
+
+
+def _require_action(action: TaskAction | None) -> TaskAction:
+    if action is None:
+        message = "server returned no task action"
+        raise RuntimeError(message)
+    return action
 
 
 class RunHandle(Generic[R]):

@@ -7,9 +7,9 @@ from unittest.mock import AsyncMock
 
 import cbor2
 import pytest
-from lutra import _blob, task_host  # ruff: ignore[import-private-name]
+from lutra import _blob  # ruff: ignore[import-private-name]
 from lutra._gen.lutra.task.v1.task_pb import ExecuteRequest, ExecuteResponse  # ruff: ignore[import-private-name]
-from lutra.task_host import TaskAPIClient, _TaskService, normalize_result  # ruff: ignore[import-private-name]
+from lutra.serve import TaskAPIClient, _Host, _host, _TaskService, normalize_result  # ruff: ignore[import-private-name]
 from lutra.value import BlobRef
 
 if TYPE_CHECKING:
@@ -34,7 +34,7 @@ async def test_synchronous_handler_does_not_block_other_calls() -> None:
         return content_type, payload
 
     service = _TaskService(handler)
-    service.api_client = cast("TaskAPIClient", object())
+    service.api_client = TaskAPIClient(cast("_Host", object()))
     ctx = cast("RequestContext[ExecuteRequest, ExecuteResponse]", None)
     slow = asyncio.create_task(service.execute(ExecuteRequest(invocation_id="slow"), ctx))
     assert await asyncio.to_thread(started.wait, 1)
@@ -53,7 +53,7 @@ async def test_result_threshold(monkeypatch: pytest.MonkeyPatch) -> None:
             resolve=True,
         )
     )
-    monkeypatch.setattr(task_host, "_store_result", store)
+    monkeypatch.setattr(_host, "_store_result", store)
     api_client = cast("TaskAPIClient", object())
     mime, embedded = await normalize_result(b"x" * 65536, api_client)
     assert mime == "application/cbor"

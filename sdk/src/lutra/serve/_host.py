@@ -1,14 +1,13 @@
-"""Serve a task callable over multiplexed newline-delimited JSON on stdio."""
+"""Serve task calls over multiplexed newline-delimited JSON on stdio."""
 
 from __future__ import annotations
 
-import argparse
 import asyncio
-import importlib
 import inspect
 import json
 import struct
 import sys
+from contextvars import ContextVar, Token
 from typing import TYPE_CHECKING, Any
 
 import httpx
@@ -78,15 +77,21 @@ class _TaskService:
             raise ConnectError(Code.INVALID_ARGUMENT, "invocation_id is required")
         if self.api_client is None:
             raise ConnectError(Code.INTERNAL, "task API client is unavailable")
+        run_token, action_token = self.api_client.set_execution_context(
+            request.run_id, request.action_id
+        )
         args = (request.invocation_id, request.content_type, request.input, self.api_client)
-        if inspect.iscoroutinefunction(self._handler):
-            result = self._handler(*args)
-        else:
-            result = await asyncio.to_thread(self._handler, *args)
-        if inspect.isawaitable(result):
-            result = await result
-        content_type, output = await normalize_result(result, self.api_client)
-        return ExecuteResponse(content_type=content_type, output=output)
+        try:
+            if inspect.iscoroutinefunction(self._handler):
+                result = self._handler(*args)
+            else:
+                result = await asyncio.to_thread(self._handler, *args)
+            if inspect.isawaitable(result):
+                result = await result
+            content_type, output = await normalize_result(result, self.api_client)
+            return ExecuteResponse(content_type=content_type, output=output)
+        finally:
+            self.api_client.reset_execution_context(run_token, action_token)
 
 
 async def _store_result(api_client: TaskAPIClient, contents: bytes, mime_type: str) -> BlobRef:
@@ -129,6 +134,8 @@ class TaskAPIClient:
 
     def __init__(self, host: _Host) -> None:
         self._host = host
+        self._run_id: ContextVar[str] = ContextVar("lutra_run_id", default="")
+        self._action_id: ContextVar[str] = ContextVar("lutra_action_id", default="")
         self.blob = BlobServiceClient(
             "http://stdio",
             codec=proto_json_codec(),
@@ -136,6 +143,21 @@ class TaskAPIClient:
             accept_compression=(),
             http_client=pyqwest.Client(transport=StdioTransport(self)),
         )
+
+    @property
+    def run_id(self) -> str:
+        return self._run_id.get()
+
+    @property
+    def action_id(self) -> str:
+        return self._action_id.get()
+
+    def set_execution_context(self, run_id: str, action_id: str) -> tuple[Token[str], Token[str]]:
+        return self._run_id.set(run_id), self._action_id.set(action_id)
+
+    def reset_execution_context(self, run_token: Token[str], action_token: Token[str]) -> None:
+        self._run_id.reset(run_token)
+        self._action_id.reset(action_token)
 
     async def unary(self, path: str, value: dict[str, Any]) -> dict[str, Any]:
         self._host.next_reverse += 1
@@ -420,19 +442,3 @@ async def serve(handler: Callable[..., Any]) -> None:
             *(call.task for call in pending if call.task is not None), return_exceptions=True
         )
         sys.stdout = original_stdout
-
-
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Serve a Lutra task on stdio")
-    parser.add_argument("callable", help="module:callable")
-    args = parser.parse_args()
-    module_name, separator, name = args.callable.partition(":")
-    if not separator or not module_name or not name:
-        parser.error("callable must be module:callable")
-    _redirect_user_stdout()
-    handler = getattr(importlib.import_module(module_name), name)
-    asyncio.run(serve(handler))
-
-
-if __name__ == "__main__":
-    main()

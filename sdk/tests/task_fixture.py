@@ -3,7 +3,7 @@
 import asyncio
 import sys
 
-from lutra.task_host import TaskAPIClient
+from lutra.serve import TaskAPIClient
 
 print("task module loaded")  # ruff: ignore[print]
 

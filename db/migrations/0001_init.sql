@@ -61,29 +61,61 @@ CREATE TABLE lutra.task_specs (
     PRIMARY KEY (project, domain, name, version)
 );
 
+CREATE TYPE lutra.task_action_status AS ENUM ('queued', 'running', 'waiting', 'succeeded', 'failed', 'canceled');
+
 CREATE TABLE lutra.runs (
     id uuid PRIMARY KEY,
-    parent_id uuid REFERENCES lutra.runs(id),
-    idempotency_key text,
+    project text NOT NULL,
+    domain text NOT NULL,
+    root_idempotency_key text,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    UNIQUE (id, project, domain)
+);
+CREATE UNIQUE INDEX runs_idempotency_idx ON lutra.runs (project, domain, root_idempotency_key) WHERE root_idempotency_key IS NOT NULL;
+
+CREATE TABLE lutra.task_actions (
+    id uuid PRIMARY KEY,
+    run_id uuid NOT NULL REFERENCES lutra.runs(id) ON DELETE CASCADE,
+    caller_action_id uuid,
     project text NOT NULL,
     domain text NOT NULL,
     name text NOT NULL,
     version text NOT NULL,
     input_cbor bytea NOT NULL,
     output_cbor bytea,
-    status text NOT NULL CHECK (status IN ('queued', 'running', 'waiting', 'succeeded', 'failed', 'canceled')),
+    status lutra.task_action_status NOT NULL DEFAULT 'queued',
+    error text NOT NULL DEFAULT '',
     attempts integer NOT NULL DEFAULT 0,
     claim_token uuid,
     lease_until timestamptz,
-    error text NOT NULL DEFAULT '',
     next_attempt_at timestamptz NOT NULL DEFAULT now(),
+    idempotency_key text,
     created_at timestamptz NOT NULL DEFAULT now(),
     updated_at timestamptz NOT NULL DEFAULT now(),
-    FOREIGN KEY (project, domain, name, version) REFERENCES lutra.task_specs(project, domain, name, version)
+    FOREIGN KEY (project, domain, name, version) REFERENCES lutra.task_specs(project, domain, name, version),
+    FOREIGN KEY (run_id, project, domain) REFERENCES lutra.runs(id, project, domain),
+    FOREIGN KEY (run_id, caller_action_id) REFERENCES lutra.task_actions(run_id, id),
+    UNIQUE (run_id, id)
 );
-CREATE INDEX runs_status_idx ON lutra.runs (status, created_at);
-CREATE INDEX runs_parent_idx ON lutra.runs (parent_id);
-CREATE UNIQUE INDEX runs_idempotency_idx ON lutra.runs (project, domain, idempotency_key) WHERE idempotency_key IS NOT NULL;
+CREATE UNIQUE INDEX task_actions_one_root_idx ON lutra.task_actions (run_id) WHERE caller_action_id IS NULL;
+CREATE UNIQUE INDEX task_actions_idempotency_idx ON lutra.task_actions (run_id, idempotency_key) WHERE idempotency_key IS NOT NULL;
+CREATE INDEX task_actions_claim_idx ON lutra.task_actions (status, next_attempt_at, created_at);
+CREATE INDEX task_actions_run_caller_idx ON lutra.task_actions (run_id, caller_action_id, created_at, id);
+
+ALTER TABLE lutra.runs
+    ADD COLUMN root_action_id uuid,
+    ADD CONSTRAINT runs_root_action_fk FOREIGN KEY (id, root_action_id) REFERENCES lutra.task_actions(run_id, id) DEFERRABLE INITIALLY DEFERRED;
+
+CREATE TABLE lutra.task_action_edges (
+    run_id uuid NOT NULL REFERENCES lutra.runs(id) ON DELETE CASCADE,
+    source_action_id uuid NOT NULL,
+    dependent_action_id uuid NOT NULL,
+    PRIMARY KEY (run_id, source_action_id, dependent_action_id),
+    CHECK (source_action_id <> dependent_action_id),
+    FOREIGN KEY (run_id, source_action_id) REFERENCES lutra.task_actions(run_id, id) ON DELETE CASCADE,
+    FOREIGN KEY (run_id, dependent_action_id) REFERENCES lutra.task_actions(run_id, id) ON DELETE CASCADE
+);
+CREATE INDEX task_action_edges_dependent_idx ON lutra.task_action_edges (run_id, dependent_action_id);
 
 CREATE TABLE lutra.run_log_streams (
     run_id uuid NOT NULL REFERENCES lutra.runs(id) ON DELETE CASCADE,
@@ -124,8 +156,12 @@ CREATE INDEX run_log_records_stream_seq_idx ON lutra.run_log_records (run_id, st
 DROP TABLE IF EXISTS lutra.run_log_records;
 DROP TABLE IF EXISTS lutra.run_log_appends;
 DROP TABLE IF EXISTS lutra.run_log_streams;
+DROP TABLE IF EXISTS lutra.task_action_edges;
+ALTER TABLE IF EXISTS lutra.runs DROP CONSTRAINT IF EXISTS runs_root_action_fk;
+DROP TABLE IF EXISTS lutra.task_actions;
 DROP TABLE IF EXISTS lutra.runs;
 DROP TABLE IF EXISTS lutra.task_specs;
+DROP TYPE IF EXISTS lutra.task_action_status;
 DROP TABLE IF EXISTS lutra.blob_uploads;
 DROP TABLE IF EXISTS lutra.blobs;
 DROP TABLE IF EXISTS lutra.settings;

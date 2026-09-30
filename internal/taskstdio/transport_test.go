@@ -310,7 +310,7 @@ func TestTaskHostRoundTrip(t *testing.T) {
 	root := filepath.Join(filepath.Dir(file), "..", "..")
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "uv", "run", "--package", "lutra", "python", "-m", "lutra.task_host", "task_fixture:echo")
+	cmd := exec.CommandContext(ctx, "uv", "run", "--package", "lutra", "python", "-m", "lutra.serve", "task_fixture:echo")
 	cmd.Dir = root
 	cmd.Env = append(os.Environ(), "PYTHONPATH="+filepath.Join(root, "sdk", "tests"))
 	var stderr bytes.Buffer

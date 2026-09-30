@@ -30,6 +30,8 @@ import (
 )
 
 type activeRun struct {
+	runID    uuid.UUID
+	actionID uuid.UUID
 	ctx      context.Context
 	cancel   context.CancelFunc
 	token    uuid.UUID
@@ -43,7 +45,7 @@ const (
 	maxSourceSize = 64 << 20
 )
 
-// Worker claims persistent runs and executes each attempt in a fresh bundle directory.
+// Worker claims persistent task actions and executes each attempt in a fresh bundle directory.
 type Worker struct {
 	DB             *pgxpool.Pool
 	TaskAPIHandler http.Handler
@@ -77,8 +79,8 @@ func (w *Worker) loop(ctx context.Context) {
 			return
 		case <-w.slots:
 		}
-		id, token, attempt, err := w.claim(ctx)
-		if err != nil || id == uuid.Nil {
+		actionID, runID, token, attempt, err := w.claim(ctx)
+		if err != nil || actionID == uuid.Nil {
 			if err != nil && ctx.Err() == nil {
 				slog.Error("claim run", "error", err)
 			}
@@ -91,37 +93,56 @@ func (w *Worker) loop(ctx context.Context) {
 			continue
 		}
 		runCtx, cancel := context.WithCancel(ctx)
-		active := &activeRun{ctx: runCtx, cancel: cancel, token: token, slotHeld: true}
+		active := &activeRun{ctx: runCtx, cancel: cancel, token: token, slotHeld: true, runID: runID, actionID: actionID}
 		w.mu.Lock()
-		w.active[id] = active
+		w.active[actionID] = active
 		w.mu.Unlock()
-		go w.execute(runCtx, id, attempt, active)
+		go w.execute(runCtx, actionID, runID, attempt, active)
 	}
 }
 
-func (w *Worker) claim(ctx context.Context) (uuid.UUID, uuid.UUID, int32, error) {
+func (w *Worker) claim(ctx context.Context) (uuid.UUID, uuid.UUID, uuid.UUID, int32, error) {
 	token := uuid.New()
-	claimed, err := w.queries.ClaimRun(ctx, db.ClaimRunParams{
+	claimed, err := w.queries.ClaimTaskAction(ctx, db.ClaimTaskActionParams{
 		ClaimToken: token, LeaseSeconds: int32(leaseDuration / time.Second),
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
-		return uuid.Nil, uuid.Nil, 0, nil
+		return uuid.Nil, uuid.Nil, uuid.Nil, 0, nil
 	}
-	return claimed.ID, token, claimed.Attempts, err
+	return claimed.ID, claimed.RunID, token, claimed.Attempts, err
 }
 
-func (w *Worker) cancel(id uuid.UUID) {
+func (w *Worker) cancelRun(runID uuid.UUID) {
 	w.mu.Lock()
-	active := w.active[id]
+	active := make([]*activeRun, 0)
+	for _, candidate := range w.active {
+		if candidate.runID == runID {
+			active = append(active, candidate)
+		}
+	}
 	w.mu.Unlock()
-	if active != nil {
-		active.cancel()
+	for _, candidate := range active {
+		candidate.cancel()
 	}
 }
 
-func (w *Worker) execute(ctx context.Context, id uuid.UUID, attempt int32, active *activeRun) {
+func (w *Worker) cancelDescendants(runID, rootID uuid.UUID) {
+	w.mu.Lock()
+	active := make([]*activeRun, 0)
+	for _, candidate := range w.active {
+		if candidate.runID == runID && candidate.actionID != rootID {
+			active = append(active, candidate)
+		}
+	}
+	w.mu.Unlock()
+	for _, candidate := range active {
+		candidate.cancel()
+	}
+}
+
+func (w *Worker) execute(ctx context.Context, actionID, runID uuid.UUID, attempt int32, active *activeRun) {
 	stopRenewal := make(chan struct{})
-	go w.renewLease(ctx, id, active, stopRenewal)
+	go w.renewLease(ctx, actionID, active, stopRenewal)
 	defer func() {
 		close(stopRenewal)
 		active.cancel()
@@ -131,15 +152,15 @@ func (w *Worker) execute(ctx context.Context, id uuid.UUID, attempt int32, activ
 		}
 		active.mu.Unlock()
 		w.mu.Lock()
-		if w.active[id] == active {
-			delete(w.active, id)
+		if w.active[actionID] == active {
+			delete(w.active, actionID)
 		}
 		w.mu.Unlock()
 	}()
-	claimed, err := w.queries.LoadClaimedRun(ctx, db.LoadClaimedRunParams{RunID: id, ClaimToken: active.token})
+	claimed, err := w.queries.LoadClaimedTaskAction(ctx, db.LoadClaimedTaskActionParams{ActionID: actionID, ClaimToken: active.token})
 	if err != nil {
-		if finishErr := w.finish(id, active.token, attempt, nil, err); finishErr != nil {
-			slog.Error("finish run", "run_id", id, "error", finishErr)
+		if finishErr := w.finish(actionID, runID, active.token, attempt, nil, err); finishErr != nil {
+			slog.Error("finish action", "action_id", actionID, "error", finishErr)
 		}
 		return
 	}
@@ -151,14 +172,14 @@ func (w *Worker) execute(ctx context.Context, id uuid.UUID, attempt int32, activ
 	}
 	archive, err := w.loadSource(ctx, claimed.ObjectKey, claimed.SourceSha256)
 	if err != nil {
-		if finishErr := w.finish(id, active.token, attempt, nil, err); finishErr != nil {
-			slog.Error("finish run", "run_id", id, "error", finishErr)
+		if finishErr := w.finish(actionID, runID, active.token, attempt, nil, err); finishErr != nil {
+			slog.Error("finish action", "action_id", actionID, "error", finishErr)
 		}
 		return
 	}
-	output, err := w.attempt(ctx, id, task, archive, claimed.InputCbor, attempt)
-	if finishErr := w.finish(id, active.token, attempt, output, err); finishErr != nil {
-		slog.Error("finish run", "run_id", id, "error", finishErr)
+	output, err := w.attempt(ctx, actionID, runID, active.token, task, archive, claimed.InputCbor, attempt)
+	if finishErr := w.finish(actionID, runID, active.token, attempt, output, err); finishErr != nil {
+		slog.Error("finish action", "action_id", actionID, "error", finishErr)
 	}
 }
 
@@ -185,7 +206,7 @@ func (w *Worker) loadSource(ctx context.Context, objectID uuid.UUID, digest []by
 	return archive, nil
 }
 
-func (w *Worker) renewLease(ctx context.Context, id uuid.UUID, active *activeRun, stop <-chan struct{}) {
+func (w *Worker) renewLease(ctx context.Context, actionID uuid.UUID, active *activeRun, stop <-chan struct{}) {
 	ticker := time.NewTicker(leaseRenewal)
 	defer ticker.Stop()
 	for {
@@ -196,13 +217,13 @@ func (w *Worker) renewLease(ctx context.Context, id uuid.UUID, active *activeRun
 			return
 		case <-ticker.C:
 			renewCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-			rows, err := w.queries.RenewRunLease(renewCtx, db.RenewRunLeaseParams{
-				LeaseSeconds: int32(leaseDuration / time.Second), RunID: id, ClaimToken: active.token,
+			rows, err := w.queries.RenewTaskActionLease(renewCtx, db.RenewTaskActionLeaseParams{
+				LeaseSeconds: int32(leaseDuration / time.Second), ActionID: actionID, ClaimToken: active.token,
 			})
 			cancel()
 			if err != nil || rows != 1 {
 				if err != nil && ctx.Err() == nil {
-					slog.Error("renew run lease", "run_id", id, "error", err)
+					slog.Error("renew action lease", "action_id", actionID, "error", err)
 				}
 				active.cancel()
 				return
@@ -211,49 +232,67 @@ func (w *Worker) renewLease(ctx context.Context, id uuid.UUID, active *activeRun
 	}
 }
 
-func (w *Worker) finish(id, token uuid.UUID, attempt int32, output []byte, runErr error) error {
+func (w *Worker) finish(actionID, runID, token uuid.UUID, attempt int32, output []byte, runErr error) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	var status string
+	tx, err := w.DB.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	q := db.New(tx)
+	locked, err := q.LockRun(ctx, runID)
+	if err != nil {
+		return err
+	}
+	var status db.LutraTaskActionStatus
 	var errorText string
 	var nextAttempt pgtype.Timestamptz
 	if runErr == nil {
-		status = "succeeded"
+		status = db.LutraTaskActionStatusSucceeded
 	} else if attempt < 3 {
 		delay := time.Second * time.Duration(1<<(attempt-1))
-		status = "queued"
+		status = db.LutraTaskActionStatusQueued
 		errorText = runErr.Error()
 		nextAttempt = pgtype.Timestamptz{Time: time.Now().Add(delay), Valid: true}
 	} else {
-		status = "failed"
+		status = db.LutraTaskActionStatusFailed
 		errorText = runErr.Error()
 	}
-	rows, err := w.queries.FinishRun(ctx, db.FinishRunParams{
-		RunID: id, ClaimToken: token, Attempt: attempt,
+	rows, err := q.FinishTaskAction(ctx, db.FinishTaskActionParams{
+		ActionID: actionID, ClaimToken: token, Attempt: attempt,
 		Status: status, OutputCbor: output, Error: errorText, NextAttemptAt: nextAttempt,
 	})
 	if err != nil {
 		return err
 	}
 	if rows == 0 {
-		slog.Debug("run completion discarded", "run_id", id, "attempt", attempt)
+		slog.Debug("action completion discarded", "action_id", actionID, "attempt", attempt)
+	}
+	rootTerminal := rows == 1 && status != db.LutraTaskActionStatusQueued && locked.RootActionID != nil && *locked.RootActionID == actionID
+	if rootTerminal {
+		if _, closeErr := q.CloseRunDescendants(ctx, db.CloseRunDescendantsParams{RunID: runID, ID: actionID}); closeErr != nil {
+			return closeErr
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return err
+	}
+	if rootTerminal {
+		w.cancelDescendants(runID, actionID)
 	}
 	return nil
 }
 
-func (w *Worker) waitChild(ctx context.Context, parent string, child uuid.UUID) error {
-	parentID, err := uuid.Parse(parent)
-	if err != nil {
-		return invalidTask("invalid parent id")
-	}
-	actual, err := w.queries.GetChildParentID(ctx, child)
-	if err != nil || actual == nil || *actual != parentID {
-		return invalidTask("run is not a child of this task")
+func (w *Worker) waitAction(ctx context.Context, identity taskContext, child uuid.UUID) error {
+	actual, err := w.queries.GetTaskActionCaller(ctx, child)
+	if err != nil || actual.RunID != identity.runID || actual.CallerActionID == nil || *actual.CallerActionID != identity.actionID {
+		return invalidTask("task action is not a child of this task")
 	}
 	w.mu.Lock()
-	active := w.active[parentID]
+	active := w.active[identity.actionID]
 	w.mu.Unlock()
-	if active == nil {
+	if active == nil || active.token != identity.token {
 		return invalidTask("parent run is not active")
 	}
 	active.mu.Lock()
@@ -278,14 +317,14 @@ func (w *Worker) waitChild(ctx context.Context, parent string, child uuid.UUID) 
 			active.mu.Unlock()
 			restoreCtx, cancel := context.WithTimeout(active.ctx, 5*time.Second)
 			defer cancel()
-			if _, err := w.queries.RestoreRunRunning(restoreCtx, db.RestoreRunRunningParams{
-				RunID: parentID, ClaimToken: active.token,
+			if _, err := w.queries.RestoreTaskActionRunning(restoreCtx, db.RestoreTaskActionRunningParams{
+				ActionID: active.actionID, ClaimToken: active.token,
 			}); err != nil && restoreCtx.Err() == nil {
-				slog.Error("restore parent run", "run_id", parentID, "error", err)
+				slog.Error("restore parent action", "action_id", active.actionID, "error", err)
 			}
 		}
 	}()
-	rows, err := w.queries.MarkRunWaiting(ctx, db.MarkRunWaitingParams{RunID: parentID, ClaimToken: active.token})
+	rows, err := w.queries.MarkTaskActionWaiting(ctx, db.MarkTaskActionWaitingParams{ActionID: active.actionID, ClaimToken: active.token})
 	if err != nil {
 		return err
 	}
@@ -293,11 +332,11 @@ func (w *Worker) waitChild(ctx context.Context, parent string, child uuid.UUID) 
 		return invalidTask("parent run is not active")
 	}
 	for {
-		status, err := w.queries.GetRunStatus(ctx, child)
+		status, err := w.queries.GetActionStatus(ctx, child)
 		if err != nil {
 			return err
 		}
-		if terminal(status) {
+		if terminal(string(status)) {
 			return nil
 		}
 		select {
@@ -308,7 +347,7 @@ func (w *Worker) waitChild(ctx context.Context, parent string, child uuid.UUID) 
 	}
 }
 
-func (w *Worker) attempt(ctx context.Context, id uuid.UUID, task *lutrav1.TaskSpec, archive, input []byte, attempt int32) ([]byte, error) {
+func (w *Worker) attempt(ctx context.Context, actionID, runID, token uuid.UUID, task *lutrav1.TaskSpec, archive, input []byte, attempt int32) ([]byte, error) {
 	if task.GetImage().GetName() != localTaskImage {
 		return nil, fmt.Errorf("unsupported task image %q", task.GetImage().GetName())
 	}
@@ -365,6 +404,8 @@ func (w *Worker) attempt(ctx context.Context, id uuid.UUID, task *lutrav1.TaskSp
 		"--setenv", "LUTRA_TASK_SOURCE_URI", task.GetSource().GetUri(),
 		"--setenv", "LUTRA_TASK_IMAGE", task.GetImage().GetName(),
 		"--setenv", "LUTRA_ATTEMPT", fmt.Sprint(attempt),
+		"--setenv", "LUTRA_TASK_RUN_ID", runID.String(),
+		"--setenv", "LUTRA_TASK_ACTION_ID", actionID.String(),
 		"--setenv", "PYTHONPATH", dir+":"+filepath.Join(dir, "src")+":"+filepath.Join(dir, "sdk", "src"),
 		"--", pythonPath, "-m", "lutra.serve",
 	)
@@ -377,8 +418,8 @@ func (w *Worker) attempt(ctx context.Context, id uuid.UUID, task *lutrav1.TaskSp
 	}
 	process.Transport.SetReverseHandler(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
 		switch request.URL.Path {
-		case lutrav1connect.LutraServiceCreateRunProcedure,
-			lutrav1connect.LutraServiceGetRunProcedure,
+		case lutrav1connect.LutraServiceCreateTaskActionProcedure,
+			lutrav1connect.LutraServiceGetTaskActionProcedure,
 			lutrav1connect.BlobServiceCreateUploadProcedure,
 			lutrav1connect.BlobServicePresignPartProcedure,
 			lutrav1connect.BlobServiceCompleteUploadProcedure,
@@ -390,9 +431,9 @@ func (w *Worker) attempt(ctx context.Context, id uuid.UUID, task *lutrav1.TaskSp
 			_, _ = response.Write([]byte(`{"code":"permission_denied","message":"procedure is unavailable to task"}`))
 			return
 		}
-		w.TaskAPIHandler.ServeHTTP(response, request.WithContext(context.WithValue(request.Context(), parentKey{}, id.String())))
+		w.TaskAPIHandler.ServeHTTP(response, request.WithContext(context.WithValue(request.Context(), taskContextKey{}, taskContext{runID: runID, actionID: actionID, token: token})))
 	}))
-	result, callErr := process.Client().Execute(ctx, connect.NewRequest(&taskv1.ExecuteRequest{InvocationId: id.String(), ContentType: "application/cbor", Input: input}))
+	result, callErr := process.Client().Execute(ctx, connect.NewRequest(&taskv1.ExecuteRequest{InvocationId: actionID.String(), RunId: runID.String(), ActionId: actionID.String(), ContentType: "application/cbor", Input: input}))
 	closeErr := process.Close()
 	if callErr != nil {
 		return nil, callErr

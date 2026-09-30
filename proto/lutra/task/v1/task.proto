@@ -6,7 +6,7 @@ option go_package = "github.com/brian14708/lutra/gen/lutra/task/v1;taskv1";
 
 // TaskService runs inside a task host subprocess speaking a multiplexed NDJSON
 // protocol over stdio (implemented by internal/taskstdio in Go and
-// lutra.task_host in Python). Frame IDs are namespaced by initiator: the Go
+// lutra.serve in Python). Frame IDs are namespaced by initiator: the Go
 // side uses "g<N>" for its calls, the task host uses "p<N>" for reverse calls
 // back into Go.
 service TaskService {
@@ -17,6 +17,8 @@ message ExecuteRequest {
   string invocation_id = 1;
   string content_type = 2;
   bytes input = 3;
+  string run_id = 4;
+  string action_id = 5;
 }
 
 message ExecuteResponse {

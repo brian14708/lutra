@@ -5,9 +5,11 @@ package lutra.v1;
 option go_package = "github.com/brian14708/lutra/gen/lutra/v1;lutrav1";
 
 service LutraService {
-  rpc Greet(GreetRequest) returns (GreetResponse);
   rpc CreateRun(CreateRunRequest) returns (CreateRunResponse);
+  rpc CreateTaskAction(CreateTaskActionRequest) returns (CreateTaskActionResponse);
   rpc GetRun(GetRunRequest) returns (GetRunResponse);
+  rpc GetTaskAction(GetTaskActionRequest) returns (GetTaskActionResponse);
+  rpc ListTaskActions(ListTaskActionsRequest) returns (ListTaskActionsResponse);
   rpc CancelRun(CancelRunRequest) returns (CancelRunResponse);
   rpc WatchRun(WatchRunRequest) returns (stream WatchRunResponse);
 }
@@ -37,11 +39,18 @@ message TaskSpec {
 message CreateRunRequest {
   TaskSpec spec = 1;
   bytes input_cbor = 2;
-  string parent_id = 3;
   string idempotency_key = 4;
 }
 message CreateRunResponse {
   Run run = 1;
+}
+message CreateTaskActionRequest {
+  TaskSpec spec = 1;
+  bytes input_cbor = 2;
+  string idempotency_key = 3;
+}
+message CreateTaskActionResponse {
+  TaskAction action = 1;
 }
 message GetRunRequest {
   string id = 1;
@@ -49,6 +58,22 @@ message GetRunRequest {
 }
 message GetRunResponse {
   Run run = 1;
+}
+message GetTaskActionRequest {
+  string id = 1;
+  bool wait = 2;
+}
+message GetTaskActionResponse {
+  TaskAction action = 1;
+}
+message ListTaskActionsRequest {
+  string run_id = 1;
+  int32 page_size = 2;
+  string page_token = 3;
+}
+message ListTaskActionsResponse {
+  repeated TaskAction actions = 1;
+  string next_page_token = 2;
 }
 message CancelRunRequest {
   string id = 1;
@@ -64,21 +89,26 @@ message WatchRunResponse {
 }
 message Run {
   string id = 1;
-  string parent_id = 2;
+  string root_action_id = 2;
   TaskSpec spec = 3;
   string status = 4;
-  int32 attempts = 5;
+  bytes output_cbor = 5;
+  string error = 6;
+  string created_at = 7;
+  string updated_at = 8;
+}
+
+message TaskAction {
+  string id = 1;
+  string run_id = 2;
+  string caller_action_id = 3;
+  TaskSpec spec = 4;
+  bytes input_cbor = 5;
   bytes output_cbor = 6;
-  string error = 7;
-  string created_at = 8;
-  string updated_at = 9;
-}
-
-message GreetRequest {
-  bytes parameters_cbor = 1;
-}
-
-message GreetResponse {
-  string content_type = 1;
-  bytes result_cbor = 2;
+  string status = 7;
+  string error = 8;
+  int32 attempts = 9;
+  string created_at = 10;
+  string updated_at = 11;
+  repeated string upstream_action_ids = 12;
 }
