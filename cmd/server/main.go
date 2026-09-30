@@ -113,9 +113,9 @@ func main() {
 	rpcMux.Handle(reflectionAlphaPath, reflectionAlphaHandler)
 	mux.Handle("/api/", http.StripPrefix("/api", rpcMux))
 	// Serve the SPA build when it is present.
-	const consoleDir = "console/dist"
-	if info, err := os.Stat(consoleDir); err == nil && info.IsDir() {
-		mux.Handle("/", web.New(os.DirFS(consoleDir)))
+	const uiDir = "ui/dist"
+	if info, err := os.Stat(uiDir); err == nil && info.IsDir() {
+		mux.Handle("/", web.New(os.DirFS(uiDir)))
 	}
 
 	server := &http.Server{Addr: addr, Handler: mux, ReadHeaderTimeout: 5 * time.Second}

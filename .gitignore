@@ -9,8 +9,8 @@ node_modules/
 # Generated files
 /sdk/src/lutra/_gen/
 /gen/
-/console/.output/
-/console/dist/
-/console/src/routeTree.gen.ts
-/console/src/proto/
+/ui/.output/
+/ui/dist/
+/ui/src/routeTree.gen.ts
+/ui/src/proto/
 /internal/db/*.go

@@ -24,11 +24,11 @@ plugins:
     opt:
       - io=async
   - local: [pnpm, exec, protoc-gen-es]
-    out: console/src/proto
+    out: ui/src/proto
     include_imports: true
     opt:
       - target=ts
   - local: [pnpm, exec, protoc-gen-connect-query]
-    out: console/src/proto
+    out: ui/src/proto
     opt:
       - target=ts

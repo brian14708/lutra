@@ -1,4 +1,4 @@
 packages:
-  - console
+  - ui
 allowBuilds:
   esbuild: true
