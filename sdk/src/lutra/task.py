@@ -10,6 +10,7 @@ from functools import update_wrapper
 from pathlib import Path
 from typing import TYPE_CHECKING, Generic, ParamSpec, TypeVar, cast
 
+from lutra._bundle import project_root
 from lutra._gen.lutra.v1.lutra_pb import SourceBundle, TaskImage, TaskSpec
 
 if TYPE_CHECKING:
@@ -47,16 +48,20 @@ class Task(Generic[P, R]):
         if "<locals>" in function.__qualname__:
             message = "tasks must be defined at module scope"
             raise ValueError(message)
+        self.source_file = Path(inspect.getfile(cast("FunctionType", function))).resolve()
         module_name = function.__module__
         loaded = sys.modules.get(module_name)
         spec = getattr(loaded, "__spec__", None)
-        if module_name == "__main__" and spec is not None and spec.name:
-            module_name = spec.name
+        if module_name == "__main__":
+            if spec is not None and spec.name:
+                module_name = spec.name
+            else:
+                relative = self.source_file.relative_to(project_root(self.source_file))
+                module_name = ".".join(relative.with_suffix("").parts)
         self.function = function
         self.name = function.__name__
         self.module = module_name
         self.qualname = function.__qualname__
-        self.source_file = Path(inspect.getfile(cast("FunctionType", function))).resolve()
         update_wrapper(self, function)
         self.__module__ = module_name
         self.__signature__ = inspect.signature(function)

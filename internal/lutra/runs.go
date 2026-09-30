@@ -254,6 +254,11 @@ func (s Service) CreateTaskAction(ctx context.Context, req *connect.Request[lutr
 		} else if err != nil {
 			return nil, err
 		}
+		if err == nil {
+			if err := s.Worker.Logs.AppendActionStatus(ctx, tx, actionID); err != nil {
+				return nil, err
+			}
+		}
 	}
 	if err := q.InsertTaskActionEdge(ctx, db.InsertTaskActionEdgeParams{RunID: active.runID, SourceActionID: actionID, DependentActionID: active.actionID}); err != nil {
 		return nil, err
@@ -493,10 +498,14 @@ func (s Service) WatchRun(ctx context.Context, req *connect.Request[lutrav1.Watc
 	if err != nil {
 		return invalidTask("invalid run id")
 	}
-	return s.watchRun(ctx, id, stream.Send)
+	cursor := req.Msg.GetTaskLogs()
+	if cursor != nil && (cursor.GetStream() != runlog.TaskLogStream || cursor.GetAfterSeq() < 0 || len(cursor.GetKeyPrefix()) > 1024) {
+		return invalidTask("invalid task log cursor")
+	}
+	return s.watchRun(ctx, id, cursor, stream.Send)
 }
 
-func (s Service) watchRun(ctx context.Context, id uuid.UUID, send func(*lutrav1.WatchRunResponse) error) error {
+func (s Service) watchRun(ctx context.Context, id uuid.UUID, taskLogs *lutrav1.StreamCursor, send func(*lutrav1.WatchRunResponse) error) error {
 	sub, err := s.Worker.Logs.Subscribe(ctx, id)
 	if err != nil {
 		return err
@@ -522,29 +531,76 @@ func (s Service) watchRun(ctx context.Context, id uuid.UUID, send func(*lutrav1.
 	if err := send(&lutrav1.WatchRunResponse{Run: run}); err != nil {
 		return err
 	}
-	if terminal(run.Status) {
+	if terminal(run.Status) && taskLogs == nil {
 		return nil
 	}
-	return sub.Run(ctx, []runlog.Cursor{{Stream: runlog.StatusStream, Prefix: []byte("status"), InspectSeq: end}}, func(record *lutrav1.TailResponse) error {
-		if !bytes.Equal(record.GetKey(), []byte("status")) {
+	cursors := []runlog.Cursor{}
+	if taskLogs != nil {
+		cursors = append(cursors, runlog.Cursor{Stream: runlog.TaskLogStream, Prefix: taskLogs.GetKeyPrefix(), InspectSeq: taskLogs.GetAfterSeq()})
+	}
+	cursors = append(cursors, runlog.Cursor{Stream: runlog.StatusStream, Prefix: []byte("status"), InspectSeq: end})
+	if taskLogs != nil {
+		cursors[1].Prefix = nil
+		cursors[1].InspectSeq = 0
+	}
+	sendLog := func(record *lutrav1.TailResponse) error {
+		if record.Stream == runlog.StatusStream {
+			if bytes.Equal(record.Key, []byte("status")) {
+				return nil
+			}
+			event, err := runlog.DecodeActionStatus(record.ValueCbor)
+			if err != nil {
+				return connect.NewError(connect.CodeDataLoss, err)
+			}
+			return send(&lutrav1.WatchRunResponse{ActionStatus: event})
+		}
+		return send(&lutrav1.WatchRunResponse{Log: &lutrav1.LogRecord{Stream: record.Stream, Seq: record.Seq, Key: record.Key, ValueCbor: record.ValueCbor, CreatedUnixNanos: record.CreatedUnixNanos}})
+	}
+	if !terminal(run.Status) {
+		err = sub.Run(ctx, cursors, func(record *lutrav1.TailResponse) error {
+			if record.Stream == runlog.TaskLogStream {
+				return sendLog(record)
+			}
+			if !bytes.Equal(record.GetKey(), []byte("status")) {
+				return sendLog(record)
+			}
+			if record.Seq <= end {
+				return nil
+			}
+			event, err := runlog.DecodeStatus(record.GetValueCbor())
+			if err != nil {
+				return connect.NewError(connect.CodeDataLoss, err)
+			}
+			next := &lutrav1.Run{
+				Id: run.Id, RootActionId: run.RootActionId, Spec: run.Spec, CreatedAt: run.CreatedAt,
+				Status: event.Status, OutputCbor: event.OutputCBOR, Error: event.Error, UpdatedAt: event.UpdatedAt,
+			}
+			if err := send(&lutrav1.WatchRunResponse{Run: next}); err != nil {
+				return err
+			}
+			if terminal(event.Status) {
+				return runlog.ErrStop
+			}
 			return nil
-		}
-		event, err := runlog.DecodeStatus(record.GetValueCbor())
+		})
 		if err != nil {
-			return connect.NewError(connect.CodeDataLoss, err)
-		}
-		next := &lutrav1.Run{
-			Id: run.Id, RootActionId: run.RootActionId, Spec: run.Spec, CreatedAt: run.CreatedAt,
-			Status: event.Status, OutputCbor: event.OutputCBOR, Error: event.Error, UpdatedAt: event.UpdatedAt,
-		}
-		if err := send(&lutrav1.WatchRunResponse{Run: next}); err != nil {
 			return err
 		}
-		if terminal(event.Status) {
-			return runlog.ErrStop
-		}
+	}
+	if taskLogs == nil {
 		return nil
-	})
+	}
+	logEnd, err := db.New(s.Worker.DB).LogStreamEnd(ctx, db.LogStreamEndParams{RunID: id, Stream: runlog.TaskLogStream})
+	if err != nil {
+		return err
+	}
+	cursors[0].UntilSeq = &logEnd
+	statusEnd, err := db.New(s.Worker.DB).LogStreamEnd(ctx, db.LogStreamEndParams{RunID: id, Stream: runlog.StatusStream})
+	if err != nil {
+		return err
+	}
+	cursors[1].UntilSeq = &statusEnd
+	return sub.Run(ctx, cursors, sendLog)
 }
 
 func terminal(status string) bool {

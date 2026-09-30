@@ -6,6 +6,7 @@ import { useEffect } from "react";
 import { decode as decodeCbor, encode as encodeCbor } from "cborg";
 import { transport } from "@/lib/rpc";
 import { SettingsService } from "@/proto/lutra/v1/settings_pb";
+import { Link } from "@tanstack/react-router";
 
 export const Route = createFileRoute("/")({ component: Home });
 const settingsRpc = createClient(SettingsService, transport);
@@ -25,6 +26,7 @@ function Home() {
   const [settingPath, setSettingPath] = useState("");
   const [settingValue, setSettingValue] = useState("{}");
   const [settingsError, setSettingsError] = useState<string | null>(null);
+  const [runId, setRunId] = useState("");
 
   useEffect(() => {
     void settingsRpc
@@ -167,6 +169,25 @@ function Home() {
             </div>
           ))}
         </div>
+      </section>
+      <section className="mt-5 rounded-lg border border-slate-200 bg-white p-5">
+        <h2 className="text-base font-semibold">Open a run</h2>
+        <form className="mt-3 flex flex-wrap gap-2" onSubmit={(event) => event.preventDefault()}>
+          <input
+            aria-label="Run ID"
+            value={runId}
+            onChange={(event) => setRunId(event.target.value)}
+            placeholder="Run ID"
+            className="min-w-0 flex-1 rounded-md border border-slate-300 p-2 font-mono text-[13px]"
+          />
+          <Link
+            to="/runs/$runId"
+            params={{ runId }}
+            className="rounded-md bg-teal-700 px-4 py-2 text-[13px] font-semibold text-white hover:bg-teal-800"
+          >
+            Open
+          </Link>
+        </form>
       </section>
     </main>
   );

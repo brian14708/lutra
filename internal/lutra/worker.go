@@ -1,6 +1,7 @@
 package lutra
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/sha256"
@@ -123,6 +124,9 @@ func (w *Worker) claim(ctx context.Context) (uuid.UUID, uuid.UUID, uuid.UUID, in
 		if err := w.Logs.AppendStatus(ctx, tx, claimed.RunID); err != nil {
 			return uuid.Nil, uuid.Nil, uuid.Nil, 0, err
 		}
+	}
+	if err := w.Logs.AppendActionStatus(ctx, tx, claimed.ID); err != nil {
+		return uuid.Nil, uuid.Nil, uuid.Nil, 0, err
 	}
 	return claimed.ID, claimed.RunID, token, claimed.Attempts, tx.Commit(ctx)
 }
@@ -284,6 +288,11 @@ func (w *Worker) finish(actionID, runID, token uuid.UUID, attempt int32, output 
 	if rows == 0 {
 		slog.Debug("action completion discarded", "action_id", actionID, "attempt", attempt)
 	}
+	if rows == 1 {
+		if err := w.Logs.AppendActionStatus(ctx, tx, actionID); err != nil {
+			return err
+		}
+	}
 	if rows == 1 && locked.RootActionID != nil && *locked.RootActionID == actionID {
 		if err := w.Logs.AppendStatus(ctx, tx, runID); err != nil {
 			return err
@@ -382,6 +391,9 @@ func (w *Worker) setWaiting(ctx context.Context, active *activeRun, waiting bool
 		return 0, err
 	}
 	if rows > 0 {
+		if err := w.Logs.AppendActionStatus(ctx, tx, active.actionID); err != nil {
+			return 0, err
+		}
 		root, err := q.GetRunRootAction(ctx, active.runID)
 		if err != nil {
 			return 0, err
@@ -404,6 +416,14 @@ func (w *Worker) attempt(ctx context.Context, actionID, runID, token uuid.UUID, 
 		return nil, err
 	}
 	defer func() { _ = os.RemoveAll(dir) }()
+	stderrReader, stderrWriter := io.Pipe()
+	logDone := w.collectTaskLogs(runID, actionID, attempt, stderrReader)
+	defer func() {
+		_ = stderrWriter.Close()
+		<-logDone
+	}()
+	setupStarted := time.Now()
+	_, _ = fmt.Fprintf(stderrWriter, "environment setup started task=%s image=%s\n", task.Name, task.GetImage().GetName())
 	path := filepath.Join(dir, "bundle.tar.zst")
 	if err := os.WriteFile(path, archive, 0o600); err != nil {
 		return nil, err
@@ -434,14 +454,18 @@ func (w *Worker) attempt(ctx context.Context, actionID, runID, token uuid.UUID, 
 	}
 	prep := exec.CommandContext(ctx, bwrapPath, append(sandboxArgs(dir), "--", uvPath, "sync", "--locked", "--no-dev", "--python", hostPython)...)
 	prep.Env = []string{"PATH=" + os.Getenv("PATH")}
-	prep.Stderr = os.Stderr
+	prep.Stderr = io.MultiWriter(os.Stderr, stderrWriter)
+	prep.Stdout = prep.Stderr
+	_, _ = fmt.Fprintf(stderrWriter, "environment syncing dependencies python=%s command=uv sync --locked --no-dev\n", hostPython)
 	if err := prep.Run(); err != nil {
+		_, _ = fmt.Fprintf(stderrWriter, "environment setup failed elapsed=%.3fs error=%v\n", time.Since(setupStarted).Seconds(), err)
 		return nil, fmt.Errorf("uv sync: %w", err)
 	}
 	pythonPath := filepath.Join(dir, ".venv", "bin", "python")
 	if _, err := os.Stat(pythonPath); err != nil {
 		return nil, fmt.Errorf("task environment python is unavailable: %w", err)
 	}
+	_, _ = fmt.Fprintf(stderrWriter, "environment setup ready elapsed=%.3fs\n", time.Since(setupStarted).Seconds())
 	args := append(sandboxArgs(dir),
 		"--setenv", "LUTRA_TASK_PROJECT", task.Project,
 		"--setenv", "LUTRA_TASK_DOMAIN", task.Domain,
@@ -459,7 +483,7 @@ func (w *Worker) attempt(ctx context.Context, actionID, runID, token uuid.UUID, 
 	)
 	command := exec.CommandContext(ctx, bwrapPath, args...)
 	command.Env = prep.Env
-	command.Stderr = os.Stderr
+	command.Stderr = io.MultiWriter(os.Stderr, stderrWriter)
 	process, err := taskstdio.Start(command)
 	if err != nil {
 		return nil, err
@@ -493,6 +517,74 @@ func (w *Worker) attempt(ctx context.Context, actionID, runID, token uuid.UUID, 
 		return nil, fmt.Errorf("unsupported result content type %q", result.Msg.GetContentType())
 	}
 	return result.Msg.GetOutput(), nil
+}
+
+func (w *Worker) collectTaskLogs(runID, actionID uuid.UUID, attempt int32, reader io.Reader) <-chan struct{} {
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		lines := make(chan string)
+		readDone := make(chan struct{})
+		go func() {
+			defer close(readDone)
+			defer close(lines)
+			input := bufio.NewReader(reader)
+			for {
+				line, err := input.ReadString('\n')
+				if len(line) > 0 {
+					if line[len(line)-1] == '\n' {
+						line = line[:len(line)-1]
+						if len(line) > 0 && line[len(line)-1] == '\r' {
+							line = line[:len(line)-1]
+						}
+					}
+					lines <- line
+				}
+				if err != nil {
+					return
+				}
+			}
+		}()
+		batch := make([]*lutrav1.LogEntry, 0, 32)
+		batchNumber := 0
+		flush := func() {
+			if len(batch) == 0 {
+				return
+			}
+			batchNumber++
+			appendID := fmt.Sprintf("task-log:%s:%d:%d", actionID, attempt, batchNumber)
+			appendCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			if _, err := w.Logs.AppendEntries(appendCtx, runID, runlog.TaskLogStream, appendID, batch); err != nil {
+				slog.Error("append task log", "action_id", actionID, "attempt", attempt, "error", err)
+			}
+			cancel()
+			batch = batch[:0]
+		}
+		timer := time.NewTicker(100 * time.Millisecond)
+		defer timer.Stop()
+		for {
+			select {
+			case line, ok := <-lines:
+				if !ok {
+					flush()
+					<-readDone
+					return
+				}
+				event, err := runlog.EncodeTaskLog(runlog.TaskLogEvent{Type: "task.log.v1", Source: "stderr", Message: line, Timestamp: time.Now().UTC().Format(time.RFC3339Nano), ActionID: actionID.String(), Attempt: attempt})
+				if err != nil {
+					slog.Error("encode task log", "action_id", actionID, "error", err)
+					continue
+				}
+				batch = append(batch, &lutrav1.LogEntry{Key: []byte(actionID.String()), ValueCbor: event})
+				if len(batch) >= 32 {
+					flush()
+				}
+			case <-timer.C:
+				flush()
+			}
+		}
+	}()
+	return done
 }
 
 func sandboxArgs(dir string) []string {

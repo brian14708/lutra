@@ -8,8 +8,8 @@ import (
 	lutrav1 "github.com/brian14708/lutra/gen/lutra/v1"
 	"github.com/brian14708/lutra/internal/db"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
-	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // Cursor is specific to one stream and prefix. InspectSeq also includes excluded records.
@@ -17,6 +17,7 @@ type Cursor struct {
 	Stream     string
 	Prefix     []byte
 	InspectSeq int64
+	UntilSeq   *int64
 }
 
 // PrefixSuccessor returns the exclusive upper bound, or nil for an unbounded range.
@@ -35,7 +36,7 @@ func PrefixSuccessor(prefix []byte) []byte {
 type Subscription struct {
 	service  Service
 	runID    uuid.UUID
-	listener *pgxpool.Conn
+	listener *pgx.Conn
 }
 
 // Subscribe registers LISTEN before callers take a snapshot or cursor boundary.
@@ -48,12 +49,13 @@ func (s Service) Subscribe(ctx context.Context, id uuid.UUID) (*Subscription, er
 }
 
 func (s *Subscription) listen(ctx context.Context) error {
-	conn, err := s.service.DB.Acquire(ctx)
+	// Long-lived LISTEN sessions must not consume connections needed for queries and writes.
+	conn, err := pgx.ConnectConfig(ctx, s.service.DB.Config().ConnConfig.Copy())
 	if err != nil {
 		return err
 	}
 	if _, err := conn.Exec(ctx, "LISTEN lutra_logs"); err != nil {
-		conn.Release()
+		_ = conn.Close(ctx)
 		return err
 	}
 	s.listener = conn
@@ -62,8 +64,7 @@ func (s *Subscription) listen(ctx context.Context) error {
 
 func (s *Subscription) release() {
 	if s.listener != nil {
-		// A listening session must never return to the general query pool.
-		conn := s.listener.Hijack()
+		conn := s.listener
 		s.listener = nil
 		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 		defer cancel()
@@ -125,6 +126,9 @@ func (s *Subscription) Run(ctx context.Context, cursors []Cursor, send func(*lut
 				return err
 			}
 			c := &cursors[i]
+			if c.UntilSeq != nil && c.InspectSeq >= *c.UntilSeq {
+				continue
+			}
 			lower := c.Prefix
 			if len(lower) == 0 {
 				lower = nil
@@ -138,6 +142,10 @@ func (s *Subscription) Run(ctx context.Context, cursors []Cursor, send func(*lut
 			}
 			inspect := c.InspectSeq
 			for _, row := range rows {
+				if c.UntilSeq != nil && row.Seq.Valid && row.Seq.Int64 > *c.UntilSeq {
+					inspect = *c.UntilSeq
+					break
+				}
 				if row.Seq.Valid {
 					value, err := s.service.rowValue(ctx, row.ValueCbor, row.ValueUri)
 					if err != nil {
@@ -159,11 +167,20 @@ func (s *Subscription) Run(ctx context.Context, cursors []Cursor, send func(*lut
 			}
 			c.InspectSeq = inspect
 		}
+		complete := true
+		for _, c := range cursors {
+			if c.UntilSeq == nil || c.InspectSeq < *c.UntilSeq {
+				complete = false
+			}
+		}
+		if complete {
+			return nil
+		}
 		if progress {
 			continue
 		}
 		for {
-			notification, err := s.listener.Conn().WaitForNotification(ctx)
+			notification, err := s.listener.WaitForNotification(ctx)
 			if err != nil {
 				if ctx.Err() != nil {
 					return ctx.Err()
@@ -179,7 +196,7 @@ func (s *Subscription) Run(ctx context.Context, cursors []Cursor, send func(*lut
 				for {
 					drainCtx, cancel := context.WithCancel(ctx)
 					cancel()
-					_, err := s.listener.Conn().WaitForNotification(drainCtx)
+					_, err := s.listener.WaitForNotification(drainCtx)
 					if err != nil {
 						break
 					}

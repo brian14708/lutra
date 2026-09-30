@@ -2,6 +2,8 @@ syntax = "proto3";
 
 package lutra.v1;
 
+import "lutra/v1/log.proto";
+
 option go_package = "github.com/brian14708/lutra/gen/lutra/v1;lutrav1";
 
 service LutraService {
@@ -83,9 +85,24 @@ message CancelRunResponse {
 }
 message WatchRunRequest {
   string id = 1;
+  // Optional task_log cursor. Include to receive task logs and child status history.
+  // Omit for root run status updates only.
+  StreamCursor task_logs = 2;
 }
 message WatchRunResponse {
   Run run = 1;
+  LogRecord log = 2;
+  TaskActionStatus action_status = 3;
+}
+
+message TaskActionStatus {
+  string action_id = 1;
+  string caller_action_id = 2;
+  string name = 3;
+  string status = 4;
+  int32 attempt = 5;
+  string error = 6;
+  string updated_at = 7;
 }
 message Run {
   string id = 1;
