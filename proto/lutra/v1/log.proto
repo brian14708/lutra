@@ -1,0 +1,59 @@
+syntax = "proto3";
+
+package lutra.v1;
+
+option go_package = "github.com/brian14708/lutra/gen/lutra/v1;lutrav1";
+
+service LogService {
+  rpc Append(AppendRequest) returns (AppendResponse);
+  rpc Read(ReadRequest) returns (ReadResponse);
+  rpc Tail(TailRequest) returns (stream TailResponse);
+}
+
+message AppendRequest {
+  string run_id = 1;
+  string stream = 2;
+  string append_id = 3;
+  repeated bytes values_cbor = 4;
+}
+
+message AppendResponse {
+  int64 first_seq = 1;
+  int64 last_seq = 2;
+}
+
+message ReadRequest {
+  string run_id = 1;
+  string stream = 2;
+  int64 after_seq = 3;
+  int32 limit = 4;
+}
+
+message ReadResponse {
+  repeated LogRecord records = 1;
+  bool truncated = 2;
+}
+
+message TailRequest {
+  string run_id = 1;
+  repeated StreamCursor streams = 2;
+}
+
+message StreamCursor {
+  string stream = 1;
+  int64 after_seq = 2;
+}
+
+message LogRecord {
+  string stream = 1;
+  int64 seq = 2;
+  bytes value_cbor = 3;
+  int64 created_unix_nanos = 4;
+}
+
+message TailResponse {
+  string stream = 1;
+  int64 seq = 2;
+  bytes value_cbor = 3;
+  int64 created_unix_nanos = 4;
+}

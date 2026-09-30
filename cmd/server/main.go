@@ -19,6 +19,7 @@ import (
 	"github.com/brian14708/lutra/db/migrations"
 	lutrav1connect "github.com/brian14708/lutra/gen/lutra/v1/lutrav1connect"
 	"github.com/brian14708/lutra/internal/blob"
+	"github.com/brian14708/lutra/internal/logstore"
 	"github.com/brian14708/lutra/internal/lutra"
 	"github.com/brian14708/lutra/internal/lutra/web"
 	"github.com/brian14708/lutra/internal/s3"
@@ -101,12 +102,17 @@ func main() {
 		connect.WithInterceptors(otelInterceptor),
 	)
 	rpcMux.Handle(settingsPath, settingsHandler)
+	logPath, logHandler := lutrav1connect.NewLogServiceHandler(
+		logstore.Service{DB: db, Store: blobStore, Bucket: storeConfig.Bucket},
+		connect.WithInterceptors(otelInterceptor),
+	)
+	rpcMux.Handle(logPath, logHandler)
 	healthPath, healthHandler := grpchealth.NewHandler(
-		grpchealth.NewStaticChecker(lutrav1connect.LutraServiceName, lutrav1connect.BlobServiceName, lutrav1connect.SettingsServiceName),
+		grpchealth.NewStaticChecker(lutrav1connect.LutraServiceName, lutrav1connect.BlobServiceName, lutrav1connect.SettingsServiceName, lutrav1connect.LogServiceName),
 		interceptors,
 	)
 	rpcMux.Handle(healthPath, healthHandler)
-	reflector := grpcreflect.NewStaticReflector(lutrav1connect.LutraServiceName, lutrav1connect.BlobServiceName, lutrav1connect.SettingsServiceName)
+	reflector := grpcreflect.NewStaticReflector(lutrav1connect.LutraServiceName, lutrav1connect.BlobServiceName, lutrav1connect.SettingsServiceName, lutrav1connect.LogServiceName)
 	reflectionPath, reflectionHandler := grpcreflect.NewHandlerV1(reflector, interceptors)
 	rpcMux.Handle(reflectionPath, reflectionHandler)
 	reflectionAlphaPath, reflectionAlphaHandler := grpcreflect.NewHandlerV1Alpha(reflector, interceptors)

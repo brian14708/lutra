@@ -85,7 +85,45 @@ CREATE INDEX runs_status_idx ON lutra.runs (status, created_at);
 CREATE INDEX runs_parent_idx ON lutra.runs (parent_id);
 CREATE UNIQUE INDEX runs_idempotency_idx ON lutra.runs (project, domain, idempotency_key) WHERE idempotency_key IS NOT NULL;
 
+CREATE TABLE lutra.run_log_streams (
+    run_id uuid NOT NULL REFERENCES lutra.runs(id) ON DELETE CASCADE,
+    stream text NOT NULL CHECK (stream ~ '^[a-zA-Z][a-zA-Z0-9_.-]{0,127}$'),
+    next_seq bigint NOT NULL DEFAULT 1 CHECK (next_seq >= 1),
+    created_at timestamptz NOT NULL DEFAULT now(),
+    updated_at timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (run_id, stream)
+);
+
+CREATE TABLE lutra.run_log_appends (
+    run_id uuid NOT NULL,
+    stream text NOT NULL,
+    append_id text NOT NULL CHECK (length(append_id) BETWEEN 1 AND 200),
+    batch_digest bytea NOT NULL CHECK (length(batch_digest) = 32),
+    first_seq bigint NOT NULL CHECK (first_seq >= 1),
+    last_seq bigint NOT NULL CHECK (last_seq >= first_seq),
+    created_at timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (run_id, stream, append_id),
+    FOREIGN KEY (run_id, stream) REFERENCES lutra.run_log_streams(run_id, stream) ON DELETE CASCADE
+);
+
+CREATE TABLE lutra.run_log_records (
+    run_id uuid NOT NULL,
+    stream text NOT NULL,
+    seq bigint NOT NULL CHECK (seq >= 1),
+    value_cbor bytea,
+    value_uri text,
+    payload_size bigint NOT NULL CHECK (payload_size > 0),
+    created_at timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (run_id, stream, seq),
+    FOREIGN KEY (run_id, stream) REFERENCES lutra.run_log_streams(run_id, stream) ON DELETE CASCADE,
+    CHECK ((value_cbor IS NOT NULL) <> (value_uri IS NOT NULL))
+);
+CREATE INDEX run_log_records_stream_seq_idx ON lutra.run_log_records (run_id, stream, seq);
+
 -- +goose Down
+DROP TABLE IF EXISTS lutra.run_log_records;
+DROP TABLE IF EXISTS lutra.run_log_appends;
+DROP TABLE IF EXISTS lutra.run_log_streams;
 DROP TABLE IF EXISTS lutra.runs;
 DROP TABLE IF EXISTS lutra.task_specs;
 DROP TABLE IF EXISTS lutra.blob_uploads;
