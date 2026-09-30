@@ -1,11 +1,12 @@
-// Package logstore implements the durable per-run CBOR log service.
-package logstore
+// Package runlog implements keyed append and listener-backed log subscriptions.
+package runlog
 
 import (
 	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/binary"
 	"errors"
 	"io"
 	"regexp"
@@ -27,23 +28,29 @@ const (
 	defaultInlineLimit = 64 << 10
 	defaultMaxRecord   = 64 << 20
 	defaultMaxBatch    = 128 << 20
+	maxKeySize         = 1024
 	defaultReadLimit   = 100
 	maxReadLimit       = 1000
 	logValueMIME       = "application/cbor"
 )
 
-var streamPattern = regexp.MustCompile(`^[a-zA-Z][a-zA-Z0-9_.-]{0,127}$`)
+var streamPattern = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_.-]{0,127}$`)
 
 // Service implements LogService. Store is optional; when it is unavailable,
 // values remain inline regardless of InlineLimit so the database-only service
 // remains useful in development and tests.
 type Service struct {
-	DB          *pgxpool.Pool
-	Store       *minio.Core
-	Bucket      string
-	InlineLimit int
-	MaxRecord   int
-	MaxBatch    int
+	DB                *pgxpool.Pool
+	Store             *minio.Core
+	Bucket            string
+	InlineLimit       int
+	MaxRecord         int
+	MaxBatch          int
+	TailBatchSize     int
+	MaxResponseBuffer int
+	ReconnectDelay    time.Duration
+	Retention         time.Duration
+	MaxCursorAge      time.Duration
 }
 
 func (s Service) limits() (inline, record, batch int) {
@@ -97,15 +104,15 @@ func validateStream(stream string) error {
 	return nil
 }
 
-func batchDigest(values [][]byte) []byte {
+func batchDigest(entries []*lutrav1.LogEntry) []byte {
 	h := sha256.New()
 	var length [8]byte
-	for _, value := range values {
-		for i := range length {
-			length[i] = byte(len(value) >> (8 * (7 - i)))
+	for _, entry := range entries {
+		for _, value := range [][]byte{entry.GetKey(), entry.GetValueCbor()} {
+			binary.BigEndian.PutUint64(length[:], uint64(len(value)))
+			h.Write(length[:])
+			h.Write(value)
 		}
-		h.Write(length[:])
-		h.Write(value)
 	}
 	return h.Sum(nil)
 }
@@ -116,44 +123,67 @@ func (s Service) Append(ctx context.Context, req *connect.Request[lutrav1.Append
 	if err != nil {
 		return nil, err
 	}
-	if err := validateStream(msg.GetStream()); err != nil {
+	result, err := s.AppendEntries(ctx, runID, msg.GetStream(), msg.GetAppendId(), msg.GetEntries())
+	if err != nil {
 		return nil, err
 	}
-	values := msg.GetValuesCbor()
-	if len(values) == 0 {
-		return nil, invalid("append batch is empty")
-	}
-	_, maxRecord, maxBatch := s.limits()
-	total := 0
-	for _, value := range values {
-		if len(value) == 0 || len(value) > maxRecord {
-			return nil, connect.NewError(connect.CodeResourceExhausted, errors.New("record size exceeded"))
-		}
-		if err := cbor.Wellformed(value); err != nil {
-			return nil, invalid("value is not valid CBOR")
-		}
-		total += len(value)
-		if total > maxBatch {
-			return nil, connect.NewError(connect.CodeResourceExhausted, errors.New("batch size exceeded"))
-		}
-	}
-	appendID := msg.GetAppendId()
-	if len(appendID) > 200 {
-		return nil, invalid("append id is too long")
-	}
-	digest := batchDigest(values)
+	return connect.NewResponse(result), nil
+}
+
+// AppendEntries commits a batch and its notification together.
+func (s Service) AppendEntries(ctx context.Context, runID uuid.UUID, stream, appendID string, entries []*lutrav1.LogEntry) (*lutrav1.AppendResponse, error) {
 	tx, err := s.DB.Begin(ctx)
 	if err != nil {
 		return nil, unavailable(err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
+	result, err := s.AppendTx(ctx, tx, runID, stream, appendID, entries)
+	if err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, unavailable(err)
+	}
+	return result, nil
+}
+
+// AppendTx appends in the caller's transaction; PostgreSQL delivers notifications on commit.
+func (s Service) AppendTx(ctx context.Context, tx pgx.Tx, runID uuid.UUID, stream, appendID string, entries []*lutrav1.LogEntry) (*lutrav1.AppendResponse, error) {
+	if err := validateStream(stream); err != nil {
+		return nil, err
+	}
+	if len(entries) == 0 {
+		return nil, invalid("append batch is empty")
+	}
+	_, maxRecord, maxBatch := s.limits()
+	total := 0
+	for _, entry := range entries {
+		value := entry.GetValueCbor()
+		if len(entry.GetKey()) > maxKeySize {
+			return nil, connect.NewError(connect.CodeResourceExhausted, errors.New("key exceeds 1024 bytes"))
+		}
+		if len(value) == 0 || len(value)+len(entry.GetKey()) > maxRecord {
+			return nil, connect.NewError(connect.CodeResourceExhausted, errors.New("record size exceeded"))
+		}
+		if err := cbor.Wellformed(value); err != nil {
+			return nil, invalid("value is not valid CBOR")
+		}
+		total += len(value) + len(entry.GetKey())
+		if total > maxBatch {
+			return nil, connect.NewError(connect.CodeResourceExhausted, errors.New("batch size exceeded"))
+		}
+	}
+	if len(appendID) > 200 {
+		return nil, invalid("append id is too long")
+	}
+	digest := batchDigest(entries)
 	queries := db.New(tx)
-	streamRow, err := queries.LockLogStream(ctx, db.LockLogStreamParams{RunID: runID, Stream: msg.GetStream()})
+	streamRow, err := queries.LockLogStream(ctx, db.LockLogStreamParams{RunID: runID, Stream: stream})
 	if errors.Is(err, pgx.ErrNoRows) {
-		if err := queries.CreateLogStream(ctx, db.CreateLogStreamParams{RunID: runID, Stream: msg.GetStream(), NextSeq: 1}); err != nil {
+		if err := queries.CreateLogStream(ctx, db.CreateLogStreamParams{RunID: runID, Stream: stream, NextSeq: 1}); err != nil {
 			return nil, internal(err)
 		}
-		streamRow, err = queries.LockLogStream(ctx, db.LockLogStreamParams{RunID: runID, Stream: msg.GetStream()})
+		streamRow, err = queries.LockLogStream(ctx, db.LockLogStreamParams{RunID: runID, Stream: stream})
 	}
 	if err != nil {
 		return nil, internal(err)
@@ -161,24 +191,29 @@ func (s Service) Append(ctx context.Context, req *connect.Request[lutrav1.Append
 	// The stream row lock serializes concurrent retries. Recheck the append
 	// record after acquiring it so a racing request returns the original range.
 	if appendID != "" {
-		previous, lookupErr := queries.GetLogAppend(ctx, db.GetLogAppendParams{RunID: runID, Stream: msg.GetStream(), AppendID: appendID})
+		previous, lookupErr := queries.GetLogAppend(ctx, db.GetLogAppendParams{RunID: runID, Stream: stream, AppendID: appendID})
 		if lookupErr == nil {
 			if !bytes.Equal(previous.BatchDigest, digest) {
 				return nil, connect.NewError(connect.CodeAlreadyExists, errors.New("append id already belongs to different values"))
 			}
-			if err := tx.Commit(ctx); err != nil {
-				return nil, unavailable(err)
-			}
-			return connect.NewResponse(&lutrav1.AppendResponse{FirstSeq: previous.FirstSeq, LastSeq: previous.LastSeq}), nil
+			return &lutrav1.AppendResponse{FirstSeq: previous.FirstSeq, LastSeq: previous.LastSeq}, nil
 		}
 		if !errors.Is(lookupErr, pgx.ErrNoRows) {
 			return nil, internal(lookupErr)
 		}
 	}
 	first := streamRow.NextSeq
-	last := first + int64(len(values)) - 1
+	last := first + int64(len(entries)) - 1
+	if last < first || last == int64(^uint64(0)>>1) {
+		return nil, invalid("sequence exhausted")
+	}
 	inlineLimit, _, _ := s.limits()
-	for i, value := range values {
+	for i, entry := range entries {
+		value := entry.GetValueCbor()
+		key := entry.GetKey()
+		if key == nil {
+			key = []byte{}
+		}
 		valueCbor := value
 		valueURI := pgtype.Text{}
 		if len(value) > inlineLimit && s.Store != nil && s.Bucket != "" {
@@ -189,22 +224,22 @@ func (s Service) Append(ctx context.Context, req *connect.Request[lutrav1.Append
 			valueCbor = nil
 			valueURI = pgtype.Text{String: uri, Valid: true}
 		}
-		if err := queries.InsertLogRecord(ctx, db.InsertLogRecordParams{RunID: runID, Stream: msg.GetStream(), Seq: first + int64(i), ValueCbor: valueCbor, ValueUri: valueURI, PayloadSize: int64(len(value))}); err != nil {
+		if err := queries.InsertLogRecord(ctx, db.InsertLogRecordParams{RunID: runID, Stream: stream, Seq: first + int64(i), Key: key, ValueCbor: valueCbor, ValueUri: valueURI, PayloadSize: int64(len(value))}); err != nil {
 			return nil, internal(err)
 		}
 	}
-	if err := queries.UpdateLogStreamNextSeq(ctx, db.UpdateLogStreamNextSeqParams{RunID: runID, Stream: msg.GetStream(), NextSeq: last + 1}); err != nil {
+	if err := queries.UpdateLogStreamNextSeq(ctx, db.UpdateLogStreamNextSeqParams{RunID: runID, Stream: stream, NextSeq: last + 1}); err != nil {
 		return nil, internal(err)
 	}
 	if appendID != "" {
-		if err := queries.InsertLogAppend(ctx, db.InsertLogAppendParams{RunID: runID, Stream: msg.GetStream(), AppendID: appendID, BatchDigest: digest, FirstSeq: first, LastSeq: last}); err != nil {
+		if err := queries.InsertLogAppend(ctx, db.InsertLogAppendParams{RunID: runID, Stream: stream, AppendID: appendID, BatchDigest: digest, FirstSeq: first, LastSeq: last}); err != nil {
 			return nil, internal(err)
 		}
 	}
-	if err := tx.Commit(ctx); err != nil {
-		return nil, unavailable(err)
+	if err := queries.NotifyLogStream(ctx, runID.String()+":"+stream); err != nil {
+		return nil, internal(err)
 	}
-	return connect.NewResponse(&lutrav1.AppendResponse{FirstSeq: first, LastSeq: last}), nil
+	return &lutrav1.AppendResponse{FirstSeq: first, LastSeq: last}, nil
 }
 
 func (s Service) storeValue(ctx context.Context, tx pgx.Tx, value []byte) (string, error) {
@@ -264,7 +299,7 @@ func (s Service) Read(ctx context.Context, req *connect.Request[lutrav1.ReadRequ
 		if err != nil {
 			return nil, err
 		}
-		records = append(records, &lutrav1.LogRecord{Stream: row.Stream, Seq: row.Seq, ValueCbor: value, CreatedUnixNanos: row.CreatedAt.Time.UnixNano()})
+		records = append(records, &lutrav1.LogRecord{Stream: row.Stream, Seq: row.Seq, Key: row.Key, ValueCbor: value, CreatedUnixNanos: row.CreatedAt.Time.UnixNano()})
 	}
 	return connect.NewResponse(&lutrav1.ReadResponse{Records: records, Truncated: truncated}), nil
 }
@@ -289,21 +324,15 @@ func (s Service) rowValue(ctx context.Context, inline []byte, uri pgtype.Text) (
 		return nil, unavailable(err)
 	}
 	defer func() { _ = reader.Close() }()
-	value, err := io.ReadAll(io.LimitReader(reader, int64(s.limitsMaxRecord())+1))
+	_, maxRecord, _ := s.limits()
+	value, err := io.ReadAll(io.LimitReader(reader, int64(maxRecord)+1))
 	if err != nil {
 		return nil, unavailable(err)
 	}
-	if len(value) > s.limitsMaxRecord() {
+	if len(value) > maxRecord {
 		return nil, connect.NewError(connect.CodeResourceExhausted, errors.New("log blob exceeds record limit"))
 	}
 	return value, nil
-}
-
-func (s Service) limitsMaxRecord() int { _, record, _ := s.limits(); return record }
-
-type cursor struct {
-	stream string
-	after  int64
 }
 
 func (s Service) Tail(ctx context.Context, req *connect.Request[lutrav1.TailRequest], stream *connect.ServerStream[lutrav1.TailResponse]) error {
@@ -314,7 +343,7 @@ func (s Service) Tail(ctx context.Context, req *connect.Request[lutrav1.TailRequ
 	if len(req.Msg.GetStreams()) == 0 {
 		return invalid("at least one stream cursor is required")
 	}
-	cursors := make([]cursor, 0, len(req.Msg.GetStreams()))
+	cursors := make([]Cursor, 0, len(req.Msg.GetStreams()))
 	seen := make(map[string]struct{}, len(req.Msg.GetStreams()))
 	for _, item := range req.Msg.GetStreams() {
 		if err := validateStream(item.GetStream()); err != nil {
@@ -327,38 +356,12 @@ func (s Service) Tail(ctx context.Context, req *connect.Request[lutrav1.TailRequ
 			return invalid("duplicate stream cursor")
 		}
 		seen[item.GetStream()] = struct{}{}
-		cursors = append(cursors, cursor{stream: item.GetStream(), after: item.GetAfterSeq()})
+		cursors = append(cursors, Cursor{Stream: item.GetStream(), InspectSeq: item.GetAfterSeq(), Prefix: item.GetKeyPrefix()})
 	}
-	for {
-		progress := false
-		for i := range cursors {
-			// One record per cursor per pass keeps a hot stream from starving
-			// quieter streams and lets RPC flow control apply between records.
-			rows, readErr := db.New(s.DB).ReadLogRecords(ctx, db.ReadLogRecordsParams{RunID: runID, Stream: cursors[i].stream, Seq: cursors[i].after, Limit: 1})
-			if readErr != nil {
-				return internal(readErr)
-			}
-			for _, row := range rows {
-				value, valueErr := s.rowValue(ctx, row.ValueCbor, row.ValueUri)
-				if valueErr != nil {
-					return valueErr
-				}
-				if sendErr := stream.Send(&lutrav1.TailResponse{Stream: row.Stream, Seq: row.Seq, ValueCbor: value, CreatedUnixNanos: row.CreatedAt.Time.UnixNano()}); sendErr != nil {
-					return sendErr
-				}
-				cursors[i].after = row.Seq
-				progress = true
-			}
-		}
-		if progress {
-			continue
-		}
-		timer := time.NewTimer(200 * time.Millisecond)
-		select {
-		case <-ctx.Done():
-			timer.Stop()
-			return ctx.Err()
-		case <-timer.C:
-		}
+	sub, err := s.Subscribe(ctx, runID)
+	if err != nil {
+		return err
 	}
+	defer sub.Close()
+	return sub.Run(ctx, cursors, stream.Send)
 }

@@ -21,6 +21,7 @@ import (
 	lutrav1connect "github.com/brian14708/lutra/gen/lutra/v1/lutrav1connect"
 	"github.com/brian14708/lutra/internal/blob"
 	"github.com/brian14708/lutra/internal/db"
+	"github.com/brian14708/lutra/internal/runlog"
 	"github.com/brian14708/lutra/internal/taskstdio"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -52,6 +53,7 @@ type Worker struct {
 	Store          *minio.Core
 	Bucket         string
 	Capacity       int
+	Logs           runlog.Service
 	slots          chan struct{}
 	queries        *db.Queries
 	mu             sync.Mutex
@@ -103,13 +105,26 @@ func (w *Worker) loop(ctx context.Context) {
 
 func (w *Worker) claim(ctx context.Context) (uuid.UUID, uuid.UUID, uuid.UUID, int32, error) {
 	token := uuid.New()
-	claimed, err := w.queries.ClaimTaskAction(ctx, db.ClaimTaskActionParams{
+	tx, err := w.DB.Begin(ctx)
+	if err != nil {
+		return uuid.Nil, uuid.Nil, uuid.Nil, 0, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	claimed, err := db.New(tx).ClaimTaskAction(ctx, db.ClaimTaskActionParams{
 		ClaimToken: token, LeaseSeconds: int32(leaseDuration / time.Second),
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
 		return uuid.Nil, uuid.Nil, uuid.Nil, 0, nil
 	}
-	return claimed.ID, claimed.RunID, token, claimed.Attempts, err
+	if err != nil {
+		return uuid.Nil, uuid.Nil, uuid.Nil, 0, err
+	}
+	if claimed.CallerActionID == nil && claimed.PreviousStatus != db.LutraTaskActionStatusRunning {
+		if err := w.Logs.AppendStatus(ctx, tx, claimed.RunID); err != nil {
+			return uuid.Nil, uuid.Nil, uuid.Nil, 0, err
+		}
+	}
+	return claimed.ID, claimed.RunID, token, claimed.Attempts, tx.Commit(ctx)
 }
 
 func (w *Worker) cancelRun(runID uuid.UUID) {
@@ -269,6 +284,11 @@ func (w *Worker) finish(actionID, runID, token uuid.UUID, attempt int32, output 
 	if rows == 0 {
 		slog.Debug("action completion discarded", "action_id", actionID, "attempt", attempt)
 	}
+	if rows == 1 && locked.RootActionID != nil && *locked.RootActionID == actionID {
+		if err := w.Logs.AppendStatus(ctx, tx, runID); err != nil {
+			return err
+		}
+	}
 	rootTerminal := rows == 1 && status != db.LutraTaskActionStatusQueued && locked.RootActionID != nil && *locked.RootActionID == actionID
 	if rootTerminal {
 		if _, closeErr := q.CloseRunDescendants(ctx, db.CloseRunDescendantsParams{RunID: runID, ID: actionID}); closeErr != nil {
@@ -317,14 +337,12 @@ func (w *Worker) waitAction(ctx context.Context, identity taskContext, child uui
 			active.mu.Unlock()
 			restoreCtx, cancel := context.WithTimeout(active.ctx, 5*time.Second)
 			defer cancel()
-			if _, err := w.queries.RestoreTaskActionRunning(restoreCtx, db.RestoreTaskActionRunningParams{
-				ActionID: active.actionID, ClaimToken: active.token,
-			}); err != nil && restoreCtx.Err() == nil {
+			if _, err := w.setWaiting(restoreCtx, active, false); err != nil && restoreCtx.Err() == nil {
 				slog.Error("restore parent action", "action_id", active.actionID, "error", err)
 			}
 		}
 	}()
-	rows, err := w.queries.MarkTaskActionWaiting(ctx, db.MarkTaskActionWaitingParams{ActionID: active.actionID, ClaimToken: active.token})
+	rows, err := w.setWaiting(ctx, active, true)
 	if err != nil {
 		return err
 	}
@@ -345,6 +363,36 @@ func (w *Worker) waitAction(ctx context.Context, identity taskContext, child uui
 		case <-time.After(100 * time.Millisecond):
 		}
 	}
+}
+
+func (w *Worker) setWaiting(ctx context.Context, active *activeRun, waiting bool) (int64, error) {
+	tx, err := w.DB.Begin(ctx)
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	q := db.New(tx)
+	var rows int64
+	if waiting {
+		rows, err = q.MarkTaskActionWaiting(ctx, db.MarkTaskActionWaitingParams{ActionID: active.actionID, ClaimToken: active.token})
+	} else {
+		rows, err = q.RestoreTaskActionRunning(ctx, db.RestoreTaskActionRunningParams{ActionID: active.actionID, ClaimToken: active.token})
+	}
+	if err != nil {
+		return 0, err
+	}
+	if rows > 0 {
+		root, err := q.GetRunRootAction(ctx, active.runID)
+		if err != nil {
+			return 0, err
+		}
+		if root != nil && *root == active.actionID {
+			if err := w.Logs.AppendStatus(ctx, tx, active.runID); err != nil {
+				return 0, err
+			}
+		}
+	}
+	return rows, tx.Commit(ctx)
 }
 
 func (w *Worker) attempt(ctx context.Context, actionID, runID, token uuid.UUID, task *lutrav1.TaskSpec, archive, input []byte, attempt int32) ([]byte, error) {

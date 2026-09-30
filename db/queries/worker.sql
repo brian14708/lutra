@@ -1,16 +1,18 @@
 -- name: ClaimTaskAction :one
-UPDATE lutra.task_actions
-SET status = 'running', attempts = attempts + 1,
-    claim_token = sqlc.arg(claim_token)::uuid,
-    lease_until = now() + sqlc.arg(lease_seconds)::integer * interval '1 second',
-    updated_at = now()
-WHERE id = (
-    SELECT id FROM lutra.task_actions
+WITH candidate AS MATERIALIZED (
+    SELECT id, status FROM lutra.task_actions
     WHERE (status = 'queued' AND next_attempt_at <= now())
        OR (status IN ('running', 'waiting') AND lease_until <= now())
     ORDER BY created_at FOR UPDATE SKIP LOCKED LIMIT 1
 )
-RETURNING id, run_id, attempts;
+UPDATE lutra.task_actions a
+SET status = 'running', attempts = attempts + 1,
+    claim_token = sqlc.arg(claim_token)::uuid,
+    lease_until = now() + sqlc.arg(lease_seconds)::integer * interval '1 second',
+    updated_at = now()
+FROM candidate c
+WHERE a.id = c.id
+RETURNING a.id, a.run_id, a.caller_action_id, a.attempts, c.status AS previous_status;
 
 -- name: LoadClaimedTaskAction :one
 SELECT a.project, a.domain, a.name, a.version, t.module, t.qualname,

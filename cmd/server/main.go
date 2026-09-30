@@ -19,9 +19,9 @@ import (
 	"github.com/brian14708/lutra/db/migrations"
 	lutrav1connect "github.com/brian14708/lutra/gen/lutra/v1/lutrav1connect"
 	"github.com/brian14708/lutra/internal/blob"
-	"github.com/brian14708/lutra/internal/logstore"
 	"github.com/brian14708/lutra/internal/lutra"
 	"github.com/brian14708/lutra/internal/lutra/web"
+	"github.com/brian14708/lutra/internal/runlog"
 	"github.com/brian14708/lutra/internal/s3"
 	"github.com/brian14708/lutra/internal/settings"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -89,7 +89,12 @@ func main() {
 	)
 	rpcMux.Handle(blobPath, blobHandler)
 	capacity, _ := strconv.Atoi(os.Getenv("LUTRA_WORKER_CONCURRENCY"))
-	worker := &lutra.Worker{DB: db, Capacity: capacity, TaskAPIHandler: rpcMux, Store: blobStore, Bucket: storeConfig.Bucket}
+	logs := runlog.Service{DB: db, Store: blobStore, Bucket: storeConfig.Bucket}
+	if err := logs.ConfigureFromEnv(); err != nil {
+		logger.Error("log configuration failed", "error", err)
+		os.Exit(1)
+	}
+	worker := &lutra.Worker{DB: db, Capacity: capacity, TaskAPIHandler: rpcMux, Store: blobStore, Bucket: storeConfig.Bucket, Logs: logs}
 	worker.Start(cleanupCtx)
 	servicePath, serviceHandler := lutrav1connect.NewLutraServiceHandler(
 		lutra.Service{Worker: worker},
@@ -103,7 +108,7 @@ func main() {
 	)
 	rpcMux.Handle(settingsPath, settingsHandler)
 	logPath, logHandler := lutrav1connect.NewLogServiceHandler(
-		logstore.Service{DB: db, Store: blobStore, Bucket: storeConfig.Bucket},
+		logs,
 		connect.WithInterceptors(otelInterceptor),
 	)
 	rpcMux.Handle(logPath, logHandler)

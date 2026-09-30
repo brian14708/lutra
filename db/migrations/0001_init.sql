@@ -119,7 +119,7 @@ CREATE INDEX task_action_edges_dependent_idx ON lutra.task_action_edges (run_id,
 
 CREATE TABLE lutra.run_log_streams (
     run_id uuid NOT NULL REFERENCES lutra.runs(id) ON DELETE CASCADE,
-    stream text NOT NULL CHECK (stream ~ '^[a-zA-Z][a-zA-Z0-9_.-]{0,127}$'),
+    stream text NOT NULL CHECK (stream ~ '^[a-zA-Z_][a-zA-Z0-9_.-]{0,127}$'),
     next_seq bigint NOT NULL DEFAULT 1 CHECK (next_seq >= 1),
     created_at timestamptz NOT NULL DEFAULT now(),
     updated_at timestamptz NOT NULL DEFAULT now(),
@@ -142,6 +142,7 @@ CREATE TABLE lutra.run_log_records (
     run_id uuid NOT NULL,
     stream text NOT NULL,
     seq bigint NOT NULL CHECK (seq >= 1),
+    key bytea NOT NULL CHECK (length(key) <= 1024),
     value_cbor bytea,
     value_uri text,
     payload_size bigint NOT NULL CHECK (payload_size > 0),
@@ -150,7 +151,7 @@ CREATE TABLE lutra.run_log_records (
     FOREIGN KEY (run_id, stream) REFERENCES lutra.run_log_streams(run_id, stream) ON DELETE CASCADE,
     CHECK ((value_cbor IS NOT NULL) <> (value_uri IS NOT NULL))
 );
-CREATE INDEX run_log_records_stream_seq_idx ON lutra.run_log_records (run_id, stream, seq);
+CREATE INDEX run_log_records_key_idx ON lutra.run_log_records (run_id, stream, key, seq);
 
 -- +goose Down
 DROP TABLE IF EXISTS lutra.run_log_records;

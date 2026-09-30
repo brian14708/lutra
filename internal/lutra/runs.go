@@ -14,6 +14,7 @@ import (
 	lutrav1 "github.com/brian14708/lutra/gen/lutra/v1"
 	"github.com/brian14708/lutra/internal/blob"
 	"github.com/brian14708/lutra/internal/db"
+	"github.com/brian14708/lutra/internal/runlog"
 	"github.com/fxamacker/cbor/v2"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -175,6 +176,9 @@ func (s Service) CreateRun(ctx context.Context, req *connect.Request[lutrav1.Cre
 		if err := q.UpdateRunRootAction(ctx, db.UpdateRunRootActionParams{RootActionID: &rootID, ID: inserted}); err != nil {
 			return nil, err
 		}
+		if err := s.Worker.Logs.AppendStatus(ctx, tx, runID); err != nil {
+			return nil, err
+		}
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return nil, err
@@ -265,7 +269,11 @@ func (s Service) CreateTaskAction(ctx context.Context, req *connect.Request[lutr
 }
 
 func (s Service) readRun(ctx context.Context, id uuid.UUID) (*lutrav1.Run, error) {
-	row, err := db.New(s.Worker.DB).ReadRun(ctx, id)
+	return readRun(ctx, db.New(s.Worker.DB), id)
+}
+
+func readRun(ctx context.Context, q *db.Queries, id uuid.UUID) (*lutrav1.Run, error) {
+	row, err := q.ReadRun(ctx, id)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, connect.NewError(connect.CodeNotFound, errors.New("run not found"))
 	}
@@ -462,8 +470,12 @@ func (s Service) CancelRun(ctx context.Context, req *connect.Request[lutrav1.Can
 	} else if err != nil {
 		return nil, err
 	}
-	if _, err := q.CancelRunIfActive(ctx, id); err != nil {
+	if rows, err := q.CancelRunIfActive(ctx, id); err != nil {
 		return nil, connect.NewError(connect.CodeInternal, err)
+	} else if rows > 0 {
+		if err := s.Worker.Logs.AppendStatus(ctx, tx, id); err != nil {
+			return nil, err
+		}
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return nil, err
@@ -481,28 +493,58 @@ func (s Service) WatchRun(ctx context.Context, req *connect.Request[lutrav1.Watc
 	if err != nil {
 		return invalidTask("invalid run id")
 	}
-	last := ""
-	for {
-		run, readErr := s.readRun(ctx, id)
-		if readErr != nil {
-			return readErr
-		}
-		key := run.Status + ":" + run.UpdatedAt
-		if key != last {
-			if sendErr := stream.Send(&lutrav1.WatchRunResponse{Run: run}); sendErr != nil {
-				return sendErr
-			}
-			last = key
-		}
-		if terminal(run.Status) {
+	return s.watchRun(ctx, id, stream.Send)
+}
+
+func (s Service) watchRun(ctx context.Context, id uuid.UUID, send func(*lutrav1.WatchRunResponse) error) error {
+	sub, err := s.Worker.Logs.Subscribe(ctx, id)
+	if err != nil {
+		return err
+	}
+	defer sub.Close()
+	tx, err := s.Worker.DB.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	q := db.New(tx)
+	run, err := readRun(ctx, q, id)
+	if err != nil {
+		return err
+	}
+	end, err := q.LogStreamEnd(ctx, db.LogStreamEndParams{RunID: id, Stream: runlog.StatusStream})
+	if err != nil {
+		return err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return err
+	}
+	if err := send(&lutrav1.WatchRunResponse{Run: run}); err != nil {
+		return err
+	}
+	if terminal(run.Status) {
+		return nil
+	}
+	return sub.Run(ctx, []runlog.Cursor{{Stream: runlog.StatusStream, Prefix: []byte("status"), InspectSeq: end}}, func(record *lutrav1.TailResponse) error {
+		if !bytes.Equal(record.GetKey(), []byte("status")) {
 			return nil
 		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(100 * time.Millisecond):
+		event, err := runlog.DecodeStatus(record.GetValueCbor())
+		if err != nil {
+			return connect.NewError(connect.CodeDataLoss, err)
 		}
-	}
+		next := &lutrav1.Run{
+			Id: run.Id, RootActionId: run.RootActionId, Spec: run.Spec, CreatedAt: run.CreatedAt,
+			Status: event.Status, OutputCbor: event.OutputCBOR, Error: event.Error, UpdatedAt: event.UpdatedAt,
+		}
+		if err := send(&lutrav1.WatchRunResponse{Run: next}); err != nil {
+			return err
+		}
+		if terminal(event.Status) {
+			return runlog.ErrStop
+		}
+		return nil
+	})
 }
 
 func terminal(status string) bool {
