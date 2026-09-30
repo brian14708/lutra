@@ -2,6 +2,15 @@
 
 from lutra.client import Client, RunHandle
 from lutra.runtime import run
-from lutra.task import Invocation, Task, task
+from lutra.task import Invocation, Resources, Task, TaskEnvironment, TaskImage
 
-__all__ = ["Client", "Invocation", "RunHandle", "Task", "run", "task"]
+__all__ = [
+    "Client",
+    "Invocation",
+    "Resources",
+    "RunHandle",
+    "Task",
+    "TaskEnvironment",
+    "TaskImage",
+    "run",
+]

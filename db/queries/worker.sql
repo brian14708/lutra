@@ -15,11 +15,10 @@ WHERE a.id = c.id
 RETURNING a.id, a.run_id, a.caller_action_id, a.attempts, c.status AS previous_status;
 
 -- name: LoadClaimedTaskAction :one
-SELECT a.project, a.domain, a.name, a.version, t.module, t.qualname,
-       t.source_sha256, t.image, b.object_key, a.input_cbor
+SELECT e.project, e.domain, a.entrypoint_id, e.name AS environment_name, e.version,
+       e.id AS environment_id, e.provider, e.spec, e.image_key, a.input_cbor
 FROM lutra.task_actions a
-JOIN lutra.task_specs t USING (project, domain, name, version)
-JOIN lutra.blobs b ON b.sha256 = t.source_sha256
+JOIN lutra.task_environments e ON e.id = a.environment_id
 WHERE a.id = sqlc.arg(action_id)::uuid
   AND a.claim_token = sqlc.arg(claim_token)::uuid
   AND a.status = 'running';
@@ -27,6 +26,12 @@ WHERE a.id = sqlc.arg(action_id)::uuid
 -- name: RenewTaskActionLease :execrows
 UPDATE lutra.task_actions
 SET lease_until = now() + sqlc.arg(lease_seconds)::integer * interval '1 second'
+WHERE id = sqlc.arg(action_id)::uuid
+  AND claim_token = sqlc.arg(claim_token)::uuid
+  AND status IN ('running', 'waiting');
+
+-- name: SetTaskActionJob :execrows
+UPDATE lutra.task_actions SET job_id = sqlc.arg(job_id)::text, updated_at = now()
 WHERE id = sqlc.arg(action_id)::uuid
   AND claim_token = sqlc.arg(claim_token)::uuid
   AND status IN ('running', 'waiting');

@@ -4,18 +4,14 @@ from __future__ import annotations
 
 import tempfile
 from pathlib import Path
-from typing import TYPE_CHECKING, TypeVar
 
-from lutra.archive import create_archive
-
-if TYPE_CHECKING:
-    from lutra.task import Task
-
-R = TypeVar("R")
-SOURCE_BUNDLE_MIME = "application/vnd.lutra.source-bundle+zstd"
+SOURCE_BUNDLE_MIME = "application/x-tar+zstd"
 
 _EXCLUDED = {
     ".git",
+    ".data",
+    ".direnv",
+    ".env",
     ".venv",
     "venv",
     "__pycache__",
@@ -38,8 +34,12 @@ def project_root(source_file: Path) -> Path:
     raise ValueError(message)
 
 
-def build_bundle(task: Task[..., R]) -> bytes:
-    root = project_root(task.source_file)
+def build_bundle(root: Path, *, source_only: bool = True) -> bytes:
+    from lutra.archive import create_archive  # ruff: ignore[import-outside-top-level]
+
+    if not root.is_dir():
+        message = "bundle context must be a directory"
+        raise ValueError(message)
     files = sorted(
         (
             path
@@ -47,10 +47,14 @@ def build_bundle(task: Task[..., R]) -> bytes:
             if path.is_file()
             and not path.is_symlink()
             and not any(
-                part in _EXCLUDED or part.startswith(".venv")
+                part in _EXCLUDED or part.startswith((".venv", ".env."))
                 for part in path.relative_to(root).parts
             )
-            and (path.suffix == ".py" or path.name in {"pyproject.toml", "uv.lock"})
+            and (
+                not source_only
+                or path.suffix == ".py"
+                or path.name in {"pyproject.toml", "uv.lock"}
+            )
         ),
         key=lambda path: path.relative_to(root).as_posix(),
     )
@@ -61,6 +65,7 @@ def build_bundle(task: Task[..., R]) -> bytes:
             target = staged / source.relative_to(root)
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes(source.read_bytes())
+            target.chmod(source.stat().st_mode & 0o777)
         archive = Path(temporary) / "bundle.tar.zst"
         create_archive(staged, archive)
         return archive.read_bytes()

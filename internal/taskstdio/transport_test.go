@@ -27,22 +27,22 @@ type bufferWriteCloser struct{ bytes.Buffer }
 
 func (*bufferWriteCloser) Close() error { return nil }
 
-func TestMalformedReversePath(t *testing.T) {
+func TestMalformedIncomingPath(t *testing.T) {
 	output := &bufferWriteCloser{}
-	transport := &Transport{output: output, reverseCalls: make(map[string]*reverseCall)}
+	transport := &Transport{output: output, incomingCalls: make(map[string]*incomingCall)}
 	ctx, cancel := context.WithCancel(context.Background())
-	call := &reverseCall{
+	call := &incomingCall{
 		path:     "/%",
 		messages: []json.RawMessage{json.RawMessage(`{}`)},
 		ctx:      ctx,
 		cancel:   cancel,
 	}
 	handlerCalled := false
-	transport.serveReverse("p1", call, http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+	transport.serveIncoming("p1", call, http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
 		handlerCalled = true
 	}))
 	if handlerCalled {
-		t.Fatal("malformed path reached reverse handler")
+		t.Fatal("malformed path reached incoming handler")
 	}
 	reader := bufio.NewScanner(bytes.NewReader(output.Bytes()))
 	var frames []frame
@@ -57,25 +57,25 @@ func TestMalformedReversePath(t *testing.T) {
 		t.Fatal(err)
 	}
 	if len(frames) != 1 || frames[0].Status != http.StatusBadRequest || frames[0].Type != "response" || !bytes.Contains(frames[0].Error, []byte(`"invalid_argument"`)) {
-		t.Fatalf("unexpected reverse error frames: %+v", frames)
+		t.Fatalf("unexpected incoming error frames: %+v", frames)
 	}
 }
 
-func TestCloseWaitsForReverseHandler(t *testing.T) {
+func TestCloseWaitsForIncomingHandler(t *testing.T) {
 	fromServer, serverOutput := io.Pipe()
 	serverInput, toServer := io.Pipe()
 	defer func() { _ = serverInput.Close() }()
 	transport := NewTransport(fromServer, toServer)
 	started := make(chan struct{})
 	finished := make(chan struct{})
-	transport.SetReverseHandler(http.HandlerFunc(func(_ http.ResponseWriter, req *http.Request) {
+	transport.SetHandler(http.HandlerFunc(func(_ http.ResponseWriter, req *http.Request) {
 		close(started)
 		<-req.Context().Done()
 		close(finished)
 	}))
 	encoder := json.NewEncoder(serverOutput)
 	for _, f := range []frame{
-		{ID: "p1", Type: "request", Path: "/test.Reverse/Echo", Headers: http.Header{"Content-Type": {"application/json"}}, Value: json.RawMessage(`{}`)},
+		{ID: "p1", Type: "request", Path: "/test.TaskAPI/Echo", Headers: http.Header{"Content-Type": {"application/json"}}, Value: json.RawMessage(`{}`)},
 	} {
 		if err := encoder.Encode(f); err != nil {
 			t.Fatal(err)
@@ -84,7 +84,7 @@ func TestCloseWaitsForReverseHandler(t *testing.T) {
 	select {
 	case <-started:
 	case <-time.After(5 * time.Second):
-		t.Fatal("reverse handler did not start")
+		t.Fatal("incoming handler did not start")
 	}
 	if err := transport.Close(); err != nil {
 		t.Fatal(err)
@@ -92,7 +92,7 @@ func TestCloseWaitsForReverseHandler(t *testing.T) {
 	select {
 	case <-finished:
 	default:
-		t.Fatal("Close returned before reverse handler finished")
+		t.Fatal("Close returned before incoming handler finished")
 	}
 	_ = serverOutput.Close()
 }
@@ -320,7 +320,7 @@ func TestTaskHostRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 	handler := http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-		if req.URL.Path != "/test.Reverse/Echo" {
+		if req.URL.Path != "/test.TaskAPI/Echo" {
 			http.NotFound(w, req)
 			return
 		}
@@ -333,9 +333,9 @@ func TestTaskHostRoundTrip(t *testing.T) {
 		t.Fatalf("invalid request: got %v; stderr: %s", err, stderr.String())
 	}
 	if _, err := client.Execute(ctx, connect.NewRequest(&taskv1.ExecuteRequest{InvocationId: "missing"})); connect.CodeOf(err) != connect.CodeUnimplemented {
-		t.Fatalf("missing reverse handler: got %v; stderr: %s", err, stderr.String())
+		t.Fatalf("missing incoming handler: got %v; stderr: %s", err, stderr.String())
 	}
-	process.Transport.SetReverseHandler(handler)
+	process.Transport.SetHandler(handler)
 
 	var group sync.WaitGroup
 	results := make(chan error, 2)
@@ -358,7 +358,7 @@ func TestTaskHostRoundTrip(t *testing.T) {
 	group.Wait()
 	close(results)
 	for err := range results {
-		t.Fatalf("Execute with reverse call failed: %v; stderr: %s", err, stderr.String())
+		t.Fatalf("Execute with task API call failed: %v; stderr: %s", err, stderr.String())
 	}
 	largeInput := bytes.Repeat([]byte{0x7f}, 4<<20)
 	largeResponse, err := client.Execute(ctx, connect.NewRequest(&taskv1.ExecuteRequest{

@@ -7,6 +7,7 @@ import "lutra/v1/log.proto";
 option go_package = "github.com/brian14708/lutra/gen/lutra/v1;lutrav1";
 
 service LutraService {
+  rpc RegisterEnvironment(RegisterEnvironmentRequest) returns (RegisterEnvironmentResponse);
   rpc CreateRun(CreateRunRequest) returns (CreateRunResponse);
   rpc CreateTaskAction(CreateTaskActionRequest) returns (CreateTaskActionResponse);
   rpc GetRun(GetRunRequest) returns (GetRunResponse);
@@ -16,40 +17,68 @@ service LutraService {
   rpc WatchRun(WatchRunRequest) returns (stream WatchRunResponse);
 }
 
-// SourceBundle is a blob containing the task's source archive and lockfile.
-message SourceBundle {
-  string uri = 1;
-}
-
-// TaskImage selects the worker environment used to execute a task.
-message TaskImage {
+// ImageSpec declares the runtime image and its execution settings.
+message ImageSpec {
   string name = 1;
+  string reference = 2;
+  Resources resources = 3;
+  map<string, string> env_vars = 4;
+  string build_context_uri = 5;
+  StartupCommand build_command = 6;
+  string workdir = 7;
 }
 
-// TaskSpec is an immutable version of a task.
-message TaskSpec {
+message Resources {
+  uint32 cpu_millis = 1;
+  uint64 memory_bytes = 2;
+}
+
+message EnvironmentIdentifier {
   string project = 1;
   string domain = 2;
   string name = 3;
-  string module = 4;
-  string qualname = 5;
-  string version = 6;
-  SourceBundle source = 7;
-  TaskImage image = 8;
+  string version = 4;
+}
+
+// EnvironmentSpec declares immutable runtime inputs, excluding resolved artifacts.
+// Providers consume it in two phases: building the image and starting the task,
+// applying the content-addressed source bundle on top of the built image.
+message EnvironmentSpec {
+  string project = 1;
+  string domain = 2;
+  string name = 3;
+  string source_uri = 4;
+  ImageSpec image = 5;
+  repeated EnvironmentIdentifier dependencies = 6;
+  // Entrypoint IDs are one-based positions in this list.
+  repeated StartupCommand entrypoints = 7;
+}
+
+message StartupCommand {
+  repeated string args = 1;
+}
+
+message RegisterEnvironmentRequest {
+  EnvironmentSpec spec = 1;
+}
+message RegisterEnvironmentResponse {
+  EnvironmentIdentifier environment = 1;
 }
 
 message CreateRunRequest {
-  TaskSpec spec = 1;
-  bytes input_cbor = 2;
+  EnvironmentIdentifier environment = 1;
+  uint32 entrypoint_id = 2;
+  bytes input_cbor = 3;
   string idempotency_key = 4;
 }
 message CreateRunResponse {
   Run run = 1;
 }
 message CreateTaskActionRequest {
-  TaskSpec spec = 1;
-  bytes input_cbor = 2;
-  string idempotency_key = 3;
+  EnvironmentIdentifier environment = 1;
+  uint32 entrypoint_id = 2;
+  bytes input_cbor = 3;
+  string idempotency_key = 4;
 }
 message CreateTaskActionResponse {
   TaskAction action = 1;
@@ -98,7 +127,7 @@ message WatchRunResponse {
 message TaskActionStatus {
   string action_id = 1;
   string caller_action_id = 2;
-  string name = 3;
+  uint32 entrypoint_id = 3;
   string status = 4;
   int32 attempt = 5;
   string error = 6;
@@ -107,19 +136,20 @@ message TaskActionStatus {
 message Run {
   string id = 1;
   string root_action_id = 2;
-  TaskSpec spec = 3;
+  EnvironmentIdentifier environment = 3;
   string status = 4;
   bytes output_cbor = 5;
   string error = 6;
   string created_at = 7;
   string updated_at = 8;
+  uint32 entrypoint_id = 9;
 }
 
 message TaskAction {
   string id = 1;
   string run_id = 2;
   string caller_action_id = 3;
-  TaskSpec spec = 4;
+  EnvironmentIdentifier environment = 4;
   bytes input_cbor = 5;
   bytes output_cbor = 6;
   string status = 7;
@@ -128,4 +158,5 @@ message TaskAction {
   string created_at = 10;
   string updated_at = 11;
   repeated string upstream_action_ids = 12;
+  uint32 entrypoint_id = 13;
 }

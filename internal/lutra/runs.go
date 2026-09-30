@@ -19,18 +19,15 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
+	"google.golang.org/protobuf/proto"
 )
 
 var (
-	taskNamePattern  = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z_0-9]*(\.[a-zA-Z_][a-zA-Z_0-9]*)*$`)
 	namespacePattern = regexp.MustCompile(`^[a-z][a-z0-9-]{0,62}$`)
 	versionPattern   = regexp.MustCompile(`^[a-f0-9]{64}$`)
 )
 
-const (
-	localTaskImage   = "local-python"
-	sourceBundleMIME = "application/vnd.lutra.source-bundle+zstd"
-)
+const localTaskImage = "local-python"
 
 type taskContextKey struct{}
 
@@ -41,60 +38,11 @@ type taskContext struct {
 }
 
 func sourceURI(digest []byte) string {
-	return "blob:" + sourceBundleMIME + "," + base64.StdEncoding.EncodeToString(digest)
-}
-
-func sourceDigest(task *lutrav1.TaskSpec) ([]byte, error) {
-	if task == nil || task.GetSource() == nil {
-		return nil, invalidTask("task source is required")
-	}
-	digest, mimeType, err := blob.ParseURI(task.GetSource().GetUri())
-	if err != nil || mimeType != sourceBundleMIME || task.GetSource().GetUri() != sourceURI(digest) {
-		return nil, invalidTask("invalid task source")
-	}
-	return digest, nil
+	return blob.URI(archiveMIME, digest)
 }
 
 func invalidTask(message string) error {
 	return connect.NewError(connect.CodeInvalidArgument, errors.New(message))
-}
-
-func validateTask(task *lutrav1.TaskSpec) error {
-	if task == nil || !namespacePattern.MatchString(task.GetProject()) || !namespacePattern.MatchString(task.GetDomain()) ||
-		!taskNamePattern.MatchString(task.GetName()) || !taskNamePattern.MatchString(task.GetModule()) ||
-		!taskNamePattern.MatchString(task.GetQualname()) || !versionPattern.MatchString(task.GetVersion()) ||
-		task.GetImage().GetName() != localTaskImage {
-		return invalidTask("invalid task spec")
-	}
-	return nil
-}
-
-func (s Service) registerTx(ctx context.Context, q *db.Queries, task *lutrav1.TaskSpec, digest []byte) error {
-	if s.Worker == nil {
-		return connect.NewError(connect.CodeUnavailable, errors.New("worker unavailable"))
-	}
-	if err := validateTask(task); err != nil {
-		return err
-	}
-	if _, err := q.GetBlobBySHA256(ctx, digest); errors.Is(err, pgx.ErrNoRows) {
-		return invalidTask("task source blob is not uploaded")
-	} else if err != nil {
-		return err
-	}
-	if err := q.InsertTaskSpec(ctx, db.InsertTaskSpecParams{
-		Project: task.Project, Domain: task.Domain, Name: task.Name, Version: task.Version,
-		SourceSha256: digest, Image: task.GetImage().GetName(), Module: task.Module, Qualname: task.Qualname,
-	}); err != nil {
-		return err
-	}
-	entry, err := q.GetTaskSpec(ctx, db.GetTaskSpecParams{Project: task.Project, Domain: task.Domain, Name: task.Name, Version: task.Version})
-	if err != nil {
-		return err
-	}
-	if entry.Module != task.Module || entry.Qualname != task.Qualname || !bytes.Equal(entry.SourceSha256, digest) || entry.Image != task.GetImage().GetName() {
-		return connect.NewError(connect.CodeAlreadyExists, errors.New("task version has a different spec"))
-	}
-	return nil
 }
 
 func validateInput(input []byte) error {
@@ -127,11 +75,6 @@ func (s Service) CreateRun(ctx context.Context, req *connect.Request[lutrav1.Cre
 	if s.Worker == nil {
 		return nil, connect.NewError(connect.CodeUnavailable, errors.New("worker unavailable"))
 	}
-	task := req.Msg.GetSpec()
-	digest, err := sourceDigest(task)
-	if err != nil {
-		return nil, err
-	}
 	if err := validateInput(req.Msg.GetInputCbor()); err != nil {
 		return nil, err
 	}
@@ -144,14 +87,15 @@ func (s Service) CreateRun(ctx context.Context, req *connect.Request[lutrav1.Cre
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 	q := db.New(tx)
-	if err := s.registerTx(ctx, q, task, digest); err != nil {
+	environment, err := lookupTask(ctx, q, req.Msg.GetEnvironment(), req.Msg.GetEntrypointId())
+	if err != nil {
 		return nil, err
 	}
 	key := pgtype.Text{String: req.Msg.GetIdempotencyKey(), Valid: req.Msg.GetIdempotencyKey() != ""}
 	runID := uuid.New()
-	inserted, err := q.InsertRun(ctx, db.InsertRunParams{ID: runID, Project: task.Project, Domain: task.Domain, RootIdempotencyKey: key})
+	inserted, err := q.InsertRun(ctx, db.InsertRunParams{ID: runID, Project: environment.Project, Domain: environment.Domain, RootIdempotencyKey: key})
 	if errors.Is(err, pgx.ErrNoRows) && key.Valid {
-		existing, lookupErr := q.GetRunByIdempotencyKey(ctx, db.GetRunByIdempotencyKeyParams{Project: task.Project, Domain: task.Domain, RootIdempotencyKey: key})
+		existing, lookupErr := q.GetRunByIdempotencyKey(ctx, db.GetRunByIdempotencyKeyParams{Project: environment.Project, Domain: environment.Domain, RootIdempotencyKey: key})
 		if lookupErr != nil {
 			return nil, lookupErr
 		}
@@ -162,14 +106,14 @@ func (s Service) CreateRun(ctx context.Context, req *connect.Request[lutrav1.Cre
 		if lookupErr != nil {
 			return nil, lookupErr
 		}
-		if action.Name != task.Name || action.Version != task.Version || !bytes.Equal(action.InputCbor, req.Msg.GetInputCbor()) {
+		if action.EnvironmentID != environment.ID || action.EntrypointID != int64(req.Msg.GetEntrypointId()) || !bytes.Equal(action.InputCbor, req.Msg.GetInputCbor()) {
 			return nil, invalidTask("idempotency key already belongs to a different invocation")
 		}
 		runID = existing.ID
 	} else if err != nil {
 		return nil, err
 	} else {
-		rootID, err := q.InsertRootAction(ctx, db.InsertRootActionParams{ID: uuid.New(), RunID: inserted, Project: task.Project, Domain: task.Domain, Name: task.Name, Version: task.Version, InputCbor: req.Msg.GetInputCbor()})
+		rootID, err := q.InsertRootAction(ctx, db.InsertRootActionParams{ID: uuid.New(), RunID: inserted, EnvironmentID: environment.ID, EntrypointID: int64(req.Msg.GetEntrypointId()), InputCbor: req.Msg.GetInputCbor()})
 		if err != nil {
 			return nil, err
 		}
@@ -195,11 +139,6 @@ func (s Service) CreateTaskAction(ctx context.Context, req *connect.Request[lutr
 	if !ok {
 		return nil, connect.NewError(connect.CodePermissionDenied, errors.New("task actions are only available inside a task"))
 	}
-	task := req.Msg.GetSpec()
-	digest, err := sourceDigest(task)
-	if err != nil {
-		return nil, err
-	}
 	if err := validateInput(req.Msg.GetInputCbor()); err != nil {
 		return nil, err
 	}
@@ -212,11 +151,15 @@ func (s Service) CreateTaskAction(ctx context.Context, req *connect.Request[lutr
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 	q := db.New(tx)
+	environment, err := lookupTask(ctx, q, req.Msg.GetEnvironment(), req.Msg.GetEntrypointId())
+	if err != nil {
+		return nil, err
+	}
 	locked, err := q.LockRun(ctx, active.runID)
 	if err != nil || locked.RootActionID == nil {
 		return nil, invalidTask("run is not active")
 	}
-	if task.GetProject() != locked.Project || task.GetDomain() != locked.Domain {
+	if environment.Project != locked.Project || environment.Domain != locked.Domain {
 		return nil, invalidTask("child task belongs to a different project or domain")
 	}
 	rootStatus, err := q.GetRootStatus(ctx, *locked.RootActionID)
@@ -227,27 +170,36 @@ func (s Service) CreateTaskAction(ctx context.Context, req *connect.Request[lutr
 	if err != nil || caller.RunID != active.runID || caller.ClaimToken == nil || *caller.ClaimToken != active.token {
 		return nil, invalidTask("caller action is not active")
 	}
-	if err := s.registerTx(ctx, q, task, digest); err != nil {
+	var callerSpec lutrav1.EnvironmentSpec
+	if err := proto.Unmarshal(caller.EnvironmentSpec, &callerSpec); err != nil {
 		return nil, err
 	}
-	if !bytes.Equal(caller.SourceSha256, digest) {
-		return nil, invalidTask("child source differs from caller")
+	allowed := caller.EnvironmentID == environment.ID
+	child := req.Msg.GetEnvironment()
+	for _, dependency := range callerSpec.Dependencies {
+		if dependency.Project == child.Project && dependency.Domain == child.Domain && dependency.Name == child.Name && dependency.Version == child.Version {
+			allowed = true
+			break
+		}
+	}
+	if !allowed {
+		return nil, connect.NewError(connect.CodePermissionDenied, errors.New("child environment is not a declared dependency"))
 	}
 	key := pgtype.Text{String: req.Msg.GetIdempotencyKey(), Valid: true}
 	existing, lookupErr := q.GetTaskActionByIdempotency(ctx, db.GetTaskActionByIdempotencyParams{RunID: active.runID, IdempotencyKey: key})
 	var actionID uuid.UUID
 	if lookupErr == nil {
-		if existing.CallerActionID == nil || *existing.CallerActionID != active.actionID || existing.Name != task.Name || existing.Version != task.Version || !bytes.Equal(existing.InputCbor, req.Msg.GetInputCbor()) {
+		if existing.CallerActionID == nil || *existing.CallerActionID != active.actionID || existing.EnvironmentID != environment.ID || existing.EntrypointID != int64(req.Msg.GetEntrypointId()) || !bytes.Equal(existing.InputCbor, req.Msg.GetInputCbor()) {
 			return nil, invalidTask("idempotency key already belongs to a different action")
 		}
 		actionID = existing.ID
 	} else if !errors.Is(lookupErr, pgx.ErrNoRows) {
 		return nil, lookupErr
 	} else {
-		actionID, err = q.InsertTaskAction(ctx, db.InsertTaskActionParams{ID: uuid.New(), RunID: active.runID, CallerActionID: &active.actionID, Project: task.Project, Domain: task.Domain, Name: task.Name, Version: task.Version, InputCbor: req.Msg.GetInputCbor(), IdempotencyKey: key})
+		actionID, err = q.InsertTaskAction(ctx, db.InsertTaskActionParams{ID: uuid.New(), RunID: active.runID, CallerActionID: &active.actionID, EnvironmentID: environment.ID, EntrypointID: int64(req.Msg.GetEntrypointId()), InputCbor: req.Msg.GetInputCbor(), IdempotencyKey: key})
 		if errors.Is(err, pgx.ErrNoRows) {
 			existing, lookupErr = q.GetTaskActionByIdempotency(ctx, db.GetTaskActionByIdempotencyParams{RunID: active.runID, IdempotencyKey: key})
-			if lookupErr != nil || existing.CallerActionID == nil || *existing.CallerActionID != active.actionID || existing.Name != task.Name || existing.Version != task.Version || !bytes.Equal(existing.InputCbor, req.Msg.GetInputCbor()) {
+			if lookupErr != nil || existing.CallerActionID == nil || *existing.CallerActionID != active.actionID || existing.EnvironmentID != environment.ID || existing.EntrypointID != int64(req.Msg.GetEntrypointId()) || !bytes.Equal(existing.InputCbor, req.Msg.GetInputCbor()) {
 				return nil, invalidTask("idempotency key already belongs to a different action")
 			}
 			actionID = existing.ID
@@ -289,11 +241,11 @@ func readRun(ctx context.Context, q *db.Queries, id uuid.UUID) (*lutrav1.Run, er
 	if row.RootActionID != nil {
 		rootID = row.RootActionID.String()
 	}
-	return &lutrav1.Run{Id: id.String(), RootActionId: rootID, Spec: specFromParts(row.Project, row.Domain, row.Name, row.Version, row.Module, row.Qualname, row.SourceSha256, row.Image), Status: string(row.Status), OutputCbor: row.OutputCbor, Error: row.Error, CreatedAt: formatTime(row.RunCreatedAt), UpdatedAt: formatTime(row.UpdatedAt)}, nil
+	return &lutrav1.Run{Id: id.String(), RootActionId: rootID, Environment: environmentIdentifier(row.Project, row.Domain, row.EnvironmentName, row.Version), EntrypointId: uint32(row.EntrypointID), Status: string(row.Status), OutputCbor: row.OutputCbor, Error: row.Error, CreatedAt: formatTime(row.RunCreatedAt), UpdatedAt: formatTime(row.UpdatedAt)}, nil
 }
 
-func specFromParts(project, domain, name, version, module, qualname string, digest []byte, image string) *lutrav1.TaskSpec {
-	return &lutrav1.TaskSpec{Project: project, Domain: domain, Name: name, Version: version, Module: module, Qualname: qualname, Source: &lutrav1.SourceBundle{Uri: sourceURI(digest)}, Image: &lutrav1.TaskImage{Name: image}}
+func environmentIdentifier(project, domain, name, version string) *lutrav1.EnvironmentIdentifier {
+	return &lutrav1.EnvironmentIdentifier{Project: project, Domain: domain, Name: name, Version: version}
 }
 
 func formatTime(value pgtype.Timestamptz) string { return value.Time.UTC().Format(time.RFC3339Nano) }
@@ -314,17 +266,19 @@ func (s Service) readTaskAction(ctx context.Context, id uuid.UUID) (*lutrav1.Tas
 }
 
 type actionRow struct {
-	ID                                                                     uuid.UUID
-	RunID                                                                  uuid.UUID
-	CallerActionID                                                         *uuid.UUID
-	Project, Domain, Name, Version, Module, Qualname, Image, Status, Error string
-	SourceSha256, InputCbor, OutputCbor                                    []byte
-	Attempts                                                               int32
-	CreatedAt, UpdatedAt                                                   pgtype.Timestamptz
+	ID                                                       uuid.UUID
+	RunID                                                    uuid.UUID
+	CallerActionID                                           *uuid.UUID
+	Project, Domain, EnvironmentName, Version, Status, Error string
+	EnvironmentID                                            uuid.UUID
+	EntrypointID                                             int64
+	InputCbor, OutputCbor                                    []byte
+	Attempts                                                 int32
+	CreatedAt, UpdatedAt                                     pgtype.Timestamptz
 }
 
 func actionFromRow(row actionRow, upstream []db.ListActionUpstreamsRow) *lutrav1.TaskAction {
-	action := &lutrav1.TaskAction{Id: row.ID.String(), RunId: row.RunID.String(), Spec: specFromParts(row.Project, row.Domain, row.Name, row.Version, row.Module, row.Qualname, row.SourceSha256, row.Image), InputCbor: row.InputCbor, OutputCbor: row.OutputCbor, Status: row.Status, Error: row.Error, Attempts: row.Attempts, CreatedAt: formatTime(row.CreatedAt), UpdatedAt: formatTime(row.UpdatedAt)}
+	action := &lutrav1.TaskAction{Id: row.ID.String(), RunId: row.RunID.String(), Environment: environmentIdentifier(row.Project, row.Domain, row.EnvironmentName, row.Version), EntrypointId: uint32(row.EntrypointID), InputCbor: row.InputCbor, OutputCbor: row.OutputCbor, Status: row.Status, Error: row.Error, Attempts: row.Attempts, CreatedAt: formatTime(row.CreatedAt), UpdatedAt: formatTime(row.UpdatedAt)}
 	if row.CallerActionID != nil {
 		action.CallerActionId = row.CallerActionID.String()
 	}
@@ -337,11 +291,11 @@ func actionFromRow(row actionRow, upstream []db.ListActionUpstreamsRow) *lutrav1
 }
 
 func actionRowFromRead(row db.ReadTaskActionRow) actionRow {
-	return actionRow{ID: row.ID, RunID: row.RunID, CallerActionID: row.CallerActionID, Project: row.Project, Domain: row.Domain, Name: row.Name, Version: row.Version, Module: row.Module, Qualname: row.Qualname, SourceSha256: row.SourceSha256, Image: row.Image, InputCbor: row.InputCbor, OutputCbor: row.OutputCbor, Status: string(row.Status), Error: row.Error, Attempts: row.Attempts, CreatedAt: row.CreatedAt, UpdatedAt: row.UpdatedAt}
+	return actionRow{ID: row.ID, RunID: row.RunID, CallerActionID: row.CallerActionID, Project: row.Project, Domain: row.Domain, EnvironmentName: row.EnvironmentName, Version: row.Version, EntrypointID: row.EntrypointID, EnvironmentID: row.EnvironmentID, InputCbor: row.InputCbor, OutputCbor: row.OutputCbor, Status: string(row.Status), Error: row.Error, Attempts: row.Attempts, CreatedAt: row.CreatedAt, UpdatedAt: row.UpdatedAt}
 }
 
 func actionRowFromList(row db.ListTaskActionsRow) actionRow {
-	return actionRow{ID: row.ID, RunID: row.RunID, CallerActionID: row.CallerActionID, Project: row.Project, Domain: row.Domain, Name: row.Name, Version: row.Version, Module: row.Module, Qualname: row.Qualname, SourceSha256: row.SourceSha256, Image: row.Image, InputCbor: row.InputCbor, OutputCbor: row.OutputCbor, Status: string(row.Status), Error: row.Error, Attempts: row.Attempts, CreatedAt: row.CreatedAt, UpdatedAt: row.UpdatedAt}
+	return actionRow{ID: row.ID, RunID: row.RunID, CallerActionID: row.CallerActionID, Project: row.Project, Domain: row.Domain, EnvironmentName: row.EnvironmentName, Version: row.Version, EntrypointID: row.EntrypointID, EnvironmentID: row.EnvironmentID, InputCbor: row.InputCbor, OutputCbor: row.OutputCbor, Status: string(row.Status), Error: row.Error, Attempts: row.Attempts, CreatedAt: row.CreatedAt, UpdatedAt: row.UpdatedAt}
 }
 
 func (s Service) GetRun(ctx context.Context, req *connect.Request[lutrav1.GetRunRequest]) (*connect.Response[lutrav1.GetRunResponse], error) {
@@ -572,7 +526,7 @@ func (s Service) watchRun(ctx context.Context, id uuid.UUID, taskLogs *lutrav1.S
 				return connect.NewError(connect.CodeDataLoss, err)
 			}
 			next := &lutrav1.Run{
-				Id: run.Id, RootActionId: run.RootActionId, Spec: run.Spec, CreatedAt: run.CreatedAt,
+				Id: run.Id, RootActionId: run.RootActionId, Environment: run.Environment, EntrypointId: run.EntrypointId, CreatedAt: run.CreatedAt,
 				Status: event.Status, OutputCbor: event.OutputCBOR, Error: event.Error, UpdatedAt: event.UpdatedAt,
 			}
 			if err := send(&lutrav1.WatchRunResponse{Run: next}); err != nil {

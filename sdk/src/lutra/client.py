@@ -18,11 +18,16 @@ from lutra._gen.lutra.v1.lutra_connect import LutraServiceClient
 from lutra._gen.lutra.v1.lutra_pb import (
     CancelRunRequest,
     CreateRunRequest,
+    EnvironmentIdentifier,
+    EnvironmentSpec,
     GetRunRequest,
+    ImageSpec,
+    RegisterEnvironmentRequest,
+    Resources,
     Run,
+    StartupCommand,
     TaskAction,
     TaskActionStatus,
-    TaskSpec,
     WatchRunRequest,
 )
 from lutra.value import dumps, loads
@@ -30,8 +35,9 @@ from lutra.value import dumps, loads
 if TYPE_CHECKING:
     import logging
     from collections.abc import AsyncIterator
+    from pathlib import Path
 
-    from lutra.task import Invocation, Task
+    from lutra.task import Invocation, TaskEnvironment
 
 R = TypeVar("R")
 
@@ -65,7 +71,7 @@ class _RunLogger:
                 self.logger,
                 self.run_id,
                 "task",
-                f"{event.name} {event.status} action={event.action_id} "
+                f"entrypoint={event.entrypoint_id} {event.status} action={event.action_id} "
                 f"parent={event.caller_action_id} attempt={event.attempt}",
                 event.updated_at,
             )
@@ -74,7 +80,7 @@ class _RunLogger:
                     self.logger,
                     self.run_id,
                     "error",
-                    f"task={event.name} action={event.action_id} "
+                    f"entrypoint={event.entrypoint_id} action={event.action_id} "
                     f"attempt={event.attempt} | {event.error}",
                     event.updated_at,
                 )
@@ -97,18 +103,15 @@ class _RunLogger:
                 timestamp,
             )
             return
-        if not self.started and event.spec is not None:
+        if not self.started and event.environment is not None:
             _log_message(
                 self.logger,
                 self.run_id,
                 "deployment",
-                f"task={event.spec.name} project={event.spec.project} "
-                f"domain={event.spec.domain} version={event.spec.version}",
+                f"entrypoint={event.entrypoint_id} "
+                f"project={event.environment.project} "
+                f"domain={event.environment.domain} version={event.environment.version}",
             )
-            if event.spec.image is not None:
-                _log_message(
-                    self.logger, self.run_id, "environment", f"image={event.spec.image.name}"
-                )
         if not self.started and event.root_action_id:
             _log_message(self.logger, self.run_id, "root", f"action={event.root_action_id}")
         self.started = True
@@ -160,6 +163,15 @@ def _require_action(action: TaskAction | None) -> TaskAction:
         message = "server returned no task action"
         raise RuntimeError(message)
     return action
+
+
+def _limited_bundle(root: Path, *, source_only: bool) -> bytes:
+    bundle = build_bundle(root, source_only=source_only)
+    if len(bundle) > 64 << 20:
+        kind = "source bundle" if source_only else "image build context"
+        msg = f"{kind} exceeds 64 MiB"
+        raise ValueError(msg)
+    return bundle
 
 
 class RunHandle(Generic[R]):
@@ -285,13 +297,75 @@ class Client:
         self.project = project
         self.domain = domain
 
-    async def _prepare(self, task: Task[..., R]) -> TaskSpec:
-        bundle = build_bundle(task)
-        if len(bundle) > 64 << 20:
-            message = "source bundle exceeds 64 MiB"
-            raise ValueError(message)
-        uri = await upload_blob(self.blob, bundle, SOURCE_BUNDLE_MIME)
-        return task.spec(self.project, self.domain, uri)
+    async def _prepare(self, environment: TaskEnvironment) -> EnvironmentIdentifier:
+        ordered: list[TaskEnvironment] = []
+        visiting: set[TaskEnvironment] = set()
+        visited: set[TaskEnvironment] = set()
+        names: dict[str, TaskEnvironment] = {}
+
+        def visit(current: TaskEnvironment) -> None:
+            if current in visiting:
+                msg = "environment dependencies contain a cycle"
+                raise ValueError(msg)
+            if current.name in names and names[current.name] is not current:
+                msg = f"ambiguous environment name {current.name!r}"
+                raise ValueError(msg)
+            names[current.name] = current
+            if current in visited:
+                return
+            visiting.add(current)
+            for dependency in current.dependencies:
+                visit(dependency)
+            visiting.remove(current)
+            visited.add(current)
+            ordered.append(current)
+
+        visit(environment)
+        identifiers: dict[TaskEnvironment, EnvironmentIdentifier] = {}
+        for current in ordered:
+            root = current.source_root
+            bundle = _limited_bundle(root, source_only=True)
+            uri = await upload_blob(self.blob, bundle, SOURCE_BUNDLE_MIME)
+            if current.image.build_context is None:
+                build_uri = uri
+            else:
+                build_root = (root / current.image.build_context).resolve()
+                build_bundle_bytes = _limited_bundle(build_root, source_only=False)
+                build_uri = await upload_blob(self.blob, build_bundle_bytes, SOURCE_BUNDLE_MIME)
+            response = await self.rpc.register_environment(
+                RegisterEnvironmentRequest(
+                    spec=EnvironmentSpec(
+                        project=self.project,
+                        domain=self.domain,
+                        name=current.name,
+                        source_uri=uri,
+                        image=ImageSpec(
+                            name=current.image.name,
+                            reference=current.image.reference,
+                            resources=Resources(
+                                cpu_millis=current.resources.cpu_millis,
+                                memory_bytes=current.resources.memory_bytes,
+                            ),
+                            env_vars=dict(current.env_vars),
+                            build_context_uri=build_uri,
+                            build_command=StartupCommand(args=list(current.image.build_command)),
+                            workdir=current.image.workdir,
+                        ),
+                        dependencies=[
+                            identifiers[dependency]
+                            for dependency in dict.fromkeys(current.dependencies)
+                        ],
+                        entrypoints=[
+                            StartupCommand(args=list(task.entrypoint())) for task in current.tasks
+                        ],
+                    )
+                )
+            )
+            if response.environment is None:
+                msg = "server returned no registered environment"
+                raise RuntimeError(msg)
+            identifiers[current] = response.environment
+        return identifiers[environment]
 
     async def submit(self, invocation: Invocation[R], *, idempotency_key: str = "") -> RunHandle[R]:
         """Submit an invocation and return a handle for its run.
@@ -300,10 +374,11 @@ class Client:
             A handle for the submitted run.
 
         """
-        spec = await self._prepare(invocation.task)
+        environment = await self._prepare(invocation.task.environment)
         result = await self.rpc.create_run(
             CreateRunRequest(
-                spec=spec,
+                environment=environment,
+                entrypoint_id=invocation.task.entrypoint_id,
                 input_cbor=dumps([list(invocation.args), invocation.kwargs]),
                 idempotency_key=idempotency_key,
             )

@@ -11,15 +11,17 @@ import os
 
 import lutra
 
+environment = lutra.TaskEnvironment(name="greetings")
 
-@lutra.task
+
+@environment.task
 async def greeting(name: str) -> str:
     await asyncio.sleep(0)
     print(f"Greeting {name}")
     return f"Hello, {name}!"
 
 
-@lutra.task
+@environment.task
 async def retry_once(value: str) -> str:
     await asyncio.sleep(0)
     print(f"Retry task attempt {os.environ.get('LUTRA_ATTEMPT')}")
@@ -29,20 +31,20 @@ async def retry_once(value: str) -> str:
     return value
 
 
-@lutra.task
+@environment.task
 async def greet_person(name: str) -> str:
     prepared = await lutra.run(retry_once(name))
     return await lutra.run(greeting(prepared))
 
 
-@lutra.task
+@environment.task
 async def summarize(greetings: list[str]) -> str:
     await asyncio.sleep(0)
     print(f"Combining {len(greetings)} greetings")
     return " | ".join(greetings)
 
 
-@lutra.task
+@environment.task
 async def hello(names: list[str]) -> str:
     greetings = [await lutra.run(greet_person(name)) for name in names]
     return await lutra.run(summarize(greetings))

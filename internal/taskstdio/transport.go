@@ -77,20 +77,20 @@ func (c *call) close() {
 
 // Transport implements connect.HTTPClient for JSON-encoded Connect RPCs.
 type Transport struct {
-	input          io.ReadCloser
-	output         io.WriteCloser
-	write          sync.Mutex
-	mu             sync.Mutex
-	calls          map[string]*call
-	reverseCalls   map[string]*reverseCall
-	reverseHandler http.Handler
-	next           uint64
-	err            error
-	workers        sync.WaitGroup
+	input         io.ReadCloser
+	output        io.WriteCloser
+	write         sync.Mutex
+	mu            sync.Mutex
+	calls         map[string]*call
+	incomingCalls map[string]*incomingCall
+	handler       http.Handler
+	next          uint64
+	err           error
+	workers       sync.WaitGroup
 }
 
 func NewTransport(input io.ReadCloser, output io.WriteCloser) *Transport {
-	t := &Transport{input: input, output: output, calls: make(map[string]*call), reverseCalls: make(map[string]*reverseCall)}
+	t := &Transport{input: input, output: output, calls: make(map[string]*call), incomingCalls: make(map[string]*incomingCall)}
 	t.workers.Add(1)
 	go func() {
 		defer t.workers.Done()
@@ -293,7 +293,7 @@ func (t *Transport) readLoop() {
 			return
 		}
 		if strings.HasPrefix(f.ID, "p") {
-			t.handleReverseFrame(f)
+			t.handleIncomingFrame(f)
 			continue
 		}
 		t.mu.Lock()
@@ -331,7 +331,7 @@ func (t *Transport) fail(err error) {
 		for _, c := range t.calls {
 			c.close()
 		}
-		for _, c := range t.reverseCalls {
+		for _, c := range t.incomingCalls {
 			c.cancel()
 		}
 	}

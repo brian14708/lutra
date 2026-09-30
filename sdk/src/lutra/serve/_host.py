@@ -161,10 +161,10 @@ class TaskAPIClient:
         self._action_id.reset(action_token)
 
     async def unary(self, path: str, value: dict[str, Any]) -> dict[str, Any]:
-        self._host.next_reverse += 1
-        call_id = f"p{self._host.next_reverse}"
+        self._host.next_api_call += 1
+        call_id = f"p{self._host.next_api_call}"
         queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
-        self._host.reverse_calls[call_id] = queue
+        self._host.api_calls[call_id] = queue
         try:
             await self._host.write({
                 "id": call_id,
@@ -178,7 +178,7 @@ class TaskAPIClient:
             await self._host.write({"id": call_id, "type": "cancel"})
             raise
         finally:
-            self._host.reverse_calls.pop(call_id, None)
+            self._host.api_calls.pop(call_id, None)
 
     @staticmethod
     async def _read_unary(queue: asyncio.Queue[dict[str, Any]]) -> dict[str, Any]:
@@ -348,8 +348,8 @@ class _Host:
     def __init__(self, app: TaskServiceASGIApplication) -> None:
         self.app = app
         self.calls: dict[str, _Call] = {}
-        self.reverse_calls: dict[str, asyncio.Queue[dict[str, Any]]] = {}
-        self.next_reverse = 0
+        self.api_calls: dict[str, asyncio.Queue[dict[str, Any]]] = {}
+        self.next_api_call = 0
         self.lock = asyncio.Lock()
 
     async def write(self, frame: dict[str, Any]) -> None:
@@ -371,7 +371,7 @@ class _Host:
         if not isinstance(call_id, str) or not call_id:
             message = "frame requires a nonempty id"
             raise ValueError(message)
-        queue = self.reverse_calls.get(call_id)
+        queue = self.api_calls.get(call_id)
         if queue is not None:
             await queue.put(frame)
             return

@@ -16,7 +16,7 @@ type actionStatusEvent struct {
 	Type           string `cbor:"type"`
 	ActionID       string `cbor:"action_id"`
 	CallerActionID string `cbor:"caller_action_id"`
-	Name           string `cbor:"name"`
+	EntrypointID   uint32 `cbor:"entrypoint_id"`
 	Status         string `cbor:"status"`
 	Attempt        int32  `cbor:"attempt"`
 	Error          string `cbor:"error"`
@@ -45,7 +45,7 @@ func DecodeActionStatus(value []byte) (*lutrav1.TaskActionStatus, error) {
 	default:
 		return nil, errors.New("invalid task status event")
 	}
-	return &lutrav1.TaskActionStatus{ActionId: event.ActionID, CallerActionId: event.CallerActionID, Name: event.Name, Status: event.Status, Attempt: event.Attempt, Error: event.Error, UpdatedAt: event.UpdatedAt}, nil
+	return &lutrav1.TaskActionStatus{ActionId: event.ActionID, CallerActionId: event.CallerActionID, EntrypointId: event.EntrypointID, Status: event.Status, Attempt: event.Attempt, Error: event.Error, UpdatedAt: event.UpdatedAt}, nil
 }
 
 func (s Service) AppendActionStatus(ctx context.Context, tx pgx.Tx, id uuid.UUID) error {
@@ -60,7 +60,7 @@ func (s Service) AppendActionStatus(ctx context.Context, tx pgx.Tx, id uuid.UUID
 	if err != nil {
 		return err
 	}
-	value, err := mode.Marshal(actionStatusEvent{Type: "task.status.v1", ActionID: id.String(), CallerActionID: row.CallerActionID.String(), Name: row.Name, Status: string(row.Status), Attempt: row.Attempts, Error: row.Error, UpdatedAt: row.UpdatedAt.Time.UTC().Format(time.RFC3339Nano)})
+	value, err := mode.Marshal(actionStatusEvent{Type: "task.status.v1", ActionID: id.String(), CallerActionID: row.CallerActionID.String(), EntrypointID: uint32(row.EntrypointID), Status: string(row.Status), Attempt: row.Attempts, Error: row.Error, UpdatedAt: row.UpdatedAt.Time.UTC().Format(time.RFC3339Nano)})
 	if err != nil {
 		return err
 	}

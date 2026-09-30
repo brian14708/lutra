@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import base64
 import hashlib
 import io
@@ -32,6 +33,8 @@ _REGULAR_MODE = 0o644
 _EXECUTABLE_MODE = 0o755
 _DIRECTORY_MODE = 0o755
 _ZSTD_LEVEL = 3
+_MAX_ARCHIVE_SIZE = 2 << 30
+_MAX_ARCHIVE_ENTRIES = 100_000
 
 
 class ArchiveError(ValueError):
@@ -78,24 +81,39 @@ def _tar_info(name: str, mode: int) -> tarfile.TarInfo:
     return entry
 
 
-def _write_tar(source: Path, target: BinaryIO) -> list[tuple[tarfile.TarInfo, int]]:
+def _write_tar(
+    source: Path, target: BinaryIO, *, prefix: str = ""
+) -> list[tuple[tarfile.TarInfo, int]]:
     members: list[tuple[tarfile.TarInfo, int]] = []
     with tarfile.open(fileobj=target, mode="w", format=tarfile.PAX_FORMAT) as archive:
         for path, name in _members(source):
+            arcname = f"{prefix}/{name}" if prefix else name
             info = path.lstat()
+            size = info.st_size if stat.S_ISREG(info.st_mode) else 0
+            if (
+                target.tell() + size + 1024 > _MAX_ARCHIVE_SIZE
+                or len(members) >= _MAX_ARCHIVE_ENTRIES
+            ):
+                msg = "archive exceeds size or entry limit"
+                raise ArchiveError(msg)
             if stat.S_ISDIR(info.st_mode):
-                entry = _tar_info(name + "/", _DIRECTORY_MODE)
+                entry = _tar_info(arcname + "/", _DIRECTORY_MODE)
                 entry.type = tarfile.DIRTYPE
                 archive.addfile(entry)
             elif stat.S_ISREG(info.st_mode):
                 mode = _EXECUTABLE_MODE if info.st_mode & 0o111 else _REGULAR_MODE
-                entry = _tar_info(name, mode)
+                entry = _tar_info(arcname, mode)
                 entry.type = tarfile.REGTYPE
                 entry.size = info.st_size
                 with path.open("rb") as contents:
                     archive.addfile(entry, contents)
+            elif stat.S_ISLNK(info.st_mode):
+                entry = _tar_info(arcname, _REGULAR_MODE)
+                entry.type = tarfile.SYMTYPE
+                entry.linkname = str(path.readlink())
+                archive.addfile(entry)
             else:
-                msg = f"unsupported archive entry: {name}"
+                msg = f"unsupported archive entry: {arcname}"
                 raise ArchiveError(msg)
             padded_size = (entry.size + tarfile.BLOCKSIZE - 1) // tarfile.BLOCKSIZE
             members.append((entry, target.tell() - padded_size * tarfile.BLOCKSIZE))
@@ -148,12 +166,14 @@ def _metadata(output: BinaryIO, data: bytes) -> tuple[int, int, int]:
     return offset, len(compressed), len(data)
 
 
-def create_archive(source: Path, output: Path) -> None:
+def create_archive(source: Path, output: Path, *, prefix: str = "") -> None:
     """Write a sorted zstd:chunked tar archive with normalized tar metadata."""
     source = Path(source)
     output = Path(output)
+    if prefix:
+        _safe_name(prefix)
     with tempfile.TemporaryFile() as raw:
-        members = _write_tar(source, raw)
+        members = _write_tar(source, raw, prefix=prefix)
         raw.seek(0, os.SEEK_END)
         tar_length = raw.tell()
         raw.seek(0)
@@ -165,11 +185,13 @@ def create_archive(source: Path, output: Path) -> None:
                 _segment(raw, compressed, offset_data - cursor, tarsplit)
                 cursor = offset_data
                 item: dict[str, object] = {
-                    "type": "dir" if member.isdir() else "reg",
+                    "type": "dir" if member.isdir() else "symlink" if member.issym() else "reg",
                     "name": member.name,
                     "mode": member.mode,
                     "modtime": "1970-01-01T00:00:00Z",
                 }
+                if member.issym():
+                    item["linkname"] = member.linkname
                 if member.isfile():
                     item["size"] = member.size
                     if member.size:
@@ -277,7 +299,11 @@ def _manifest(source: BinaryIO) -> list[dict[str, object]]:
             msg = "invalid archive entry"
             raise ArchiveError(msg)
         name = entry.get("name")
-        if not isinstance(name, str) or name in seen or entry.get("type") not in {"dir", "reg"}:
+        if (
+            not isinstance(name, str)
+            or name in seen
+            or entry.get("type") not in {"dir", "reg", "symlink"}
+        ):
             msg = "invalid archive entry"
             raise ArchiveError(msg)
         _safe_name(name)
@@ -356,6 +382,19 @@ def read_archive(archive: Path, name: str) -> bytes:
     raise KeyError(name)
 
 
+def _extract_symlink(target: Path, link: str, root: Path) -> None:
+    if Path(link).is_absolute():
+        resolved = Path(os.path.normpath(link))
+        if not any(resolved.is_relative_to(prefix) for prefix in ("/nix/store", "/usr")):
+            msg = "archive symlink escapes allowed runtime roots"
+            raise ArchiveError(msg)
+    elif not target.parent.joinpath(link).resolve().is_relative_to(root):
+        msg = "archive symlink escapes destination"
+        raise ArchiveError(msg)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.symlink_to(link)
+
+
 def _extract_member(tar: tarfile.TarFile, member: tarfile.TarInfo, root: Path) -> None:
     target = root.joinpath(*_safe_name(member.name))
     if not target.parent.resolve().is_relative_to(root) or target.is_symlink():
@@ -363,6 +402,8 @@ def _extract_member(tar: tarfile.TarFile, member: tarfile.TarInfo, root: Path) -
         raise ArchiveError(msg)
     if member.isdir():
         target.mkdir(parents=True, exist_ok=True)
+    elif member.issym():
+        _extract_symlink(target, member.linkname, root)
     elif member.isfile():
         contents = tar.extractfile(member)
         if contents is None:
@@ -373,6 +414,8 @@ def _extract_member(tar: tarfile.TarFile, member: tarfile.TarInfo, root: Path) -
             temporary = Path(output.name)
             try:
                 shutil.copyfileobj(contents, output)
+                if member.mode & 0o100:
+                    temporary.chmod(0o700)
             except Exception:
                 temporary.unlink(missing_ok=True)
                 raise
@@ -383,7 +426,7 @@ def _extract_member(tar: tarfile.TarFile, member: tarfile.TarInfo, root: Path) -
 
 
 def extract_archive(archive: Path, destination: Path) -> None:
-    """Extract all regular files and directories from the tar stream.
+    """Extract files, directories, and symlinks from the tar stream.
 
     Raises:
         ArchiveError: If the archive is malformed or contains an unsafe path.
@@ -403,3 +446,25 @@ def extract_archive(archive: Path, destination: Path) -> None:
     except (tarfile.TarError, zstandard.ZstdError) as error:
         msg = "invalid compressed tar archive"
         raise ArchiveError(msg) from error
+
+
+def main() -> None:
+    """Create or extract an archive from the command line."""
+    parser = argparse.ArgumentParser()
+    commands = parser.add_subparsers(dest="command", required=True)
+    create = commands.add_parser("create")
+    create.add_argument("source", type=Path)
+    create.add_argument("output", type=Path)
+    create.add_argument("--prefix", default="")
+    extract = commands.add_parser("extract")
+    extract.add_argument("archive", type=Path)
+    extract.add_argument("destination", type=Path)
+    args = parser.parse_args()
+    if args.command == "create":
+        create_archive(args.source, args.output, prefix=args.prefix)
+    else:
+        extract_archive(args.archive, args.destination)
+
+
+if __name__ == "__main__":
+    main()

@@ -12,13 +12,10 @@ import (
 	"github.com/klauspost/compress/zstd"
 )
 
-func extractBundle(archive, destination string) error {
-	file, err := os.Open(archive)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = file.Close() }()
-	decoder, err := zstd.NewReader(file)
+const archiveMIME = "application/x-tar+zstd"
+
+func extractBundle(archive io.Reader, destination string) error {
+	decoder, err := zstd.NewReader(archive)
 	if err != nil {
 		return err
 	}
@@ -44,6 +41,9 @@ func extractBundle(archive, destination string) error {
 		if name == "" || filepath.IsAbs(name) || strings.Contains(name, "\\") || filepath.Clean(name) != name || name == ".." || strings.HasPrefix(name, "../") {
 			return fmt.Errorf("unsafe bundle path %q", member.Name)
 		}
+		if name == ".venv" || strings.HasPrefix(name, ".venv/") {
+			return errors.New("source bundle cannot replace the built image")
+		}
 		target := filepath.Join(destination, name)
 		switch member.Typeflag {
 		case tar.TypeDir:
@@ -61,7 +61,11 @@ func extractBundle(archive, destination string) error {
 			if err := os.MkdirAll(filepath.Dir(target), 0o700); err != nil {
 				return err
 			}
-			output, err := os.OpenFile(target, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+			mode := os.FileMode(0o600)
+			if member.Mode&0o100 != 0 {
+				mode = 0o700
+			}
+			output, err := os.OpenFile(target, os.O_CREATE|os.O_EXCL|os.O_WRONLY, mode)
 			if err != nil {
 				return err
 			}

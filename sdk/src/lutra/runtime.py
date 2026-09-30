@@ -12,7 +12,11 @@ import pyqwest
 from connectrpc.codec import proto_json_codec
 
 from lutra._gen.lutra.v1.lutra_connect import LutraServiceClient
-from lutra._gen.lutra.v1.lutra_pb import CreateTaskActionRequest, GetTaskActionRequest, TaskSpec
+from lutra._gen.lutra.v1.lutra_pb import (
+    CreateTaskActionRequest,
+    EnvironmentIdentifier,
+    GetTaskActionRequest,
+)
 from lutra.client import _require_action
 from lutra.serve import StdioTransport, TaskAPIClient
 from lutra.value import dumps, loads
@@ -30,7 +34,7 @@ class RunContext:
     """Context needed to submit child actions from a running task."""
 
     api_client: TaskAPIClient
-    task_spec: TaskSpec
+    environments: dict[str, EnvironmentIdentifier]
     run_id: str
     action_id: str
     child_numbers: Iterator[int] = field(default_factory=lambda: count(1))
@@ -51,13 +55,11 @@ async def run(invocation: Invocation[R]) -> R:
     """
     context = run_context.get()
     api_client = context.api_client
-    current = context.task_spec
     child = invocation.task
-    source = current.source
-    if source is None:
-        message = "active task has no source bundle"
-        raise RuntimeError(message)
-    spec = child.spec(current.project, current.domain, source.uri)
+    environment = context.environments.get(child.environment.name)
+    if environment is None:
+        msg = f"environment {child.environment.name!r} is not a registered dependency"
+        raise RuntimeError(msg)
     client = LutraServiceClient(
         "http://stdio",
         codec=proto_json_codec(),
@@ -67,7 +69,8 @@ async def run(invocation: Invocation[R]) -> R:
     )
     response = await client.create_task_action(
         CreateTaskActionRequest(
-            spec=spec,
+            environment=environment,
+            entrypoint_id=child.entrypoint_id,
             input_cbor=dumps([list(invocation.args), invocation.kwargs]),
             idempotency_key=f"{context.action_id}:{next(context.child_numbers)}",
         )

@@ -19,7 +19,7 @@ async def echo(
     logger.info("task handler called")
     if invocation_id == "wait":
         await asyncio.Event().wait()
-    reply = await api_client.unary("/test.Reverse/Echo", {"message": invocation_id})
+    reply = await api_client.unary("/test.TaskAPI/Echo", {"message": invocation_id})
     if reply.get("message") != invocation_id:
         message = "task API call returned an unexpected message"
         raise ValueError(message)

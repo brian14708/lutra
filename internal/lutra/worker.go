@@ -10,25 +10,21 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
-	"os"
-	"os/exec"
-	"path/filepath"
 	"sync"
 	"time"
 
 	"connectrpc.com/connect"
-	taskv1 "github.com/brian14708/lutra/gen/lutra/task/v1"
 	lutrav1 "github.com/brian14708/lutra/gen/lutra/v1"
 	lutrav1connect "github.com/brian14708/lutra/gen/lutra/v1/lutrav1connect"
 	"github.com/brian14708/lutra/internal/blob"
 	"github.com/brian14708/lutra/internal/db"
 	"github.com/brian14708/lutra/internal/runlog"
-	"github.com/brian14708/lutra/internal/taskstdio"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/minio/minio-go/v7"
+	"google.golang.org/protobuf/proto"
 )
 
 type activeRun struct {
@@ -177,50 +173,69 @@ func (w *Worker) execute(ctx context.Context, actionID, runID uuid.UUID, attempt
 		w.mu.Unlock()
 	}()
 	claimed, err := w.queries.LoadClaimedTaskAction(ctx, db.LoadClaimedTaskActionParams{ActionID: actionID, ClaimToken: active.token})
-	if err != nil {
-		if finishErr := w.finish(actionID, runID, active.token, attempt, nil, err); finishErr != nil {
-			slog.Error("finish action", "action_id", actionID, "error", finishErr)
+	if err == nil {
+		var task *EnvironmentExecution
+		task, err = newExecution(claimed, runID, actionID, attempt)
+		if err == nil {
+			var output []byte
+			output, err = w.executeEnvironment(ctx, claimed.ImageKey, active.token, task)
+			if finishErr := w.finish(actionID, runID, active.token, attempt, output, err); finishErr != nil {
+				slog.Error("finish action", "action_id", actionID, "error", finishErr)
+			}
+			return
 		}
-		return
 	}
-	task := &lutrav1.TaskSpec{
-		Project: claimed.Project, Domain: claimed.Domain, Name: claimed.Name,
-		Version: claimed.Version, Module: claimed.Module, Qualname: claimed.Qualname,
-		Source: &lutrav1.SourceBundle{Uri: sourceURI(claimed.SourceSha256)},
-		Image:  &lutrav1.TaskImage{Name: claimed.Image},
-	}
-	archive, err := w.loadSource(ctx, claimed.ObjectKey, claimed.SourceSha256)
-	if err != nil {
-		if finishErr := w.finish(actionID, runID, active.token, attempt, nil, err); finishErr != nil {
-			slog.Error("finish action", "action_id", actionID, "error", finishErr)
-		}
-		return
-	}
-	output, err := w.attempt(ctx, actionID, runID, active.token, task, archive, claimed.InputCbor, attempt)
-	if finishErr := w.finish(actionID, runID, active.token, attempt, output, err); finishErr != nil {
+	if finishErr := w.finish(actionID, runID, active.token, attempt, nil, err); finishErr != nil {
 		slog.Error("finish action", "action_id", actionID, "error", finishErr)
 	}
 }
 
-func (w *Worker) loadSource(ctx context.Context, objectID uuid.UUID, digest []byte) ([]byte, error) {
+func newExecution(claimed db.LoadClaimedTaskActionRow, runID, actionID uuid.UUID, attempt int32) (*EnvironmentExecution, error) {
+	task := &EnvironmentExecution{
+		Environment:  &lutrav1.EnvironmentIdentifier{Project: claimed.Project, Domain: claimed.Domain, Name: claimed.EnvironmentName, Version: claimed.Version},
+		EntrypointID: uint32(claimed.EntrypointID),
+		Provider:     claimed.Provider,
+		Spec:         &lutrav1.EnvironmentSpec{},
+		Input:        claimed.InputCbor,
+		RunID:        runID.String(),
+		ActionID:     actionID.String(),
+		Attempt:      attempt,
+	}
+	if err := proto.Unmarshal(claimed.Spec, task.Spec); err != nil {
+		return nil, err
+	}
+	task.Environments = append([]*lutrav1.EnvironmentIdentifier{task.Environment}, task.Spec.Dependencies...)
+	return task, nil
+}
+
+func (w *Worker) openBundle(ctx context.Context, digest []byte) (io.ReadCloser, error) {
 	if w.Store == nil || w.Bucket == "" {
 		return nil, errors.New("source blob store unavailable")
 	}
+	record, err := w.queries.GetBlobBySHA256(ctx, digest)
+	if err != nil {
+		return nil, err
+	}
+	reader, _, _, err := w.Store.GetObject(ctx, w.Bucket, blob.ObjectKey(record.ObjectKey), minio.GetObjectOptions{})
+	return reader, err
+}
+
+func (w *Worker) readVerified(ctx context.Context, objectID uuid.UUID, digest []byte, maxSize int64) ([]byte, error) {
 	reader, _, _, err := w.Store.GetObject(ctx, w.Bucket, blob.ObjectKey(objectID), minio.GetObjectOptions{})
 	if err != nil {
 		return nil, err
 	}
 	defer func() { _ = reader.Close() }()
-	archive, err := io.ReadAll(io.LimitReader(reader, maxSourceSize+1))
+	archive, err := io.ReadAll(io.LimitReader(reader, maxSize+1))
 	if err != nil {
 		return nil, err
 	}
-	if len(archive) > maxSourceSize {
-		return nil, errors.New("source bundle exceeds 64 MiB")
+	if int64(len(archive)) > maxSize {
+		return nil, errors.New("blob exceeds size limit")
 	}
 	hash := sha256.Sum256(archive)
 	if !bytes.Equal(hash[:], digest) {
-		return nil, errors.New("source blob checksum mismatch")
+		return nil, errors.New("blob checksum mismatch")
 	}
 	return archive, nil
 }
@@ -407,88 +422,25 @@ func (w *Worker) setWaiting(ctx context.Context, active *activeRun, waiting bool
 	return rows, tx.Commit(ctx)
 }
 
-func (w *Worker) attempt(ctx context.Context, actionID, runID, token uuid.UUID, task *lutrav1.TaskSpec, archive, input []byte, attempt int32) ([]byte, error) {
-	if task.GetImage().GetName() != localTaskImage {
-		return nil, fmt.Errorf("unsupported task image %q", task.GetImage().GetName())
+// executor returns the provider for an image name. Unconfigured providers
+// fail explicitly until their adapters exist.
+func (w *Worker) executor(name string) (Executor, error) {
+	if name == localTaskImage {
+		return &LocalExecutor{StoreArtifact: w.storeArtifact, LoadArtifact: w.loadArtifact, OpenBundle: w.openBundle}, nil
 	}
-	dir, err := os.MkdirTemp("", "lutra-run-")
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = os.RemoveAll(dir) }()
+	return nil, connect.NewError(connect.CodeUnimplemented, fmt.Errorf("%s executor is not configured", name))
+}
+
+func (w *Worker) executeEnvironment(ctx context.Context, imageKey []byte, token uuid.UUID, task *EnvironmentExecution) ([]byte, error) {
+	runID, actionID := uuid.MustParse(task.RunID), uuid.MustParse(task.ActionID)
 	stderrReader, stderrWriter := io.Pipe()
-	logDone := w.collectTaskLogs(runID, actionID, attempt, stderrReader)
+	logDone := w.collectTaskLogs(runID, actionID, task.Attempt, stderrReader)
 	defer func() {
 		_ = stderrWriter.Close()
 		<-logDone
 	}()
-	setupStarted := time.Now()
-	_, _ = fmt.Fprintf(stderrWriter, "environment setup started task=%s image=%s\n", task.Name, task.GetImage().GetName())
-	path := filepath.Join(dir, "bundle.tar.zst")
-	if err := os.WriteFile(path, archive, 0o600); err != nil {
-		return nil, err
-	}
-	// Validate archive paths and size before running bundled code.
-	if err := extractBundle(path, dir); err != nil {
-		return nil, err
-	}
-	uvPath, err := exec.LookPath("uv")
-	if err != nil {
-		return nil, err
-	}
-	uvPath, err = filepath.EvalSymlinks(uvPath)
-	if err != nil {
-		return nil, err
-	}
-	hostPython, err := exec.LookPath("python3")
-	if err != nil {
-		return nil, err
-	}
-	hostPython, err = filepath.EvalSymlinks(hostPython)
-	if err != nil {
-		return nil, err
-	}
-	bwrapPath, err := exec.LookPath("bwrap")
-	if err != nil {
-		return nil, err
-	}
-	prep := exec.CommandContext(ctx, bwrapPath, append(sandboxArgs(dir), "--", uvPath, "sync", "--locked", "--no-dev", "--python", hostPython)...)
-	prep.Env = []string{"PATH=" + os.Getenv("PATH")}
-	prep.Stderr = io.MultiWriter(os.Stderr, stderrWriter)
-	prep.Stdout = prep.Stderr
-	_, _ = fmt.Fprintf(stderrWriter, "environment syncing dependencies python=%s command=uv sync --locked --no-dev\n", hostPython)
-	if err := prep.Run(); err != nil {
-		_, _ = fmt.Fprintf(stderrWriter, "environment setup failed elapsed=%.3fs error=%v\n", time.Since(setupStarted).Seconds(), err)
-		return nil, fmt.Errorf("uv sync: %w", err)
-	}
-	pythonPath := filepath.Join(dir, ".venv", "bin", "python")
-	if _, err := os.Stat(pythonPath); err != nil {
-		return nil, fmt.Errorf("task environment python is unavailable: %w", err)
-	}
-	_, _ = fmt.Fprintf(stderrWriter, "environment setup ready elapsed=%.3fs\n", time.Since(setupStarted).Seconds())
-	args := append(sandboxArgs(dir),
-		"--setenv", "LUTRA_TASK_PROJECT", task.Project,
-		"--setenv", "LUTRA_TASK_DOMAIN", task.Domain,
-		"--setenv", "LUTRA_TASK_NAME", task.Name,
-		"--setenv", "LUTRA_TASK_MODULE", task.Module,
-		"--setenv", "LUTRA_TASK_QUALNAME", task.Qualname,
-		"--setenv", "LUTRA_TASK_VERSION", task.Version,
-		"--setenv", "LUTRA_TASK_SOURCE_URI", task.GetSource().GetUri(),
-		"--setenv", "LUTRA_TASK_IMAGE", task.GetImage().GetName(),
-		"--setenv", "LUTRA_ATTEMPT", fmt.Sprint(attempt),
-		"--setenv", "LUTRA_TASK_RUN_ID", runID.String(),
-		"--setenv", "LUTRA_TASK_ACTION_ID", actionID.String(),
-		"--setenv", "PYTHONPATH", dir+":"+filepath.Join(dir, "src")+":"+filepath.Join(dir, "sdk", "src"),
-		"--", pythonPath, "-m", "lutra.serve",
-	)
-	command := exec.CommandContext(ctx, bwrapPath, args...)
-	command.Env = prep.Env
-	command.Stderr = io.MultiWriter(os.Stderr, stderrWriter)
-	process, err := taskstdio.Start(command)
-	if err != nil {
-		return nil, err
-	}
-	process.Transport.SetReverseHandler(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+	task.Stderr = stderrWriter
+	task.TaskAPIHandler = http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
 		switch request.URL.Path {
 		case lutrav1connect.LutraServiceCreateTaskActionProcedure,
 			lutrav1connect.LutraServiceGetTaskActionProcedure,
@@ -504,19 +456,34 @@ func (w *Worker) attempt(ctx context.Context, actionID, runID, token uuid.UUID, 
 			return
 		}
 		w.TaskAPIHandler.ServeHTTP(response, request.WithContext(context.WithValue(request.Context(), taskContextKey{}, taskContext{runID: runID, actionID: actionID, token: token})))
-	}))
-	result, callErr := process.Client().Execute(ctx, connect.NewRequest(&taskv1.ExecuteRequest{InvocationId: actionID.String(), RunId: runID.String(), ActionId: actionID.String(), ContentType: "application/cbor", Input: input}))
-	closeErr := process.Close()
-	if callErr != nil {
-		return nil, callErr
+	})
+	executor, err := w.executor(task.Provider)
+	if err != nil {
+		return nil, err
 	}
-	if closeErr != nil {
-		return nil, closeErr
+	_, _ = fmt.Fprintf(stderrWriter, "image build name=%s version=%s\n", task.Environment.Name, task.Environment.Version)
+	image, err := w.ensureImage(ctx, imageKey, executor, task)
+	if err != nil {
+		return nil, err
 	}
-	if result.Msg.GetContentType() != "application/cbor" {
-		return nil, fmt.Errorf("unsupported result content type %q", result.Msg.GetContentType())
+	job, err := executor.Run(ctx, image, task)
+	if err != nil {
+		return nil, err
 	}
-	return result.Msg.GetOutput(), nil
+	rows, err := w.queries.SetTaskActionJob(ctx, db.SetTaskActionJobParams{ActionID: actionID, ClaimToken: token, JobID: job.ID()})
+	if err != nil || rows != 1 {
+		_ = job.Kill(context.Background())
+		_, _ = job.Wait(ctx)
+		if err == nil {
+			err = errors.New("task action claim lost")
+		}
+		return nil, err
+	}
+	output, waitErr := job.Wait(ctx)
+	if ctx.Err() != nil {
+		_ = job.Kill(context.Background())
+	}
+	return output, waitErr
 }
 
 func (w *Worker) collectTaskLogs(runID, actionID uuid.UUID, attempt int32, reader io.Reader) <-chan struct{} {
@@ -585,26 +552,4 @@ func (w *Worker) collectTaskLogs(runID, actionID uuid.UUID, attempt int32, reade
 		}
 	}()
 	return done
-}
-
-func sandboxArgs(dir string) []string {
-	return []string{
-		"--die-with-parent", "--new-session", "--unshare-pid", "--clearenv",
-		"--ro-bind-try", "/nix/store", "/nix/store",
-		"--ro-bind", "/usr", "/usr",
-		"--ro-bind-try", "/etc/ssl", "/etc/ssl",
-		"--ro-bind-try", "/etc/static/ssl", "/etc/static/ssl",
-		"--ro-bind-try", "/etc/resolv.conf", "/etc/resolv.conf",
-		"--ro-bind-try", "/etc/hosts", "/etc/hosts",
-		"--ro-bind-try", "/etc/nsswitch.conf", "/etc/nsswitch.conf",
-		"--ro-bind-try", "/etc/passwd", "/etc/passwd",
-		"--ro-bind-try", "/etc/group", "/etc/group",
-		"--ro-bind-try", "/bin", "/bin", "--ro-bind-try", "/lib", "/lib",
-		"--ro-bind-try", "/lib64", "/lib64", "--tmpfs", "/tmp",
-		"--bind", dir, dir, "--dev", "/dev", "--proc", "/proc",
-		"--setenv", "PATH", os.Getenv("PATH"),
-		"--setenv", "HOME", dir,
-		"--setenv", "UV_CACHE_DIR", filepath.Join(dir, ".uv-cache"),
-		"--chdir", dir,
-	}
 }

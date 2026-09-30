@@ -1,7 +1,9 @@
 package blob
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
 	"errors"
 	"mime"
@@ -36,6 +38,36 @@ type Service struct {
 
 // ObjectKey returns the storage key of an existing blob.
 func ObjectKey(id uuid.UUID) string { return "blobs/" + id.String() }
+
+// URI returns the canonical blob URI for a content digest and MIME type.
+func URI(mimeType string, digest []byte) string {
+	return "blob:" + mimeType + "," + base64.StdEncoding.EncodeToString(digest)
+}
+
+// Put stores data as a content-addressed blob, deduplicating by digest, and
+// returns its canonical URI.
+func Put(ctx context.Context, store *minio.Core, bucket string, queries *db.Queries, mimeType string, data []byte) (string, error) {
+	hash := sha256.Sum256(data)
+	uri := URI(mimeType, hash[:])
+	if _, err := queries.GetBlobBySHA256(ctx, hash[:]); err == nil {
+		return uri, nil
+	} else if !errors.Is(err, pgx.ErrNoRows) {
+		return "", err
+	}
+	id := uuid.New()
+	if _, err := store.Client.PutObject(ctx, bucket, ObjectKey(id), bytes.NewReader(data), int64(len(data)), minio.PutObjectOptions{ContentType: mimeType}); err != nil {
+		return "", err
+	}
+	rows, err := queries.InsertBlobIfAbsent(ctx, db.InsertBlobIfAbsentParams{Sha256: hash[:], ObjectKey: id})
+	if err != nil {
+		return "", err
+	}
+	if rows == 0 {
+		// Another upload owns the content; drop the duplicate object.
+		_ = store.RemoveObject(ctx, bucket, ObjectKey(id), minio.RemoveObjectOptions{})
+	}
+	return uri, nil
+}
 
 func partCount(size int64) int32 {
 	return int32((size + partSize - 1) / partSize)
@@ -265,10 +297,10 @@ func (s Service) CompleteUpload(ctx context.Context, req *connect.Request[lutrav
 		return nil, connect.NewError(connect.CodeInternal, err)
 	}
 	if rows == 0 {
+		// Another upload owns the content; drop the duplicate object.
 		_ = s.Store.RemoveObject(ctx, s.Bucket, key, minio.RemoveObjectOptions{})
-		return nil, connect.NewError(connect.CodeAlreadyExists, errors.New("blob name already exists"))
 	}
-	return connect.NewResponse(&lutrav1.CompleteUploadResponse{Uri: "blob:" + session.MimeType + "," + base64.StdEncoding.EncodeToString(session.Sha256)}), nil
+	return connect.NewResponse(&lutrav1.CompleteUploadResponse{Uri: URI(session.MimeType, session.Sha256)}), nil
 }
 
 func (s Service) AbortUpload(ctx context.Context, req *connect.Request[lutrav1.AbortUploadRequest]) (*connect.Response[lutrav1.AbortUploadResponse], error) {

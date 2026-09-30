@@ -48,18 +48,34 @@ CREATE TABLE lutra.settings (
 CREATE INDEX settings_project_path_idx ON lutra.settings (project_id, path);
 CREATE INDEX settings_domain_path_idx ON lutra.settings (project_id, domain_id, path);
 
-CREATE TABLE lutra.task_specs (
+CREATE TABLE lutra.task_environments (
+    id uuid PRIMARY KEY,
     project text NOT NULL,
     domain text NOT NULL,
     name text NOT NULL,
     version text NOT NULL,
-    source_sha256 bytea NOT NULL REFERENCES lutra.blobs(sha256),
-    image text NOT NULL,
-    module text NOT NULL,
-    qualname text NOT NULL,
+    provider text NOT NULL,
+    spec bytea NOT NULL,
+    image_key bytea NOT NULL CHECK (length(image_key) = 32),
     created_at timestamptz NOT NULL DEFAULT now(),
-    PRIMARY KEY (project, domain, name, version)
+    UNIQUE (project, domain, name, version)
 );
+
+-- Mutable generations are deliberately excluded from environment identity.
+CREATE TYPE lutra.image_build_status AS ENUM ('building', 'ready', 'failed');
+
+CREATE TABLE lutra.image_builds (
+    id uuid PRIMARY KEY,
+    image_key bytea NOT NULL CHECK (length(image_key) = 32),
+    status lutra.image_build_status NOT NULL,
+    claim_token uuid NOT NULL,
+    lease_until timestamptz NOT NULL,
+    artifact_uri text NOT NULL DEFAULT '',
+    error text NOT NULL DEFAULT '',
+    created_at timestamptz NOT NULL DEFAULT now(),
+    CHECK (status <> 'ready' OR artifact_uri <> '')
+);
+CREATE UNIQUE INDEX image_building_idx ON lutra.image_builds(image_key) WHERE status = 'building';
 
 CREATE TYPE lutra.task_action_status AS ENUM ('queued', 'running', 'waiting', 'succeeded', 'failed', 'canceled');
 
@@ -68,8 +84,7 @@ CREATE TABLE lutra.runs (
     project text NOT NULL,
     domain text NOT NULL,
     root_idempotency_key text,
-    created_at timestamptz NOT NULL DEFAULT now(),
-    UNIQUE (id, project, domain)
+    created_at timestamptz NOT NULL DEFAULT now()
 );
 CREATE UNIQUE INDEX runs_idempotency_idx ON lutra.runs (project, domain, root_idempotency_key) WHERE root_idempotency_key IS NOT NULL;
 
@@ -77,10 +92,8 @@ CREATE TABLE lutra.task_actions (
     id uuid PRIMARY KEY,
     run_id uuid NOT NULL REFERENCES lutra.runs(id) ON DELETE CASCADE,
     caller_action_id uuid,
-    project text NOT NULL,
-    domain text NOT NULL,
-    name text NOT NULL,
-    version text NOT NULL,
+    environment_id uuid NOT NULL REFERENCES lutra.task_environments(id),
+    entrypoint_id bigint NOT NULL CHECK (entrypoint_id BETWEEN 1 AND 4294967295),
     input_cbor bytea NOT NULL,
     output_cbor bytea,
     status lutra.task_action_status NOT NULL DEFAULT 'queued',
@@ -88,12 +101,11 @@ CREATE TABLE lutra.task_actions (
     attempts integer NOT NULL DEFAULT 0,
     claim_token uuid,
     lease_until timestamptz,
+    job_id text NOT NULL DEFAULT '',
     next_attempt_at timestamptz NOT NULL DEFAULT now(),
     idempotency_key text,
     created_at timestamptz NOT NULL DEFAULT now(),
     updated_at timestamptz NOT NULL DEFAULT now(),
-    FOREIGN KEY (project, domain, name, version) REFERENCES lutra.task_specs(project, domain, name, version),
-    FOREIGN KEY (run_id, project, domain) REFERENCES lutra.runs(id, project, domain),
     FOREIGN KEY (run_id, caller_action_id) REFERENCES lutra.task_actions(run_id, id),
     UNIQUE (run_id, id)
 );
@@ -161,7 +173,9 @@ DROP TABLE IF EXISTS lutra.task_action_edges;
 ALTER TABLE IF EXISTS lutra.runs DROP CONSTRAINT IF EXISTS runs_root_action_fk;
 DROP TABLE IF EXISTS lutra.task_actions;
 DROP TABLE IF EXISTS lutra.runs;
-DROP TABLE IF EXISTS lutra.task_specs;
+DROP TABLE IF EXISTS lutra.image_builds;
+DROP TABLE IF EXISTS lutra.task_environments;
+DROP TYPE IF EXISTS lutra.image_build_status;
 DROP TYPE IF EXISTS lutra.task_action_status;
 DROP TABLE IF EXISTS lutra.blob_uploads;
 DROP TABLE IF EXISTS lutra.blobs;
