@@ -33,8 +33,8 @@ async def retry_once(value: str) -> str:
 
 async def main() -> None:
     client = lutra.Client(os.environ.get("LUTRA_URL", "http://127.0.0.1:8080/api"))
-    print(await client.run(hello("Lutra")))  # ruff: ignore[print]
-    print(await client.run(retry_once("retry-ok")))  # ruff: ignore[print]
+    print(await client.run(hello("Lutra")))
+    print(await client.run(retry_once("retry-ok")))
 
 
 if __name__ == "__main__":

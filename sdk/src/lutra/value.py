@@ -36,6 +36,7 @@ def _parse_blob_name(name: str) -> bytes:
 
     Raises:
         ValueCodecError: If the digest name is invalid.
+
     """
     digest_name = name.rsplit(",", 1)[-1]
     try:
@@ -50,11 +51,19 @@ def _parse_blob_name(name: str) -> bytes:
 
 @dataclass(frozen=True)
 class BlobRef:
+    """Reference a blob stored by Lutra or embedded as a data URI."""
+
     uri: str
     resolve: bool = False
     mime_type: str = "application/octet-stream"
 
     def __post_init__(self) -> None:
+        """Validate the URI and infer its MIME type when needed.
+
+        Raises:
+            ValueCodecError: If the URI is malformed.
+
+        """
         if self.uri.startswith("blob:"):
             _parse_blob_name(self.uri[5:])
             if self.mime_type == "application/octet-stream" and "," in self.uri:
@@ -67,6 +76,7 @@ class BlobRef:
 
     @property
     def uri_string(self) -> str:
+        """URI with the requested resolution attribute."""
         attrs = []
         if self.resolve:
             attrs.append("resolve")
@@ -95,6 +105,7 @@ def dumps(value: object) -> bytes:
 
     Returns:
         The canonical CBOR bytes.
+
     """
     return cbor2.dumps(value, canonical=True, default=_encode_default)
 
@@ -104,6 +115,7 @@ def value_hash(value: object) -> bytes:
 
     Returns:
         The 32-byte SHA-256 digest.
+
     """
     return hashlib.sha256(dumps(value)).digest()
 
@@ -185,6 +197,7 @@ async def loads(data: bytes, resolver: Callable[[str], Awaitable[bytes]] | None 
 
     Raises:
         ValueCodecError: If the input contains trailing data.
+
     """
     stream = io.BytesIO(data)
     value = cbor2.CBORDecoder(stream, tag_hook=_decode_tag).decode()

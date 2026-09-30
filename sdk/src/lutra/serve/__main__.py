@@ -10,7 +10,8 @@ from typing import TYPE_CHECKING
 
 from lutra._gen.lutra.v1.lutra_pb import SourceBundle, TaskImage, TaskSpec
 from lutra.runtime import RunContext, run_context
-from lutra.serve import TaskAPIClient, _redirect_user_stdout, serve
+from lutra.serve import TaskAPIClient, serve
+from lutra.serve._host import _redirect_user_stdout
 from lutra.task import Task
 from lutra.value import dumps, loads
 
@@ -68,6 +69,7 @@ def _bundled_handler() -> Callable[..., object]:
 
 
 def main() -> None:
+    """Load a task callable and serve it over the stdio protocol."""
     parser = argparse.ArgumentParser(description="Serve a Lutra task on stdio")
     parser.add_argument("callable", nargs="?", help="module:callable")
     args = parser.parse_args()

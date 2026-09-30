@@ -23,13 +23,24 @@ LOCAL_TASK_IMAGE = "local-python"
 
 @dataclass(frozen=True)
 class Invocation(Generic[R]):
+    """A task and the arguments captured for one invocation."""
+
     task: Task[..., R]
     args: tuple[object, ...]
     kwargs: dict[str, object]
 
 
 class Task(Generic[P, R]):
+    """Describe an async Python function that can be submitted to Lutra."""
+
     def __init__(self, function: Callable[P, Coroutine[object, object, R]]) -> None:
+        """Wrap an async module-level function as a Lutra task.
+
+        Raises:
+            TypeError: If the function is not asynchronous.
+            ValueError: If the function is local rather than module-level.
+
+        """
         if not inspect.iscoroutinefunction(function):
             message = "tasks must be async functions"
             raise TypeError(message)
@@ -51,10 +62,22 @@ class Task(Generic[P, R]):
         self.__signature__ = inspect.signature(function)
 
     def __call__(self, *args: P.args, **kwargs: P.kwargs) -> Invocation[R]:
+        """Capture arguments for a later task invocation.
+
+        Returns:
+            The captured task invocation.
+
+        """
         inspect.signature(self.function).bind(*args, **kwargs)
         return Invocation(self, args, kwargs)
 
     def spec(self, project: str, domain: str, source_uri: str) -> TaskSpec:
+        """Build the deployable task specification for this task.
+
+        Returns:
+            The task specification sent to the Lutra server.
+
+        """
         identity = f"{source_uri}\0{self.module}\0{self.qualname}\0{LOCAL_TASK_IMAGE}"
         version = hashlib.sha256(identity.encode()).hexdigest()
         return TaskSpec(
@@ -70,4 +93,10 @@ class Task(Generic[P, R]):
 
 
 def task(function: Callable[P, Coroutine[object, object, R]]) -> Task[P, R]:
+    """Decorate an async function as a Lutra task.
+
+    Returns:
+        The wrapped task.
+
+    """
     return Task(function)

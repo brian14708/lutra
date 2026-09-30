@@ -341,6 +341,7 @@ def read_archive(archive: Path, name: str) -> bytes:
 
     Raises:
         KeyError: If the file is absent.
+
     """
     _safe_name(name)
     with Path(archive).open("rb") as source:
@@ -386,6 +387,7 @@ def extract_archive(archive: Path, destination: Path) -> None:
 
     Raises:
         ArchiveError: If the archive is malformed or contains an unsafe path.
+
     """
     destination = Path(destination)
     destination.mkdir(parents=True, exist_ok=True)

@@ -20,10 +20,14 @@ select = ["ALL"]
 ignore = [
   "missing-trailing-comma",
   "missing-copyright-notice",
-  "D",
-  "assert",
+  "incorrect-blank-line-before-class",
+  "multi-line-summary-second-line",
 ]
 extend-safe-fixes = ["TC", "unused-import"]
+
+[tool.ruff.lint.per-file-ignores]
+"sdk/tests/**/*.py" = ["assert", "D", "import-private-name"]
+"sdk/examples/**/*.py" = ["D", "print"]
 
 [tool.ruff.lint.isort]
 extra-standard-library = ["typing_extensions"]

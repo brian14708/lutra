@@ -104,6 +104,7 @@ async def normalize_result(result: object, api_client: TaskAPIClient) -> tuple[s
 
     Returns:
         The result MIME type and CBOR bytes.
+
     """
     if (
         isinstance(result, tuple)
@@ -417,6 +418,7 @@ async def serve(handler: Callable[..., Any]) -> None:
 
     Raises:
         ValueError: An input frame is invalid.
+
     """
     original_stdout = sys.stdout
     _redirect_user_stdout()

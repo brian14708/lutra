@@ -27,6 +27,8 @@ R = TypeVar("R")
 
 @dataclass
 class RunContext:
+    """Context needed to submit child actions from a running task."""
+
     api_client: TaskAPIClient
     task_spec: TaskSpec
     run_id: str
@@ -38,6 +40,15 @@ run_context: ContextVar[RunContext] = ContextVar("lutra_run")
 
 
 async def run(invocation: Invocation[R]) -> R:
+    """Submit a child task invocation through the current task host.
+
+    Returns:
+        The decoded child task result.
+
+    Raises:
+        RuntimeError: If no active task exists or the child task fails.
+
+    """
     context = run_context.get()
     api_client = context.api_client
     current = context.task_spec
