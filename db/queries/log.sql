@@ -13,7 +13,8 @@ VALUES ($1, $2, $3)
 ON CONFLICT (run_id, stream) DO NOTHING;
 
 -- name: UpdateLogStreamNextSeq :exec
-UPDATE lutra.run_log_streams SET next_seq = $3, updated_at = now()
+UPDATE lutra.run_log_streams
+SET next_seq = $3, updated_at = now()
 WHERE run_id = $1 AND stream = $2;
 
 -- name: GetLogAppend :one
@@ -22,13 +23,11 @@ FROM lutra.run_log_appends
 WHERE run_id = $1 AND stream = $2 AND append_id = $3;
 
 -- name: InsertLogAppend :exec
-INSERT INTO lutra.run_log_appends
-  (run_id, stream, append_id, batch_digest, first_seq, last_seq)
+INSERT INTO lutra.run_log_appends (run_id, stream, append_id, batch_digest, first_seq, last_seq)
 VALUES ($1, $2, $3, $4, $5, $6);
 
 -- name: InsertLogRecord :exec
-INSERT INTO lutra.run_log_records
-  (run_id, stream, seq, value_cbor, value_uri, payload_size, key, created_at)
+INSERT INTO lutra.run_log_records (run_id, stream, seq, value_cbor, value_uri, payload_size, key, created_at)
 VALUES ($1, $2, $3, $4, $5, $6, $7, now());
 
 -- name: ReadLogRecords :many
@@ -39,8 +38,7 @@ ORDER BY seq
 LIMIT $4;
 
 -- name: LogStreamEnd :one
-SELECT COALESCE((SELECT next_seq - 1 FROM lutra.run_log_streams
-WHERE run_id = $1 AND stream = $2), 0)::bigint AS seq;
+SELECT coalesce( (SELECT next_seq - 1 FROM lutra.run_log_streams WHERE run_id = $1 AND stream = $2), 0)::bigint AS seq;
 
 -- name: ReadFilteredLogRecords :many
 WITH boundary AS MATERIALIZED (

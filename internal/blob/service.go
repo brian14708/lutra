@@ -153,7 +153,7 @@ func (s Service) CreateUpload(ctx context.Context, req *connect.Request[lutrav1.
 	if !errors.Is(err, pgx.ErrNoRows) {
 		return nil, connect.NewError(connect.CodeInternal, err)
 	}
-	id, err := uuid.NewRandom()
+	id, err := uuid.NewV7()
 	if err != nil {
 		return nil, connect.NewError(connect.CodeInternal, err)
 	}

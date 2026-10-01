@@ -22,6 +22,11 @@ import (
 
 var environmentVariablePattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z_0-9]*$`)
 
+func validUUID(value string) bool {
+	id, err := uuid.Parse(value)
+	return err == nil && id != uuid.Nil
+}
+
 // environmentSpec is the validated, normalized EnvironmentSpec alongside its
 // deterministic encoding, which is both stored and hashed.
 type environmentSpec struct {
@@ -46,7 +51,7 @@ func (e *environmentSpec) version() (string, error) {
 }
 
 func validateEnvironmentIdentifier(id *lutrav1.EnvironmentIdentifier) error {
-	if id == nil || !namespacePattern.MatchString(id.Project) || !namespacePattern.MatchString(id.Domain) ||
+	if id == nil || !validUUID(id.NamespaceId) ||
 		!namespacePattern.MatchString(id.Name) || !versionPattern.MatchString(id.Version) {
 		return invalidTask("invalid environment identifier")
 	}
@@ -54,7 +59,7 @@ func validateEnvironmentIdentifier(id *lutrav1.EnvironmentIdentifier) error {
 }
 
 func normalizeEnvironment(spec *lutrav1.EnvironmentSpec) (*environmentSpec, error) {
-	if spec == nil || !namespacePattern.MatchString(spec.Project) || !namespacePattern.MatchString(spec.Domain) || !namespacePattern.MatchString(spec.Name) {
+	if spec == nil || !validUUID(spec.NamespaceId) || !namespacePattern.MatchString(spec.Name) {
 		return nil, invalidTask("invalid environment spec")
 	}
 	digest, mimeType, err := blob.ParseURI(spec.SourceUri)
@@ -119,14 +124,14 @@ func normalizeEnvironment(spec *lutrav1.EnvironmentSpec) (*environmentSpec, erro
 		if err := validateEnvironmentIdentifier(dep); err != nil {
 			return nil, err
 		}
-		if dep.Project != spec.Project || dep.Domain != spec.Domain || names[dep.Name] {
-			return nil, invalidTask("dependencies must have unique names in the same project and domain")
+		if dep.NamespaceId != spec.NamespaceId || names[dep.Name] {
+			return nil, invalidTask("dependencies must have unique names in the same namespace")
 		}
 		names[dep.Name] = true
 	}
 	sort.Slice(deps, func(i, j int) bool { return deps[i].Name < deps[j].Name })
 	normalized := &lutrav1.EnvironmentSpec{
-		Project: spec.Project, Domain: spec.Domain, Name: spec.Name,
+		NamespaceId: spec.NamespaceId, Name: spec.Name,
 		SourceUri: sourceURI(digest),
 		Image: &lutrav1.ImageSpec{
 			Name: image.Name, Reference: image.Reference,
@@ -184,9 +189,20 @@ func (s Service) RegisterEnvironment(ctx context.Context, req *connect.Request[l
 	if err != nil {
 		return nil, err
 	}
-	identifier := &lutrav1.EnvironmentIdentifier{Project: spec.spec.Project, Domain: spec.spec.Domain, Name: spec.spec.Name, Version: version}
+	namespaceID, err := uuid.Parse(spec.spec.NamespaceId)
+	if err != nil || namespaceID == uuid.Nil {
+		return nil, invalidTask("invalid namespace ID")
+	}
+	namespace, err := db.New(s.Worker.DB).GetNamespaceByID(ctx, namespaceID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, connect.NewError(connect.CodeNotFound, errors.New("namespace not found"))
+	}
+	if err != nil {
+		return nil, err
+	}
+	identifier := &lutrav1.EnvironmentIdentifier{NamespaceId: spec.spec.NamespaceId, Name: spec.spec.Name, Version: version}
 	// Matching versions include the commands, so repeat registrations skip source loading.
-	_, err = db.New(s.Worker.DB).GetEnvironment(ctx, db.GetEnvironmentParams{Project: identifier.Project, Domain: identifier.Domain, Name: identifier.Name, Version: version})
+	_, err = db.New(s.Worker.DB).GetEnvironment(ctx, db.GetEnvironmentParams{NamespaceID: namespaceID, Name: identifier.Name, Version: version})
 	if err == nil {
 		return connect.NewResponse(&lutrav1.RegisterEnvironmentResponse{Environment: identifier}), nil
 	}
@@ -217,8 +233,11 @@ func (s Service) RegisterEnvironment(ctx context.Context, req *connect.Request[l
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 	q := db.New(tx)
-	id := uuid.New()
-	_, err = q.InsertEnvironment(ctx, db.InsertEnvironmentParams{ID: id, Project: identifier.Project, Domain: identifier.Domain, Name: identifier.Name, Version: version, Provider: spec.spec.GetImage().GetName(), Spec: spec.specBytes, ImageKey: imageKey})
+	id, err := uuid.NewV7()
+	if err != nil {
+		return nil, err
+	}
+	_, err = q.InsertEnvironment(ctx, db.InsertEnvironmentParams{ID: id, NamespaceID: namespace.ID, Name: identifier.Name, Version: version, Provider: spec.spec.GetImage().GetName(), Spec: spec.specBytes, ImageKey: imageKey})
 	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
 		return nil, err
 	}
@@ -239,7 +258,11 @@ func lookupEnvironment(ctx context.Context, q *db.Queries, id *lutrav1.Environme
 	if err := validateEnvironmentIdentifier(id); err != nil {
 		return db.LutraTaskEnvironment{}, err
 	}
-	row, err := q.GetEnvironment(ctx, db.GetEnvironmentParams{Project: id.Project, Domain: id.Domain, Name: id.Name, Version: id.Version})
+	namespaceID, err := uuid.Parse(id.NamespaceId)
+	if err != nil {
+		return db.LutraTaskEnvironment{}, invalidTask("invalid environment identifier")
+	}
+	row, err := q.GetEnvironment(ctx, db.GetEnvironmentParams{NamespaceID: namespaceID, Name: id.Name, Version: id.Version})
 	if errors.Is(err, pgx.ErrNoRows) {
 		return row, connect.NewError(connect.CodeNotFound, errors.New("environment is not registered"))
 	}

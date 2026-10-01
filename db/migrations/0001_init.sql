@@ -20,46 +20,33 @@ CREATE TABLE lutra.blob_uploads (
 );
 CREATE INDEX blob_uploads_expiry_idx ON lutra.blob_uploads (expires_at);
 
-CREATE TABLE lutra.projects (
+CREATE TABLE lutra.namespaces (
     id uuid PRIMARY KEY,
     slug text UNIQUE NOT NULL CHECK (slug ~ '^[a-z][a-z0-9-]{0,62}$'),
     name text NOT NULL CHECK (length(name) BETWEEN 1 AND 200),
     created_at timestamptz NOT NULL DEFAULT now()
 );
 
-CREATE TABLE lutra.domains (
-    id uuid PRIMARY KEY,
-    project_id uuid NOT NULL REFERENCES lutra.projects(id) ON DELETE CASCADE,
-    slug text NOT NULL CHECK (slug ~ '^[a-z][a-z0-9-]{0,62}$'),
-    name text NOT NULL CHECK (length(name) BETWEEN 1 AND 200),
-    created_at timestamptz NOT NULL DEFAULT now(),
-    UNIQUE (project_id, slug),
-    UNIQUE (project_id, id)
-);
+INSERT INTO lutra.namespaces (id, slug, name) VALUES (gen_random_uuid(), 'default', 'Default');
 
 CREATE TABLE lutra.settings (
-    project_id uuid NOT NULL REFERENCES lutra.projects(id) ON DELETE CASCADE,
-    domain_id uuid NULL,
+    namespace_id uuid NOT NULL REFERENCES lutra.namespaces(id) ON DELETE CASCADE,
     path text NOT NULL CHECK (path ~ '^[a-z][a-z0-9_-]{0,63}(/[a-z][a-z0-9_-]{0,63})*$'),
     value bytea NOT NULL CHECK (length(value) BETWEEN 1 AND 65536),
     updated_at timestamptz NOT NULL DEFAULT now(),
-    UNIQUE NULLS NOT DISTINCT (project_id, domain_id, path),
-    FOREIGN KEY (project_id, domain_id) REFERENCES lutra.domains(project_id, id) ON DELETE CASCADE
+    PRIMARY KEY (namespace_id, path)
 );
-CREATE INDEX settings_project_path_idx ON lutra.settings (project_id, path);
-CREATE INDEX settings_domain_path_idx ON lutra.settings (project_id, domain_id, path);
 
 CREATE TABLE lutra.task_environments (
     id uuid PRIMARY KEY,
-    project text NOT NULL,
-    domain text NOT NULL,
+    namespace_id uuid NOT NULL REFERENCES lutra.namespaces(id),
     name text NOT NULL,
     version text NOT NULL,
     provider text NOT NULL,
     spec bytea NOT NULL,
     image_key bytea NOT NULL CHECK (length(image_key) = 32),
     created_at timestamptz NOT NULL DEFAULT now(),
-    UNIQUE (project, domain, name, version)
+    UNIQUE (namespace_id, name, version)
 );
 
 -- Mutable generations are deliberately excluded from environment identity.
@@ -82,12 +69,11 @@ CREATE TYPE lutra.task_action_status AS ENUM ('queued', 'running', 'waiting', 's
 
 CREATE TABLE lutra.runs (
     id uuid PRIMARY KEY,
-    project text NOT NULL,
-    domain text NOT NULL,
+    namespace_id uuid NOT NULL REFERENCES lutra.namespaces(id),
     root_idempotency_key text,
     created_at timestamptz NOT NULL DEFAULT now()
 );
-CREATE UNIQUE INDEX runs_idempotency_idx ON lutra.runs (project, domain, root_idempotency_key) WHERE root_idempotency_key IS NOT NULL;
+CREATE UNIQUE INDEX runs_idempotency_idx ON lutra.runs (namespace_id, root_idempotency_key) WHERE root_idempotency_key IS NOT NULL;
 
 CREATE TABLE lutra.task_actions (
     id uuid PRIMARY KEY,
@@ -181,6 +167,5 @@ DROP TYPE IF EXISTS lutra.task_action_status;
 DROP TABLE IF EXISTS lutra.blob_uploads;
 DROP TABLE IF EXISTS lutra.blobs;
 DROP TABLE IF EXISTS lutra.settings;
-DROP TABLE IF EXISTS lutra.domains;
-DROP TABLE IF EXISTS lutra.projects;
+DROP TABLE IF EXISTS lutra.namespaces;
 DROP SCHEMA IF EXISTS lutra;

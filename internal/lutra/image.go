@@ -76,7 +76,11 @@ func (w *Worker) claimImageBuild(ctx context.Context, imageKey []byte) (db.Lutra
 	if err == nil && (current.Status == db.LutraImageBuildStatusReady || current.Status == db.LutraImageBuildStatusBuilding) {
 		return current, false, tx.Commit(ctx)
 	}
-	current, err = q.InsertImageBuild(ctx, db.InsertImageBuildParams{ID: uuid.New(), ImageKey: imageKey, ClaimToken: uuid.New()})
+	id, err := uuid.NewV7()
+	if err != nil {
+		return current, false, err
+	}
+	current, err = q.InsertImageBuild(ctx, db.InsertImageBuildParams{ID: id, ImageKey: imageKey, ClaimToken: uuid.New()})
 	if errors.Is(err, pgx.ErrNoRows) {
 		return current, false, tx.Commit(ctx)
 	}

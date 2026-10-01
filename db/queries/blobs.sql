@@ -13,7 +13,8 @@ SELECT * FROM lutra.blob_uploads WHERE session_id = $1 FOR UPDATE;
 
 -- name: InsertBlobIfAbsent :execrows
 INSERT INTO lutra.blobs (sha256, object_key)
-VALUES ($1, $2) ON CONFLICT (sha256) DO NOTHING;
+VALUES ($1, $2)
+ON CONFLICT (sha256) DO NOTHING;
 
 -- name: DeleteBlobUpload :exec
 DELETE FROM lutra.blob_uploads WHERE session_id = $1;

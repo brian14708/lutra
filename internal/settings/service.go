@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"regexp"
-	"sort"
 	"strings"
 	"time"
 
@@ -14,6 +13,8 @@ import (
 	"github.com/brian14708/lutra/internal/db"
 	"github.com/fxamacker/cbor/v2"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -31,19 +32,16 @@ func invalid(message string) error {
 	return connect.NewError(connect.CodeInvalidArgument, errors.New(message))
 }
 
-func parseID(value, field string) (uuid.UUID, error) {
+func namespaceID(ctx context.Context, q *db.Queries, value string) (uuid.UUID, error) {
 	id, err := uuid.Parse(value)
 	if err != nil || id == uuid.Nil {
-		return uuid.Nil, invalid("invalid " + field)
+		return uuid.Nil, invalid("invalid namespace ID")
 	}
-	return id, nil
-}
-
-func validateSlug(value, field string) error {
-	if !slugPattern.MatchString(value) {
-		return invalid("invalid " + field)
+	row, err := q.GetNamespaceByID(ctx, id)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return uuid.Nil, connect.NewError(connect.CodeNotFound, errors.New("namespace not found"))
 	}
-	return nil
+	return row.ID, err
 }
 
 func validateName(value string) error {
@@ -78,96 +76,51 @@ func timestamp(t pgtype.Timestamptz) string {
 	return t.Time.UTC().Format(time.RFC3339Nano)
 }
 
-func projectMessage(row db.LutraProject) *lutrav1.Project {
-	return &lutrav1.Project{Id: row.ID.String(), Slug: row.Slug, Name: row.Name, CreatedAt: timestamp(row.CreatedAt)}
-}
-
-func domainMessage(row db.LutraDomain) *lutrav1.Domain {
-	return &lutrav1.Domain{Id: row.ID.String(), ProjectId: row.ProjectID.String(), Slug: row.Slug, Name: row.Name, CreatedAt: timestamp(row.CreatedAt)}
+func namespaceMessage(row db.LutraNamespace) *lutrav1.Namespace {
+	return &lutrav1.Namespace{Id: row.ID.String(), Slug: row.Slug, Name: row.Name, CreatedAt: timestamp(row.CreatedAt)}
 }
 
 func settingMessage(row db.LutraSetting) *lutrav1.Setting {
-	domain := ""
-	if row.DomainID != nil {
-		domain = row.DomainID.String()
-	}
-	return &lutrav1.Setting{ProjectId: row.ProjectID.String(), DomainId: domain, Path: row.Path, ValueCbor: row.Value, UpdatedAt: timestamp(row.UpdatedAt)}
+	return &lutrav1.Setting{NamespaceId: row.NamespaceID.String(), Path: row.Path, ValueCbor: row.Value, UpdatedAt: timestamp(row.UpdatedAt)}
 }
 
-func (s Service) CreateProject(ctx context.Context, req *connect.Request[lutrav1.CreateProjectRequest]) (*connect.Response[lutrav1.CreateProjectResponse], error) {
-	if err := validateSlug(req.Msg.GetSlug(), "project slug"); err != nil {
-		return nil, err
+func (s Service) CreateNamespace(ctx context.Context, req *connect.Request[lutrav1.CreateNamespaceRequest]) (*connect.Response[lutrav1.CreateNamespaceResponse], error) {
+	if !slugPattern.MatchString(req.Msg.GetSlug()) {
+		return nil, invalid("invalid namespace slug")
 	}
 	if err := validateName(req.Msg.GetName()); err != nil {
 		return nil, err
 	}
-	row, err := db.New(s.DB).CreateProject(ctx, db.CreateProjectParams{ID: uuid.New(), Slug: req.Msg.GetSlug(), Name: req.Msg.GetName()})
+	id, err := uuid.NewV7()
 	if err != nil {
-		return nil, connect.NewError(connect.CodeAlreadyExists, err)
+		return nil, err
 	}
-	return connect.NewResponse(&lutrav1.CreateProjectResponse{Project: projectMessage(row)}), nil
+	row, err := db.New(s.DB).CreateNamespace(ctx, db.CreateNamespaceParams{ID: id, Slug: req.Msg.GetSlug(), Name: req.Msg.GetName()})
+	if err != nil {
+		var databaseError *pgconn.PgError
+		if errors.As(err, &databaseError) && databaseError.Code == "23505" {
+			return nil, connect.NewError(connect.CodeAlreadyExists, err)
+		}
+		return nil, connect.NewError(connect.CodeInternal, err)
+	}
+	return connect.NewResponse(&lutrav1.CreateNamespaceResponse{Namespace: namespaceMessage(row)}), nil
 }
 
-func (s Service) ListProjects(ctx context.Context, _ *connect.Request[lutrav1.ListProjectsRequest]) (*connect.Response[lutrav1.ListProjectsResponse], error) {
-	rows, err := db.New(s.DB).ListProjects(ctx)
+func (s Service) ListNamespaces(ctx context.Context, _ *connect.Request[lutrav1.ListNamespacesRequest]) (*connect.Response[lutrav1.ListNamespacesResponse], error) {
+	rows, err := db.New(s.DB).ListNamespaces(ctx)
 	if err != nil {
 		return nil, connect.NewError(connect.CodeInternal, err)
 	}
-	result := &lutrav1.ListProjectsResponse{Projects: make([]*lutrav1.Project, 0, len(rows))}
+	out := &lutrav1.ListNamespacesResponse{}
 	for _, row := range rows {
-		result.Projects = append(result.Projects, projectMessage(row))
+		out.Namespaces = append(out.Namespaces, namespaceMessage(row))
 	}
-	return connect.NewResponse(result), nil
-}
-
-func (s Service) CreateDomain(ctx context.Context, req *connect.Request[lutrav1.CreateDomainRequest]) (*connect.Response[lutrav1.CreateDomainResponse], error) {
-	projectID, err := parseID(req.Msg.GetProjectId(), "project ID")
-	if err != nil {
-		return nil, err
-	}
-	if err := validateSlug(req.Msg.GetSlug(), "domain slug"); err != nil {
-		return nil, err
-	}
-	if err := validateName(req.Msg.GetName()); err != nil {
-		return nil, err
-	}
-	row, err := db.New(s.DB).CreateDomain(ctx, db.CreateDomainParams{ID: uuid.New(), ProjectID: projectID, Slug: req.Msg.GetSlug(), Name: req.Msg.GetName()})
-	if err != nil {
-		return nil, connect.NewError(connect.CodeAlreadyExists, err)
-	}
-	return connect.NewResponse(&lutrav1.CreateDomainResponse{Domain: domainMessage(row)}), nil
-}
-
-func (s Service) ListDomains(ctx context.Context, req *connect.Request[lutrav1.ListDomainsRequest]) (*connect.Response[lutrav1.ListDomainsResponse], error) {
-	projectID, err := parseID(req.Msg.GetProjectId(), "project ID")
-	if err != nil {
-		return nil, err
-	}
-	rows, err := db.New(s.DB).ListDomains(ctx, projectID)
-	if err != nil {
-		return nil, connect.NewError(connect.CodeInternal, err)
-	}
-	result := &lutrav1.ListDomainsResponse{Domains: make([]*lutrav1.Domain, 0, len(rows))}
-	for _, row := range rows {
-		result.Domains = append(result.Domains, domainMessage(row))
-	}
-	return connect.NewResponse(result), nil
-}
-
-func optionalDomain(value string) (*uuid.UUID, error) {
-	if value == "" {
-		return nil, nil
-	}
-	id, err := parseID(value, "domain ID")
-	return &id, err
+	return connect.NewResponse(out), nil
 }
 
 func (s Service) UpsertSetting(ctx context.Context, req *connect.Request[lutrav1.UpsertSettingRequest]) (*connect.Response[lutrav1.UpsertSettingResponse], error) {
-	projectID, err := parseID(req.Msg.GetProjectId(), "project ID")
-	if err != nil {
-		return nil, err
-	}
-	domainID, err := optionalDomain(req.Msg.GetDomainId())
+	q := db.New(s.DB)
+	id, err := namespaceID(ctx, q, req.Msg.GetNamespaceId())
 	if err != nil {
 		return nil, err
 	}
@@ -177,7 +130,7 @@ func (s Service) UpsertSetting(ctx context.Context, req *connect.Request[lutrav1
 	if err := validateCBOR(req.Msg.GetValueCbor()); err != nil {
 		return nil, err
 	}
-	row, err := db.New(s.DB).UpsertSetting(ctx, db.UpsertSettingParams{ProjectID: projectID, DomainID: domainID, Path: req.Msg.GetPath(), Value: req.Msg.GetValueCbor()})
+	row, err := q.UpsertSetting(ctx, db.UpsertSettingParams{NamespaceID: id, Path: req.Msg.GetPath(), Value: req.Msg.GetValueCbor()})
 	if err != nil {
 		return nil, connect.NewError(connect.CodeFailedPrecondition, err)
 	}
@@ -185,75 +138,38 @@ func (s Service) UpsertSetting(ctx context.Context, req *connect.Request[lutrav1
 }
 
 func (s Service) DeleteSetting(ctx context.Context, req *connect.Request[lutrav1.DeleteSettingRequest]) (*connect.Response[lutrav1.DeleteSettingResponse], error) {
-	projectID, err := parseID(req.Msg.GetProjectId(), "project ID")
-	if err != nil {
-		return nil, err
-	}
-	domainID, err := optionalDomain(req.Msg.GetDomainId())
+	q := db.New(s.DB)
+	id, err := namespaceID(ctx, q, req.Msg.GetNamespaceId())
 	if err != nil {
 		return nil, err
 	}
 	if err := validatePath(req.Msg.GetPath()); err != nil {
 		return nil, err
 	}
-	if _, err := db.New(s.DB).DeleteSetting(ctx, db.DeleteSettingParams{ProjectID: projectID, DomainID: domainID, Path: req.Msg.GetPath()}); err != nil {
+	if _, err := q.DeleteSetting(ctx, db.DeleteSettingParams{NamespaceID: id, Path: req.Msg.GetPath()}); err != nil {
 		return nil, connect.NewError(connect.CodeInternal, err)
 	}
 	return connect.NewResponse(&lutrav1.DeleteSettingResponse{}), nil
 }
 
 func (s Service) ListSettings(ctx context.Context, req *connect.Request[lutrav1.ListSettingsRequest]) (*connect.Response[lutrav1.ListSettingsResponse], error) {
-	projectID, err := parseID(req.Msg.GetProjectId(), "project ID")
+	q := db.New(s.DB)
+	id, err := namespaceID(ctx, q, req.Msg.GetNamespaceId())
 	if err != nil {
 		return nil, err
 	}
-	domainID, err := optionalDomain(req.Msg.GetDomainId())
-	if err != nil {
-		return nil, err
-	}
-	rows, err := db.New(s.DB).ListSettings(ctx, db.ListSettingsParams{ProjectID: projectID, DomainID: domainID})
-	if err != nil {
-		return nil, connect.NewError(connect.CodeInternal, err)
-	}
-	result := &lutrav1.ListSettingsResponse{Settings: make([]*lutrav1.Setting, 0, len(rows))}
-	for _, row := range rows {
-		result.Settings = append(result.Settings, settingMessage(row))
-	}
-	return connect.NewResponse(result), nil
-}
-
-func (s Service) ResolveSettings(ctx context.Context, req *connect.Request[lutrav1.ResolveSettingsRequest]) (*connect.Response[lutrav1.ResolveSettingsResponse], error) {
-	projectID, err := parseID(req.Msg.GetProjectId(), "project ID")
-	if err != nil {
-		return nil, err
-	}
-	domainID, err := optionalDomain(req.Msg.GetDomainId())
-	if err != nil {
-		return nil, err
-	}
-	for _, path := range req.Msg.GetPaths() {
-		if err := validatePath(path); err != nil {
+	for _, p := range req.Msg.GetPaths() {
+		if err := validatePath(p); err != nil {
 			return nil, err
 		}
 	}
-	rows, err := db.New(s.DB).ResolveSettings(ctx, db.ResolveSettingsParams{ProjectID: projectID, DomainID: domainID, Column3: req.Msg.GetPaths()})
+	rows, err := q.ListSettings(ctx, db.ListSettingsParams{NamespaceID: id, Paths: req.Msg.GetPaths()})
 	if err != nil {
 		return nil, connect.NewError(connect.CodeInternal, err)
 	}
-	merged := make(map[string]db.LutraSetting, len(rows))
+	out := &lutrav1.ListSettingsResponse{}
 	for _, row := range rows {
-		if _, ok := merged[row.Path]; !ok || row.DomainID != nil {
-			merged[row.Path] = row
-		}
+		out.Settings = append(out.Settings, settingMessage(row))
 	}
-	result := &lutrav1.ListSettingsResponse{Settings: make([]*lutrav1.Setting, 0, len(merged))}
-	paths := make([]string, 0, len(merged))
-	for path := range merged {
-		paths = append(paths, path)
-	}
-	sort.Strings(paths)
-	for _, path := range paths {
-		result.Settings = append(result.Settings, settingMessage(merged[path]))
-	}
-	return connect.NewResponse(&lutrav1.ResolveSettingsResponse{Settings: result.Settings}), nil
+	return connect.NewResponse(out), nil
 }

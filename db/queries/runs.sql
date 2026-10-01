@@ -1,12 +1,13 @@
 -- name: InsertRun :one
-INSERT INTO lutra.runs (id, project, domain, root_idempotency_key)
-VALUES ($1, $2, $3, $4)
-ON CONFLICT (project, domain, root_idempotency_key) WHERE root_idempotency_key IS NOT NULL DO NOTHING
+INSERT INTO lutra.runs (id, namespace_id, root_idempotency_key)
+VALUES ($1, $2, $3)
+ON CONFLICT (namespace_id, root_idempotency_key) WHERE root_idempotency_key IS NOT NULL DO NOTHING
 RETURNING id;
 
 -- name: GetRunByIdempotencyKey :one
-SELECT id, root_action_id FROM lutra.runs
-WHERE project = $1 AND domain = $2 AND root_idempotency_key = $3;
+SELECT id, root_action_id
+FROM lutra.runs
+WHERE namespace_id = $1 AND root_idempotency_key = $2;
 
 -- name: InsertRootAction :one
 INSERT INTO lutra.task_actions (id, run_id, environment_id, entrypoint_id, input_cbor, status)
@@ -33,25 +34,47 @@ VALUES ($1, $2, $3)
 ON CONFLICT DO NOTHING;
 
 -- name: ReadRun :one
-SELECT r.root_action_id, r.project, r.domain, r.created_at AS run_created_at,
-       a.id, a.status, a.output_cbor, a.error, a.updated_at,
-       e.name AS environment_name, e.version, a.entrypoint_id, a.environment_id
-FROM lutra.runs r
-JOIN lutra.task_actions a ON a.run_id = r.id AND a.id = r.root_action_id
-JOIN lutra.task_environments e ON e.id = a.environment_id
+SELECT
+  r.root_action_id,
+  e.namespace_id,
+  r.created_at AS run_created_at,
+  a.id,
+  a.status,
+  a.output_cbor,
+  a.error,
+  a.updated_at,
+  e.name AS environment_name,
+  e.version,
+  a.entrypoint_id,
+  a.environment_id
+FROM lutra.runs AS r
+JOIN lutra.task_actions AS a ON a.run_id = r.id AND a.id = r.root_action_id
+JOIN lutra.task_environments AS e ON e.id = a.environment_id
 WHERE r.id = $1;
 
 -- name: ReadTaskAction :one
-SELECT a.id, a.run_id, a.caller_action_id, e.project, e.domain,
-       e.name AS environment_name, e.version, a.entrypoint_id, a.environment_id,
-       a.input_cbor, a.output_cbor, a.status, a.error, a.attempts,
-       a.created_at, a.updated_at
-FROM lutra.task_actions a
-JOIN lutra.task_environments e ON e.id = a.environment_id
+SELECT
+  a.id,
+  a.run_id,
+  a.caller_action_id,
+  e.namespace_id,
+  e.name AS environment_name,
+  e.version,
+  a.entrypoint_id,
+  a.environment_id,
+  a.input_cbor,
+  a.output_cbor,
+  a.status,
+  a.error,
+  a.attempts,
+  a.created_at,
+  a.updated_at
+FROM lutra.task_actions AS a
+JOIN lutra.task_environments AS e ON e.id = a.environment_id
 WHERE a.id = $1;
 
 -- name: ListTaskActions :many
-SELECT a.id, a.run_id, a.caller_action_id, e.project, e.domain,
+SELECT a.id, a.run_id, a.caller_action_id, e.namespace_id,
        e.name AS environment_name, e.version, a.entrypoint_id, a.environment_id,
        a.input_cbor, a.output_cbor, a.status, a.error, a.attempts,
        a.created_at, a.updated_at
@@ -63,8 +86,9 @@ ORDER BY a.created_at, a.id
 LIMIT sqlc.arg(page_size)::integer;
 
 -- name: ListActionUpstreams :many
-SELECT dependent_action_id, source_action_id FROM lutra.task_action_edges
-WHERE run_id = $1 AND dependent_action_id = ANY(sqlc.arg(action_ids)::uuid[])
+SELECT dependent_action_id, source_action_id
+FROM lutra.task_action_edges
+WHERE run_id = $1 AND dependent_action_id = sqlc.arg(action_ids)::uuid[]
 ORDER BY dependent_action_id, source_action_id;
 
 -- name: GetTaskActionCaller :one
@@ -72,12 +96,12 @@ SELECT run_id, caller_action_id FROM lutra.task_actions WHERE id = $1;
 
 -- name: GetActiveCaller :one
 SELECT a.run_id, a.id, a.status, a.claim_token, a.environment_id, e.spec AS environment_spec
-FROM lutra.task_actions a
-JOIN lutra.task_environments e ON e.id = a.environment_id
+FROM lutra.task_actions AS a
+JOIN lutra.task_environments AS e ON e.id = a.environment_id
 WHERE a.id = $1 AND a.status IN ('running', 'waiting') AND a.claim_token IS NOT NULL;
 
 -- name: LockRun :one
-SELECT id, root_action_id, project, domain FROM lutra.runs WHERE id = $1 FOR UPDATE;
+SELECT id, root_action_id, namespace_id FROM lutra.runs WHERE id = $1 FOR UPDATE;
 
 -- name: GetRootStatus :one
 SELECT status FROM lutra.task_actions WHERE id = $1;

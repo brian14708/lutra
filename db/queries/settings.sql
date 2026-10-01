@@ -1,32 +1,21 @@
--- name: CreateProject :one
-INSERT INTO lutra.projects (id, slug, name) VALUES ($1, $2, $3)
-RETURNING id, slug, name, created_at;
+-- name: CreateNamespace :one
+INSERT INTO lutra.namespaces (id, slug, name) VALUES ($1, $2, $3) RETURNING *;
 
--- name: ListProjects :many
-SELECT id, slug, name, created_at FROM lutra.projects ORDER BY slug;
+-- name: ListNamespaces :many
+SELECT * FROM lutra.namespaces ORDER BY slug;
 
--- name: CreateDomain :one
-INSERT INTO lutra.domains (id, project_id, slug, name) VALUES ($1, $2, $3, $4)
-RETURNING id, project_id, slug, name, created_at;
-
--- name: ListDomains :many
-SELECT id, project_id, slug, name, created_at FROM lutra.domains WHERE project_id = $1 ORDER BY slug;
+-- name: GetNamespaceByID :one
+SELECT * FROM lutra.namespaces WHERE id = $1;
 
 -- name: UpsertSetting :one
-INSERT INTO lutra.settings (project_id, domain_id, path, value)
-VALUES ($1, $2, $3, $4)
-ON CONFLICT (project_id, domain_id, path) DO UPDATE SET value = EXCLUDED.value, updated_at = now()
-RETURNING project_id, domain_id, path, value, updated_at;
+INSERT INTO lutra.settings (namespace_id, path, value) VALUES ($1, $2, $3) ON CONFLICT (namespace_id, path) DO UPDATE SET value = excluded.value, updated_at = now() RETURNING *;
 
 -- name: DeleteSetting :execrows
-DELETE FROM lutra.settings WHERE project_id = $1 AND domain_id IS NOT DISTINCT FROM $2 AND path = $3;
+DELETE FROM lutra.settings WHERE namespace_id = $1 AND path = $2;
 
 -- name: ListSettings :many
-SELECT project_id, domain_id, path, value, updated_at FROM lutra.settings
-WHERE project_id = $1 AND (domain_id IS NOT DISTINCT FROM $2) ORDER BY path;
-
--- name: ResolveSettings :many
-SELECT project_id, domain_id, path, value, updated_at FROM lutra.settings
-WHERE project_id = $1 AND (domain_id IS NULL OR domain_id = $2)
-  AND (cardinality($3::text[]) = 0 OR path = ANY($3::text[]))
-ORDER BY path, domain_id NULLS FIRST;
+SELECT *
+FROM lutra.settings
+WHERE namespace_id = $1
+  AND (coalesce(cardinality(sqlc.arg(paths)::text[]), 0) = 0 OR path IN (SELECT unnest(sqlc.arg(paths)::text[])))
+ORDER BY path;

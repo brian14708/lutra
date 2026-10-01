@@ -12,16 +12,12 @@ export const Route = createFileRoute("/")({ component: Home });
 const settingsRpc = createClient(SettingsService, transport);
 
 function Home() {
-  const [projects, setProjects] = useState<
-    Awaited<ReturnType<typeof settingsRpc.listProjects>>["projects"]
+  const [namespaces, setNamespaces] = useState<
+    Awaited<ReturnType<typeof settingsRpc.listNamespaces>>["namespaces"]
   >([]);
-  const [domains, setDomains] = useState<
-    Awaited<ReturnType<typeof settingsRpc.listDomains>>["domains"]
-  >([]);
-  const [projectId, setProjectId] = useState("");
-  const [domainId, setDomainId] = useState("");
+  const [namespaceId, setNamespaceId] = useState("");
   const [settings, setSettings] = useState<
-    Awaited<ReturnType<typeof settingsRpc.resolveSettings>>["settings"]
+    Awaited<ReturnType<typeof settingsRpc.listSettings>>["settings"]
   >([]);
   const [settingPath, setSettingPath] = useState("");
   const [settingValue, setSettingValue] = useState("{}");
@@ -30,41 +26,35 @@ function Home() {
 
   useEffect(() => {
     void settingsRpc
-      .listProjects({})
+      .listNamespaces({})
       .then((response) => {
-        setProjects(response.projects);
-        if (response.projects[0]) setProjectId(response.projects[0].id);
+        setNamespaces(response.namespaces);
+        setNamespaceId(
+          response.namespaces.find((item) => item.slug === "default")?.id ??
+            response.namespaces[0]?.id ??
+            "",
+        );
       })
       .catch((cause) => setSettingsError(String(cause)));
   }, []);
   useEffect(() => {
-    if (!projectId) {
-      setDomains([]);
-      return;
-    }
-    void settingsRpc
-      .listDomains({ projectId })
-      .then((response) => setDomains(response.domains))
-      .catch((cause) => setSettingsError(String(cause)));
-  }, [projectId]);
-  useEffect(() => {
-    if (!projectId) {
+    if (!namespaceId) {
       setSettings([]);
       return;
     }
     void settingsRpc
-      .resolveSettings({ projectId, domainId, paths: [] })
+      .listSettings({ namespaceId, paths: [] })
       .then((response) => setSettings(response.settings))
       .catch((cause) => setSettingsError(String(cause)));
-  }, [projectId, domainId]);
+  }, [namespaceId]);
 
   async function saveSetting(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     setSettingsError(null);
     try {
       const value = encodeCbor(JSON.parse(settingValue));
-      await settingsRpc.upsertSetting({ projectId, domainId, path: settingPath, valueCbor: value });
-      const response = await settingsRpc.resolveSettings({ projectId, domainId, paths: [] });
+      await settingsRpc.upsertSetting({ namespaceId, path: settingPath, valueCbor: value });
+      const response = await settingsRpc.listSettings({ namespaceId, paths: [] });
       setSettings(response.settings);
     } catch (cause) {
       setSettingsError(cause instanceof Error ? cause.message : String(cause));
@@ -88,33 +78,15 @@ function Home() {
         </h2>
         <div className="mt-4 grid gap-3 md:grid-cols-2">
           <label className="text-[13px] font-semibold">
-            Project
+            Namespace
             <select
-              value={projectId}
-              onChange={(event) => {
-                setProjectId(event.target.value);
-                setDomainId("");
-              }}
+              value={namespaceId}
+              onChange={(event) => setNamespaceId(event.target.value)}
               className="mt-1 block w-full rounded-md border border-slate-300 p-2 font-normal"
             >
-              {projects.map((project) => (
-                <option key={project.id} value={project.id}>
-                  {project.name} ({project.slug})
-                </option>
-              ))}
-            </select>
-          </label>
-          <label className="text-[13px] font-semibold">
-            Domain
-            <select
-              value={domainId}
-              onChange={(event) => setDomainId(event.target.value)}
-              className="mt-1 block w-full rounded-md border border-slate-300 p-2 font-normal"
-            >
-              <option value="">Project defaults</option>
-              {domains.map((domain) => (
-                <option key={domain.id} value={domain.id}>
-                  {domain.name} ({domain.slug})
+              {namespaces.map((item) => (
+                <option key={item.id} value={item.id}>
+                  {item.name} ({item.slug})
                 </option>
               ))}
             </select>
@@ -145,7 +117,7 @@ function Home() {
           </label>
           <Button
             type="submit"
-            disabled={!projectId}
+            disabled={!namespaceId}
             className="rounded-md bg-teal-700 px-4 py-2 text-[13px] font-semibold text-white hover:bg-teal-800 disabled:opacity-50"
           >
             Save

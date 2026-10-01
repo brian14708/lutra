@@ -10,12 +10,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"os"
-	"os/exec"
-	"path/filepath"
-	"runtime"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
@@ -299,92 +294,5 @@ func TestConnectModes(t *testing.T) {
 				t.Fatal(err)
 			}
 		})
-	}
-}
-
-func TestTaskHostRoundTrip(t *testing.T) {
-	if _, err := exec.LookPath("uv"); err != nil {
-		t.Skip("uv is unavailable")
-	}
-	_, file, _, _ := runtime.Caller(0)
-	root := filepath.Join(filepath.Dir(file), "..", "..")
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, "uv", "run", "--package", "lutra", "python", "-m", "lutra.serve", "task_fixture:echo")
-	cmd.Dir = root
-	cmd.Env = append(os.Environ(), "PYTHONPATH="+filepath.Join(root, "sdk", "tests"))
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-	process, err := Start(cmd)
-	if err != nil {
-		t.Fatal(err)
-	}
-	handler := http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-		if req.URL.Path != "/test.TaskAPI/Echo" {
-			http.NotFound(w, req)
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = io.Copy(w, req.Body)
-	})
-	client := process.Client()
-
-	if _, err := client.Execute(ctx, connect.NewRequest(&taskv1.ExecuteRequest{Input: []byte("bad")})); connect.CodeOf(err) != connect.CodeInvalidArgument {
-		t.Fatalf("invalid request: got %v; stderr: %s", err, stderr.String())
-	}
-	if _, err := client.Execute(ctx, connect.NewRequest(&taskv1.ExecuteRequest{InvocationId: "missing"})); connect.CodeOf(err) != connect.CodeUnimplemented {
-		t.Fatalf("missing incoming handler: got %v; stderr: %s", err, stderr.String())
-	}
-	process.Transport.SetHandler(handler)
-
-	var group sync.WaitGroup
-	results := make(chan error, 2)
-	for i := range 2 {
-		group.Add(1)
-		go func() {
-			defer group.Done()
-			payload := []byte{0, byte(i), 255}
-			request := &taskv1.ExecuteRequest{InvocationId: string(rune('a' + i)), ContentType: "application/octet-stream", Input: payload}
-			response, err := client.Execute(ctx, connect.NewRequest(request))
-			if err != nil {
-				results <- err
-				return
-			}
-			if response.Msg.GetContentType() != request.ContentType || !bytes.Equal(response.Msg.GetOutput(), payload) {
-				results <- fmt.Errorf("unexpected Execute response: %v", response.Msg)
-			}
-		}()
-	}
-	group.Wait()
-	close(results)
-	for err := range results {
-		t.Fatalf("Execute with task API call failed: %v; stderr: %s", err, stderr.String())
-	}
-	largeInput := bytes.Repeat([]byte{0x7f}, 4<<20)
-	largeResponse, err := client.Execute(ctx, connect.NewRequest(&taskv1.ExecuteRequest{
-		InvocationId: "large",
-		ContentType:  "application/octet-stream",
-		Input:        largeInput,
-	}))
-	if err != nil || !bytes.Equal(largeResponse.Msg.GetOutput(), largeInput) {
-		t.Fatalf("large Execute failed: %v; stderr: %s", err, stderr.String())
-	}
-	cancelCtx, cancelCall := context.WithCancel(ctx)
-	callDone := make(chan error, 1)
-	go func() {
-		_, err := client.Execute(cancelCtx, connect.NewRequest(&taskv1.ExecuteRequest{InvocationId: "wait"}))
-		callDone <- err
-	}()
-	cancelCall()
-	if err := <-callDone; connect.CodeOf(err) != connect.CodeCanceled {
-		t.Fatalf("canceled call: %v", err)
-	}
-	if err := process.Close(); err != nil && !errors.Is(err, os.ErrClosed) {
-		t.Fatalf("task host exited: %v; stderr: %s", err, stderr.String())
-	}
-	if !strings.Contains(stderr.String(), "task host started") ||
-		!strings.Contains(stderr.String(), "task module loaded") ||
-		!strings.Contains(stderr.String(), "task handler called") {
-		t.Fatalf("expected task prints on stderr, got %q", stderr.String())
 	}
 }

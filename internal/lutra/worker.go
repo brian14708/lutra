@@ -192,7 +192,7 @@ func (w *Worker) execute(ctx context.Context, actionID, runID uuid.UUID, attempt
 
 func newExecution(claimed db.LoadClaimedTaskActionRow, runID, actionID uuid.UUID, attempt int32) (*EnvironmentExecution, error) {
 	task := &EnvironmentExecution{
-		Environment:  &lutrav1.EnvironmentIdentifier{Project: claimed.Project, Domain: claimed.Domain, Name: claimed.EnvironmentName, Version: claimed.Version},
+		Environment:  &lutrav1.EnvironmentIdentifier{NamespaceId: claimed.NamespaceID.String(), Name: claimed.EnvironmentName, Version: claimed.Version},
 		EntrypointID: uint32(claimed.EntrypointID),
 		Provider:     claimed.Provider,
 		Spec:         &lutrav1.EnvironmentSpec{},

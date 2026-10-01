@@ -234,7 +234,7 @@ func (e *LocalExecutor) Run(ctx context.Context, image *Image, req *EnvironmentE
 	for _, key := range keys {
 		args = append(args, "--setenv", key, envVars[key])
 	}
-	values := map[string]string{"LUTRA_TASK_PROJECT": req.Environment.Project, "LUTRA_TASK_DOMAIN": req.Environment.Domain, "LUTRA_TASK_VERSION": req.Environment.Version, "LUTRA_ENVIRONMENT_NAME": req.Environment.Name, "LUTRA_ENVIRONMENTS_JSON": string(environmentsJSON), "LUTRA_ATTEMPT": fmt.Sprint(req.Attempt), "LUTRA_TASK_RUN_ID": req.RunID, "LUTRA_TASK_ACTION_ID": req.ActionID, "PYTHONPATH": workdir + ":" + workdir + "/src:" + workdir + "/sdk/src"}
+	values := map[string]string{"LUTRA_TASK_NAMESPACE": req.Environment.NamespaceId, "LUTRA_TASK_VERSION": req.Environment.Version, "LUTRA_ENVIRONMENT_NAME": req.Environment.Name, "LUTRA_ENVIRONMENTS_JSON": string(environmentsJSON), "LUTRA_ATTEMPT": fmt.Sprint(req.Attempt), "LUTRA_TASK_RUN_ID": req.RunID, "LUTRA_TASK_ACTION_ID": req.ActionID, "PYTHONPATH": workdir + ":" + workdir + "/src:" + workdir + "/sdk/src"}
 	for key, value := range values {
 		args = append(args, "--setenv", key, value)
 	}

@@ -92,10 +92,13 @@ func (s Service) CreateRun(ctx context.Context, req *connect.Request[lutrav1.Cre
 		return nil, err
 	}
 	key := pgtype.Text{String: req.Msg.GetIdempotencyKey(), Valid: req.Msg.GetIdempotencyKey() != ""}
-	runID := uuid.New()
-	inserted, err := q.InsertRun(ctx, db.InsertRunParams{ID: runID, Project: environment.Project, Domain: environment.Domain, RootIdempotencyKey: key})
+	runID, err := uuid.NewV7()
+	if err != nil {
+		return nil, err
+	}
+	inserted, err := q.InsertRun(ctx, db.InsertRunParams{ID: runID, NamespaceID: environment.NamespaceID, RootIdempotencyKey: key})
 	if errors.Is(err, pgx.ErrNoRows) && key.Valid {
-		existing, lookupErr := q.GetRunByIdempotencyKey(ctx, db.GetRunByIdempotencyKeyParams{Project: environment.Project, Domain: environment.Domain, RootIdempotencyKey: key})
+		existing, lookupErr := q.GetRunByIdempotencyKey(ctx, db.GetRunByIdempotencyKeyParams{NamespaceID: environment.NamespaceID, RootIdempotencyKey: key})
 		if lookupErr != nil {
 			return nil, lookupErr
 		}
@@ -113,7 +116,11 @@ func (s Service) CreateRun(ctx context.Context, req *connect.Request[lutrav1.Cre
 	} else if err != nil {
 		return nil, err
 	} else {
-		rootID, err := q.InsertRootAction(ctx, db.InsertRootActionParams{ID: uuid.New(), RunID: inserted, EnvironmentID: environment.ID, EntrypointID: int64(req.Msg.GetEntrypointId()), InputCbor: req.Msg.GetInputCbor()})
+		rootID, err := uuid.NewV7()
+		if err != nil {
+			return nil, err
+		}
+		rootID, err = q.InsertRootAction(ctx, db.InsertRootActionParams{ID: rootID, RunID: inserted, EnvironmentID: environment.ID, EntrypointID: int64(req.Msg.GetEntrypointId()), InputCbor: req.Msg.GetInputCbor()})
 		if err != nil {
 			return nil, err
 		}
@@ -159,8 +166,8 @@ func (s Service) CreateTaskAction(ctx context.Context, req *connect.Request[lutr
 	if err != nil || locked.RootActionID == nil {
 		return nil, invalidTask("run is not active")
 	}
-	if environment.Project != locked.Project || environment.Domain != locked.Domain {
-		return nil, invalidTask("child task belongs to a different project or domain")
+	if environment.NamespaceID != locked.NamespaceID {
+		return nil, invalidTask("child task belongs to a different namespace")
 	}
 	rootStatus, err := q.GetRootStatus(ctx, *locked.RootActionID)
 	if err != nil || terminal(string(rootStatus)) {
@@ -177,7 +184,7 @@ func (s Service) CreateTaskAction(ctx context.Context, req *connect.Request[lutr
 	allowed := caller.EnvironmentID == environment.ID
 	child := req.Msg.GetEnvironment()
 	for _, dependency := range callerSpec.Dependencies {
-		if dependency.Project == child.Project && dependency.Domain == child.Domain && dependency.Name == child.Name && dependency.Version == child.Version {
+		if dependency.NamespaceId == child.NamespaceId && dependency.Name == child.Name && dependency.Version == child.Version {
 			allowed = true
 			break
 		}
@@ -196,7 +203,11 @@ func (s Service) CreateTaskAction(ctx context.Context, req *connect.Request[lutr
 	} else if !errors.Is(lookupErr, pgx.ErrNoRows) {
 		return nil, lookupErr
 	} else {
-		actionID, err = q.InsertTaskAction(ctx, db.InsertTaskActionParams{ID: uuid.New(), RunID: active.runID, CallerActionID: &active.actionID, EnvironmentID: environment.ID, EntrypointID: int64(req.Msg.GetEntrypointId()), InputCbor: req.Msg.GetInputCbor(), IdempotencyKey: key})
+		actionID, err = uuid.NewV7()
+		if err != nil {
+			return nil, err
+		}
+		actionID, err = q.InsertTaskAction(ctx, db.InsertTaskActionParams{ID: actionID, RunID: active.runID, CallerActionID: &active.actionID, EnvironmentID: environment.ID, EntrypointID: int64(req.Msg.GetEntrypointId()), InputCbor: req.Msg.GetInputCbor(), IdempotencyKey: key})
 		if errors.Is(err, pgx.ErrNoRows) {
 			existing, lookupErr = q.GetTaskActionByIdempotency(ctx, db.GetTaskActionByIdempotencyParams{RunID: active.runID, IdempotencyKey: key})
 			if lookupErr != nil || existing.CallerActionID == nil || *existing.CallerActionID != active.actionID || existing.EnvironmentID != environment.ID || existing.EntrypointID != int64(req.Msg.GetEntrypointId()) || !bytes.Equal(existing.InputCbor, req.Msg.GetInputCbor()) {
@@ -241,11 +252,11 @@ func readRun(ctx context.Context, q *db.Queries, id uuid.UUID) (*lutrav1.Run, er
 	if row.RootActionID != nil {
 		rootID = row.RootActionID.String()
 	}
-	return &lutrav1.Run{Id: id.String(), RootActionId: rootID, Environment: environmentIdentifier(row.Project, row.Domain, row.EnvironmentName, row.Version), EntrypointId: uint32(row.EntrypointID), Status: string(row.Status), OutputCbor: row.OutputCbor, Error: row.Error, CreatedAt: formatTime(row.RunCreatedAt), UpdatedAt: formatTime(row.UpdatedAt)}, nil
+	return &lutrav1.Run{Id: id.String(), RootActionId: rootID, Environment: environmentIdentifier(row.NamespaceID, row.EnvironmentName, row.Version), EntrypointId: uint32(row.EntrypointID), Status: string(row.Status), OutputCbor: row.OutputCbor, Error: row.Error, CreatedAt: formatTime(row.RunCreatedAt), UpdatedAt: formatTime(row.UpdatedAt)}, nil
 }
 
-func environmentIdentifier(project, domain, name, version string) *lutrav1.EnvironmentIdentifier {
-	return &lutrav1.EnvironmentIdentifier{Project: project, Domain: domain, Name: name, Version: version}
+func environmentIdentifier(namespaceID uuid.UUID, name, version string) *lutrav1.EnvironmentIdentifier {
+	return &lutrav1.EnvironmentIdentifier{NamespaceId: namespaceID.String(), Name: name, Version: version}
 }
 
 func formatTime(value pgtype.Timestamptz) string { return value.Time.UTC().Format(time.RFC3339Nano) }
@@ -266,19 +277,20 @@ func (s Service) readTaskAction(ctx context.Context, id uuid.UUID) (*lutrav1.Tas
 }
 
 type actionRow struct {
-	ID                                                       uuid.UUID
-	RunID                                                    uuid.UUID
-	CallerActionID                                           *uuid.UUID
-	Project, Domain, EnvironmentName, Version, Status, Error string
-	EnvironmentID                                            uuid.UUID
-	EntrypointID                                             int64
-	InputCbor, OutputCbor                                    []byte
-	Attempts                                                 int32
-	CreatedAt, UpdatedAt                                     pgtype.Timestamptz
+	NamespaceID                             uuid.UUID
+	ID                                      uuid.UUID
+	RunID                                   uuid.UUID
+	CallerActionID                          *uuid.UUID
+	EnvironmentName, Version, Status, Error string
+	EnvironmentID                           uuid.UUID
+	EntrypointID                            int64
+	InputCbor, OutputCbor                   []byte
+	Attempts                                int32
+	CreatedAt, UpdatedAt                    pgtype.Timestamptz
 }
 
 func actionFromRow(row actionRow, upstream []db.ListActionUpstreamsRow) *lutrav1.TaskAction {
-	action := &lutrav1.TaskAction{Id: row.ID.String(), RunId: row.RunID.String(), Environment: environmentIdentifier(row.Project, row.Domain, row.EnvironmentName, row.Version), EntrypointId: uint32(row.EntrypointID), InputCbor: row.InputCbor, OutputCbor: row.OutputCbor, Status: row.Status, Error: row.Error, Attempts: row.Attempts, CreatedAt: formatTime(row.CreatedAt), UpdatedAt: formatTime(row.UpdatedAt)}
+	action := &lutrav1.TaskAction{Id: row.ID.String(), RunId: row.RunID.String(), Environment: environmentIdentifier(row.NamespaceID, row.EnvironmentName, row.Version), EntrypointId: uint32(row.EntrypointID), InputCbor: row.InputCbor, OutputCbor: row.OutputCbor, Status: row.Status, Error: row.Error, Attempts: row.Attempts, CreatedAt: formatTime(row.CreatedAt), UpdatedAt: formatTime(row.UpdatedAt)}
 	if row.CallerActionID != nil {
 		action.CallerActionId = row.CallerActionID.String()
 	}
@@ -291,11 +303,11 @@ func actionFromRow(row actionRow, upstream []db.ListActionUpstreamsRow) *lutrav1
 }
 
 func actionRowFromRead(row db.ReadTaskActionRow) actionRow {
-	return actionRow{ID: row.ID, RunID: row.RunID, CallerActionID: row.CallerActionID, Project: row.Project, Domain: row.Domain, EnvironmentName: row.EnvironmentName, Version: row.Version, EntrypointID: row.EntrypointID, EnvironmentID: row.EnvironmentID, InputCbor: row.InputCbor, OutputCbor: row.OutputCbor, Status: string(row.Status), Error: row.Error, Attempts: row.Attempts, CreatedAt: row.CreatedAt, UpdatedAt: row.UpdatedAt}
+	return actionRow{ID: row.ID, RunID: row.RunID, CallerActionID: row.CallerActionID, NamespaceID: row.NamespaceID, EnvironmentName: row.EnvironmentName, Version: row.Version, EntrypointID: row.EntrypointID, EnvironmentID: row.EnvironmentID, InputCbor: row.InputCbor, OutputCbor: row.OutputCbor, Status: string(row.Status), Error: row.Error, Attempts: row.Attempts, CreatedAt: row.CreatedAt, UpdatedAt: row.UpdatedAt}
 }
 
 func actionRowFromList(row db.ListTaskActionsRow) actionRow {
-	return actionRow{ID: row.ID, RunID: row.RunID, CallerActionID: row.CallerActionID, Project: row.Project, Domain: row.Domain, EnvironmentName: row.EnvironmentName, Version: row.Version, EntrypointID: row.EntrypointID, EnvironmentID: row.EnvironmentID, InputCbor: row.InputCbor, OutputCbor: row.OutputCbor, Status: string(row.Status), Error: row.Error, Attempts: row.Attempts, CreatedAt: row.CreatedAt, UpdatedAt: row.UpdatedAt}
+	return actionRow{ID: row.ID, RunID: row.RunID, CallerActionID: row.CallerActionID, NamespaceID: row.NamespaceID, EnvironmentName: row.EnvironmentName, Version: row.Version, EntrypointID: row.EntrypointID, EnvironmentID: row.EnvironmentID, InputCbor: row.InputCbor, OutputCbor: row.OutputCbor, Status: string(row.Status), Error: row.Error, Attempts: row.Attempts, CreatedAt: row.CreatedAt, UpdatedAt: row.UpdatedAt}
 }
 
 func (s Service) GetRun(ctx context.Context, req *connect.Request[lutrav1.GetRunRequest]) (*connect.Response[lutrav1.GetRunResponse], error) {

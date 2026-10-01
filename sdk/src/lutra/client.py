@@ -30,6 +30,8 @@ from lutra._gen.lutra.v1.lutra_pb import (
     TaskActionStatus,
     WatchRunRequest,
 )
+from lutra._gen.lutra.v1.settings_connect import SettingsServiceClient
+from lutra._gen.lutra.v1.settings_pb import ListNamespacesRequest
 from lutra.value import dumps, loads
 
 if TYPE_CHECKING:
@@ -109,8 +111,8 @@ class _RunLogger:
                 self.run_id,
                 "deployment",
                 f"entrypoint={event.entrypoint_id} "
-                f"project={event.environment.project} "
-                f"domain={event.environment.domain} version={event.environment.version}",
+                f"namespace_id={event.environment.namespace_id} "
+                f"version={event.environment.version}",
             )
         if not self.started and event.root_action_id:
             _log_message(self.logger, self.run_id, "root", f"action={event.root_action_id}")
@@ -285,19 +287,28 @@ class Client:
     """Submit tasks to a Lutra server and retrieve their results."""
 
     def __init__(
-        self,
-        url: str = "http://localhost:8080/api",
-        *,
-        project: str = "default",
-        domain: str = "default",
+        self, url: str = "http://localhost:8080/api", *, namespace: str = "default"
     ) -> None:
-        """Create a client for the API URL, project, and domain."""
+        """Create a client for the API URL and namespace."""
         self.rpc = LutraServiceClient(url, http_client=pyqwest.Client())
         self.blob = BlobServiceClient(url, http_client=pyqwest.Client())
-        self.project = project
-        self.domain = domain
+        self.namespace = namespace
+        self.settings = SettingsServiceClient(url, http_client=pyqwest.Client())
+        self._namespace_id: str | None = None
+
+    async def _resolve_namespace_id(self) -> str:
+        if self._namespace_id is None:
+            response = await self.settings.list_namespaces(ListNamespacesRequest())
+            self._namespace_id = next(
+                (item.id for item in response.namespaces if item.slug == self.namespace), None
+            )
+            if self._namespace_id is None:
+                msg = f"namespace {self.namespace!r} does not exist"
+                raise ValueError(msg)
+        return self._namespace_id
 
     async def _prepare(self, environment: TaskEnvironment) -> EnvironmentIdentifier:
+        namespace_id = await self._resolve_namespace_id()
         ordered: list[TaskEnvironment] = []
         visiting: set[TaskEnvironment] = set()
         visited: set[TaskEnvironment] = set()
@@ -335,8 +346,7 @@ class Client:
             response = await self.rpc.register_environment(
                 RegisterEnvironmentRequest(
                     spec=EnvironmentSpec(
-                        project=self.project,
-                        domain=self.domain,
+                        namespace_id=namespace_id,
                         name=current.name,
                         source_uri=uri,
                         image=ImageSpec(
