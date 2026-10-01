@@ -52,6 +52,33 @@ JOIN lutra.task_actions AS a ON a.run_id = r.id AND a.id = r.root_action_id
 JOIN lutra.task_environments AS e ON e.id = a.environment_id
 WHERE r.id = $1;
 
+-- name: GetTaskCache :one
+SELECT * FROM lutra.task_cache WHERE cache_key = $1;
+
+-- name: ClaimTaskCache :one
+INSERT INTO lutra.task_cache (cache_key, status, claim_token, lease_until)
+VALUES ($1, 'building', $2, now() + $3::integer * interval '1 second')
+ON CONFLICT (cache_key) DO NOTHING
+RETURNING *;
+
+-- name: FinishTaskCache :execrows
+UPDATE lutra.task_cache
+SET status = 'ready', output_cbor = sqlc.narg(output_cbor)::bytea,
+    error_code = sqlc.arg(error_code)::text, error_details = sqlc.narg(error_details)::bytea,
+    updated_at = now(), lease_until = now()
+WHERE cache_key = sqlc.arg(cache_key)::bytea AND status = 'building'
+  AND claim_token = sqlc.arg(claim_token)::uuid AND lease_until > now();
+
+-- name: RenewTaskCache :execrows
+UPDATE lutra.task_cache SET lease_until = now() + interval '30 seconds'
+WHERE cache_key = $1 AND claim_token = $2 AND status = 'building' AND lease_until > now();
+
+-- name: ReleaseTaskCache :exec
+DELETE FROM lutra.task_cache WHERE cache_key = $1 AND claim_token = $2 AND status = 'building';
+
+-- name: ExpireTaskCache :exec
+DELETE FROM lutra.task_cache WHERE status = 'building' AND lease_until <= now();
+
 -- name: ReadTaskAction :one
 SELECT
   a.id,

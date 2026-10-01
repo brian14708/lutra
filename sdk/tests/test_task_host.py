@@ -7,11 +7,12 @@ from unittest.mock import AsyncMock
 
 import cbor2
 import pytest
-from lutra import RetryMode, _blob, current_context
 from lutra._gen.lutra.task.v1.task_pb import ExecuteRequest, ExecuteResponse
 from lutra.serve import TaskAPIClient, _host, normalize_result
 from lutra.serve._host import _Host, _TaskService
 from lutra.value import BlobRef
+
+from lutra import CacheableError, RetryMode, _blob, current_context
 
 if TYPE_CHECKING:
     from connectrpc.request import RequestContext
@@ -58,6 +59,22 @@ async def test_task_context_uses_python_retry_mode() -> None:
     ctx = cast("RequestContext[ExecuteRequest, ExecuteResponse]", None)
     response = await service.execute(ExecuteRequest(invocation_id="test"), ctx)
     assert response.output == b"idempotent"
+
+
+@pytest.mark.asyncio
+async def test_cacheable_error_is_typed_on_task_protocol() -> None:
+    def handler(
+        _invocation_id: str, _content_type: str, _payload: bytes, _api_client: TaskAPIClient
+    ) -> tuple[str, bytes]:
+        code = "invalid_input"
+        raise CacheableError(code, {"field": "value"})
+
+    service = _TaskService(handler)
+    service.api_client = TaskAPIClient(cast("_Host", object()))
+    ctx = cast("RequestContext[ExecuteRequest, ExecuteResponse]", None)
+    response = await service.execute(ExecuteRequest(invocation_id="error"), ctx)
+    assert response.error_code == "invalid_input"
+    assert cbor2.loads(response.error_details) == {"field": "value"}
 
 
 @pytest.mark.asyncio

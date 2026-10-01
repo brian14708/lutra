@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -44,6 +45,24 @@ type EnvironmentExecution struct {
 	// task's callbacks; remote providers may inject direct API access instead.
 	Stderr         io.Writer
 	TaskAPIHandler http.Handler
+}
+
+type CacheableError struct {
+	Code    string
+	Details []byte
+}
+
+var cacheErrorCodePattern = regexp.MustCompile(`^[a-z][a-z0-9_.-]{0,127}$`)
+
+func (e *CacheableError) Error() string { return e.Code }
+func (*CacheableError) Cacheable() bool { return true }
+
+func (e *CacheableError) output() ([]byte, error) {
+	mode, err := cbor.CanonicalEncOptions().EncMode()
+	if err != nil {
+		return nil, err
+	}
+	return mode.Marshal([]any{"lutra.cacheable-error.v1", e.Code, cbor.RawMessage(e.Details)})
 }
 
 // Image references a built image artifact. The provider that built it
@@ -273,6 +292,21 @@ func (j *localJob) Wait(ctx context.Context) ([]byte, error) {
 	}
 	if closeErr != nil {
 		return nil, closeErr
+	}
+	if result.Msg.GetErrorCode() != "" {
+		if !cacheErrorCodePattern.MatchString(result.Msg.GetErrorCode()) || len(result.Msg.GetErrorDetails()) > 64<<10 || len(result.Msg.GetOutput()) != 0 {
+			return nil, errors.New("task returned invalid cacheable error")
+		}
+		var details any
+		if err := cbor.Unmarshal(result.Msg.GetErrorDetails(), &details); err != nil {
+			return nil, errors.New("task returned invalid cacheable error details")
+		}
+		failure := &CacheableError{Code: result.Msg.GetErrorCode(), Details: result.Msg.GetErrorDetails()}
+		output, err := failure.output()
+		if err != nil {
+			return nil, err
+		}
+		return output, failure
 	}
 	if result.Msg.GetContentType() != "application/cbor" {
 		return nil, errors.New("task returned unsupported content type")

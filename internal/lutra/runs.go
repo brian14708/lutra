@@ -24,8 +24,9 @@ import (
 )
 
 var (
-	namespacePattern = regexp.MustCompile(`^[a-z][a-z0-9-]{0,62}$`)
-	versionPattern   = regexp.MustCompile(`^[a-f0-9]{64}$`)
+	namespacePattern       = regexp.MustCompile(`^[a-z][a-z0-9-]{0,62}$`)
+	versionPattern         = regexp.MustCompile(`^[a-f0-9]{64}$`)
+	semanticVersionPattern = regexp.MustCompile(`^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)(\.(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*)?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$`)
 )
 
 const localTaskImage = "local-python"
@@ -65,6 +66,19 @@ func validateInput(input []byte) error {
 	return nil
 }
 
+func validateActionCache(spec *lutrav1.ActionSpec) error {
+	if !spec.GetCache() {
+		if spec.GetTaskVersion() != "" || len(spec.GetCacheKey()) != 0 {
+			return invalidTask("uncached actions cannot include cache fields")
+		}
+		return nil
+	}
+	if len(spec.GetTaskVersion()) > 200 || !semanticVersionPattern.MatchString(spec.GetTaskVersion()) || len(spec.GetCacheKey()) != 32 {
+		return invalidTask("cached actions require a semantic task version and a 32-byte cache_key")
+	}
+	return nil
+}
+
 func validateIdempotency(key string, required bool) error {
 	if required && key == "" {
 		return invalidTask("idempotency key is required")
@@ -84,6 +98,9 @@ func (s Service) CreateRun(ctx context.Context, req *connect.Request[lutrav1.Cre
 		return nil, invalidTask("action spec is required")
 	}
 	if err := validateInput(actionSpec.GetInputCbor()); err != nil {
+		return nil, err
+	}
+	if err := validateActionCache(actionSpec); err != nil {
 		return nil, err
 	}
 	if err := validateIdempotency(req.Msg.GetIdempotencyKey(), false); err != nil {
@@ -165,6 +182,9 @@ func (s Service) CreateTaskAction(ctx context.Context, req *connect.Request[lutr
 	if err := validateInput(actionSpec.GetInputCbor()); err != nil {
 		return nil, err
 	}
+	if err := validateActionCache(actionSpec); err != nil {
+		return nil, err
+	}
 	if err := validateIdempotency(req.Msg.GetIdempotencyKey(), true); err != nil {
 		return nil, err
 	}
@@ -238,7 +258,7 @@ func (s Service) CreateTaskAction(ctx context.Context, req *connect.Request[lutr
 			return nil, err
 		}
 		if err == nil {
-			if err := s.Logs.AppendActionStatus(ctx, tx, actionID); err != nil {
+			if err := s.Logs.AppendActionStatus(ctx, tx, actionID, false); err != nil {
 				return nil, err
 			}
 		}

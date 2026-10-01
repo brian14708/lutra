@@ -24,7 +24,7 @@ from lutra._gen.lutra.v1.blob_connect import BlobServiceClient
 from lutra._gen.lutra.v1.blob_pb import GetDownloadRequest
 from lutra._gen.lutra.v1.log_connect import LogServiceClient
 from lutra.checkpoint import CheckpointManager
-from lutra.task import RetryMode
+from lutra.task import CacheableError, RetryMode
 from lutra.value import BlobRef, _parse_blob_name, dumps
 
 if TYPE_CHECKING:
@@ -95,7 +95,7 @@ class _TaskService:
             )
         )
         args = (request.invocation_id, request.content_type, request.input, self.api_client)
-        try:
+        try:  # ruff: ignore[too-many-statements-in-try-clause]
             if inspect.iscoroutinefunction(self._handler):
                 result = self._handler(*args)
             else:
@@ -104,6 +104,10 @@ class _TaskService:
                 result = await result
             content_type, output = await normalize_result(result, self.api_client)
             return ExecuteResponse(content_type=content_type, output=output)
+        except CacheableError as exc:
+            return ExecuteResponse(
+                content_type="", error_code=exc.code, error_details=dumps(exc.details)
+            )
         finally:
             task_context.reset(context_token)
             self.api_client.reset_execution_context(run_token, action_token)

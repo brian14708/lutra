@@ -158,6 +158,13 @@ func validateEntrypoints(entries []*lutrav1.Entrypoint) error {
 		if entry == nil {
 			return invalidTask("invalid entrypoint")
 		}
+		if entry.GetCache() {
+			if len(entry.GetTaskVersion()) > 200 || !semanticVersionPattern.MatchString(entry.GetTaskVersion()) {
+				return invalidTask("cached tasks require a semantic task version")
+			}
+		} else if entry.GetTaskVersion() != "" {
+			return invalidTask("uncached tasks cannot include a cache version")
+		}
 		if _, err := resolveAttempts(entry, 0); err != nil {
 			return err
 		}

@@ -57,6 +57,8 @@ message EnvironmentSpec {
 message Entrypoint {
   StartupCommand command = 1;
   int32 max_attempts = 3;
+  bool cache = 4;
+  string task_version = 5;
 }
 
 message StartupCommand {
@@ -66,6 +68,9 @@ message StartupCommand {
 message ActionSpec {
   bytes input_cbor = 1;
   int32 max_attempts = 2;
+  bool cache = 3;
+  string task_version = 4;
+  bytes cache_key = 5;
 }
 
 message RegisterEnvironmentRequest {
@@ -143,6 +148,7 @@ message TaskActionStatus {
   string error = 6;
   string updated_at = 7;
   int32 max_attempts = 8;
+  bool cache_hit = 9;
 }
 message Run {
   string id = 1;

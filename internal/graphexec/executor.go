@@ -40,6 +40,8 @@ type Node struct {
 	State                          State
 	WaitingOn                      WaitReason
 	ImageKey, Output               []byte
+	CacheKey                       []byte
+	CacheHit                       bool
 	Error                          string
 	NextAttemptAt                  time.Time
 	Prerequisites                  []uuid.UUID
@@ -58,6 +60,7 @@ type Transition struct {
 	Output                             []byte
 	Error                              string
 	At, NextAttemptAt                  time.Time
+	CacheHit                           bool
 }
 
 type Store interface {
@@ -68,6 +71,10 @@ type Runner interface {
 }
 type Images interface {
 	Ensure(context.Context, []byte) error
+}
+type Cache interface {
+	Lookup(context.Context, uuid.UUID, []byte) ([]byte, error, bool)
+	Store(context.Context, uuid.UUID, []byte, []byte, error) error
 }
 type Clock interface {
 	Now() time.Time
@@ -104,6 +111,7 @@ type Options struct {
 	Store             Store
 	Runner            Runner
 	Images            Images
+	Cache             Cache
 	RetryBackoff      func(int32) time.Duration
 }
 
@@ -156,6 +164,7 @@ func New(snapshot []Node, opts Options) *Executor {
 func clone(n Node) Node {
 	n.Output = append([]byte(nil), n.Output...)
 	n.ImageKey = append([]byte(nil), n.ImageKey...)
+	n.CacheKey = append([]byte(nil), n.CacheKey...)
 	n.Prerequisites = append([]uuid.UUID(nil), n.Prerequisites...)
 	if n.ParentID != nil {
 		p := *n.ParentID
@@ -181,7 +190,7 @@ func (e *Executor) commitLocked(ctx context.Context, next Node) error {
 		return e.err
 	}
 	if e.opts.Store != nil {
-		err := e.opts.Store.Transition(ctx, Transition{RunID: e.opts.RunID, ClaimToken: e.opts.ClaimToken, NodeID: next.ID, From: old.State, State: next.State, WaitingOn: next.WaitingOn, Attempt: next.Attempt, Failures: next.Failures, ExpectedAttempt: old.Attempt, Output: next.Output, Error: next.Error, At: e.opts.Clock.Now(), NextAttemptAt: next.NextAttemptAt})
+		err := e.opts.Store.Transition(ctx, Transition{RunID: e.opts.RunID, ClaimToken: e.opts.ClaimToken, NodeID: next.ID, From: old.State, State: next.State, WaitingOn: next.WaitingOn, Attempt: next.Attempt, Failures: next.Failures, ExpectedAttempt: old.Attempt, Output: next.Output, Error: next.Error, At: e.opts.Clock.Now(), NextAttemptAt: next.NextAttemptAt, CacheHit: next.CacheHit})
 		if err != nil {
 			e.err = err
 			if e.cancel != nil {
@@ -351,11 +360,45 @@ func (e *Executor) dispatchLocked() {
 }
 
 func (e *Executor) execute(id uuid.UUID) {
+	var cacheOwner uuid.UUID
 	e.mu.Lock()
 	n := clone(*e.nodes[id])
 	if n.State != Ready || e.ctx.Err() != nil {
 		e.mu.Unlock()
 		return
+	}
+	if len(n.CacheKey) > 0 && e.opts.Cache != nil {
+		owner := uuid.New()
+		e.mu.Unlock()
+		output, err, hit := e.opts.Cache.Lookup(e.ctx, owner, n.CacheKey)
+		if !hit {
+			defer func() {
+				cleanup, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+				_ = e.opts.Cache.Store(cleanup, owner, n.CacheKey, nil, context.Canceled)
+			}()
+		}
+		e.mu.Lock()
+		n = clone(*e.nodes[id])
+		if n.State.Terminal() || e.ctx.Err() != nil {
+			e.mu.Unlock()
+			return
+		}
+		if hit {
+			n.CacheHit = err == nil || isCacheable(err)
+			n.Output = output
+			if err != nil {
+				n.State, n.Error = Failed, err.Error()
+			} else {
+				n.State, n.Output, n.Error = Done, output, ""
+			}
+			if e.commitLocked(e.ctx, n) == nil {
+				_ = e.closeLocked(e.ctx, id, "parent action completed")
+			}
+			e.mu.Unlock()
+			return
+		}
+		cacheOwner = owner
 	}
 	if len(n.ImageKey) > 0 && e.opts.Images != nil {
 		n.State = Waiting
@@ -421,6 +464,11 @@ func (e *Executor) execute(id uuid.UUID) {
 	} else {
 		out, err = e.opts.Runner.Run(taskCtx, attempt)
 	}
+	if len(n.CacheKey) > 0 && e.opts.Cache != nil && taskCtx.Err() == nil {
+		if cacheErr := e.opts.Cache.Store(taskCtx, cacheOwner, n.CacheKey, out, err); cacheErr != nil {
+			err = cacheErr
+		}
+	}
 	// Release capacity and remove the attempt before a retry can be dispatched.
 	a.resumeMu.Lock()
 	e.mu.Lock()
@@ -449,7 +497,7 @@ func (e *Executor) execute(id uuid.UUID) {
 	} else {
 		n.Failures++
 		n.Error = err.Error()
-		if n.Failures < max(n.MaxAttempts, 1) {
+		if !isCacheable(err) && n.Failures < max(n.MaxAttempts, 1) {
 			n.State = Pending
 			n.WaitingOn = WaitingForRetry
 			n.NextAttemptAt = e.opts.Clock.Now().Add(e.opts.RetryBackoff(n.Failures))
@@ -466,6 +514,13 @@ func (e *Executor) execute(id uuid.UUID) {
 	}
 	e.mu.Unlock()
 	a.resumeMu.Unlock()
+}
+
+type cacheable interface{ Cacheable() bool }
+
+func isCacheable(err error) bool {
+	var value cacheable
+	return errors.As(err, &value) && value.Cacheable()
 }
 
 func (e *Executor) timerLocked(id uuid.UUID, attempt int32, at time.Time) {

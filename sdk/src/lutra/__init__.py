@@ -4,9 +4,18 @@ from lutra._context import TaskContext, current_context
 from lutra.checkpoint import CheckpointEvent, CheckpointManager, CheckpointNotFound
 from lutra.client import Client, RunHandle
 from lutra.runtime import run
-from lutra.task import Invocation, Resources, RetryMode, Task, TaskEnvironment, TaskImage
+from lutra.task import (
+    CacheableError,
+    Invocation,
+    Resources,
+    RetryMode,
+    Task,
+    TaskEnvironment,
+    TaskImage,
+)
 
 __all__ = [
+    "CacheableError",
     "CheckpointEvent",
     "CheckpointManager",
     "CheckpointNotFound",

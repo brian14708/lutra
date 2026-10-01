@@ -16,7 +16,6 @@ from lutra._gen.lutra.v1.blob_pb import GetDownloadRequest
 from lutra._gen.lutra.v1.log_pb import StreamCursor
 from lutra._gen.lutra.v1.lutra_connect import LutraServiceClient
 from lutra._gen.lutra.v1.lutra_pb import (
-    ActionSpec,
     CancelRunRequest,
     CreateRunRequest,
     Entrypoint,
@@ -34,8 +33,8 @@ from lutra._gen.lutra.v1.lutra_pb import (
 )
 from lutra._gen.lutra.v1.settings_connect import SettingsServiceClient
 from lutra._gen.lutra.v1.settings_pb import ListNamespacesRequest
-from lutra.task import normalize_retry
-from lutra.value import dumps, loads
+from lutra.task import CacheableError, normalize_retry
+from lutra.value import loads
 
 if TYPE_CHECKING:
     import logging
@@ -72,6 +71,14 @@ class _RunLogger:
 
     def event(self, event: Run | LogEvent | TaskActionStatus) -> None:
         if isinstance(event, TaskActionStatus):
+            if event.cache_hit:
+                _log_message(
+                    self.logger,
+                    self.run_id,
+                    "cache",
+                    f"hit entrypoint={event.entrypoint_id} action={event.action_id}",
+                    event.updated_at,
+                )
             _log_message(
                 self.logger,
                 self.run_id,
@@ -215,6 +222,7 @@ class RunHandle(Generic[R]):
             The decoded task result.
 
         Raises:
+            CacheableError: If the task returns a deterministic typed failure.
             RuntimeError: If the run fails, is canceled, or ends prematurely.
 
         """
@@ -232,6 +240,14 @@ class RunHandle(Generic[R]):
             message = "run status stream ended before completion"
             raise RuntimeError(message)
         if terminal.status != "succeeded":
+            if terminal.status == "failed" and terminal.output_cbor:
+                failure = await loads(terminal.output_cbor, self.client.resolve_blob)
+                if (
+                    isinstance(failure, list)
+                    and len(failure) == len(("lutra.cacheable-error.v1", "", None))
+                    and failure[0] == "lutra.cacheable-error.v1"
+                ):
+                    raise CacheableError(failure[1], failure[2])
             raise RuntimeError(terminal.error or f"run {terminal.status}")
         result = await loads(terminal.output_cbor, self.client.resolve_blob)
         if logger is not None:
@@ -372,6 +388,8 @@ class Client:
                             Entrypoint(
                                 command=StartupCommand(args=list(task.entrypoint())),
                                 max_attempts=task.max_attempts,
+                                cache=task.cache,
+                                task_version=task.version if task.cache else "",
                             )
                             for task in current.tasks
                         ],
@@ -406,10 +424,7 @@ class Client:
             CreateRunRequest(
                 environment=environment,
                 entrypoint_id=invocation.task.entrypoint_id,
-                action_spec=ActionSpec(
-                    input_cbor=dumps([list(invocation.args), invocation.kwargs]),
-                    max_attempts=attempts,
-                ),
+                action_spec=invocation.action_spec(attempts),
                 idempotency_key=idempotency_key,
             )
         )

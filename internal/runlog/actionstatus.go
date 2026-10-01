@@ -23,6 +23,7 @@ type actionStatusEvent struct {
 	Error          string `cbor:"error"`
 	UpdatedAt      string `cbor:"updated_at"`
 	MaxAttempts    int32  `cbor:"max_attempts"`
+	CacheHit       bool   `cbor:"cache_hit"`
 }
 
 func DecodeActionStatus(value []byte) (*lutrav1.TaskActionStatus, error) {
@@ -36,8 +37,10 @@ func DecodeActionStatus(value []byte) (*lutrav1.TaskActionStatus, error) {
 	if _, err := uuid.Parse(event.ActionID); err != nil {
 		return nil, err
 	}
-	if _, err := uuid.Parse(event.CallerActionID); err != nil {
-		return nil, err
+	if event.CallerActionID != "" {
+		if _, err := uuid.Parse(event.CallerActionID); err != nil {
+			return nil, err
+		}
 	}
 	if _, err := time.Parse(time.RFC3339Nano, event.UpdatedAt); err != nil {
 		return nil, err
@@ -47,16 +50,20 @@ func DecodeActionStatus(value []byte) (*lutrav1.TaskActionStatus, error) {
 	default:
 		return nil, errors.New("invalid task status event")
 	}
-	return &lutrav1.TaskActionStatus{ActionId: event.ActionID, CallerActionId: event.CallerActionID, EntrypointId: event.EntrypointID, Status: event.Status, Attempt: event.Attempt, Error: event.Error, UpdatedAt: event.UpdatedAt, MaxAttempts: event.MaxAttempts}, nil
+	return &lutrav1.TaskActionStatus{ActionId: event.ActionID, CallerActionId: event.CallerActionID, EntrypointId: event.EntrypointID, Status: event.Status, Attempt: event.Attempt, Error: event.Error, UpdatedAt: event.UpdatedAt, MaxAttempts: event.MaxAttempts, CacheHit: event.CacheHit}, nil
 }
 
-func (s Service) AppendActionStatus(ctx context.Context, tx pgx.Tx, id uuid.UUID) error {
+func (s Service) AppendActionStatus(ctx context.Context, tx pgx.Tx, id uuid.UUID, cacheHit bool) error {
 	row, err := db.New(tx).ReadTaskAction(ctx, id)
 	if err != nil {
 		return err
 	}
-	if row.CallerActionID == nil {
+	if row.CallerActionID == nil && !cacheHit {
 		return nil
+	}
+	caller := ""
+	if row.CallerActionID != nil {
+		caller = row.CallerActionID.String()
 	}
 	var spec lutrav1.ActionSpec
 	if err := proto.Unmarshal(row.ActionSpec, &spec); err != nil {
@@ -66,7 +73,7 @@ func (s Service) AppendActionStatus(ctx context.Context, tx pgx.Tx, id uuid.UUID
 	if err != nil {
 		return err
 	}
-	value, err := mode.Marshal(actionStatusEvent{Type: "task.status.v1", ActionID: id.String(), CallerActionID: row.CallerActionID.String(), EntrypointID: uint32(row.EntrypointID), Status: string(row.Status), Attempt: row.Attempts, Error: row.Error, UpdatedAt: row.UpdatedAt.Time.UTC().Format(time.RFC3339Nano), MaxAttempts: spec.MaxAttempts})
+	value, err := mode.Marshal(actionStatusEvent{Type: "task.status.v1", ActionID: id.String(), CallerActionID: caller, EntrypointID: uint32(row.EntrypointID), Status: string(row.Status), Attempt: row.Attempts, Error: row.Error, UpdatedAt: row.UpdatedAt.Time.UTC().Format(time.RFC3339Nano), MaxAttempts: spec.MaxAttempts, CacheHit: cacheHit})
 	if err != nil {
 		return err
 	}

@@ -64,7 +64,7 @@ func (s graphStore) Transition(ctx context.Context, t graphexec.Transition) erro
 	if rows != 1 {
 		return ErrLeaseLost
 	}
-	if err := s.logs.AppendActionStatus(ctx, tx, t.NodeID); err != nil {
+	if err := s.logs.AppendActionStatus(ctx, tx, t.NodeID, t.CacheHit); err != nil {
 		return err
 	}
 	if run.RootActionID != nil && *run.RootActionID == t.NodeID {

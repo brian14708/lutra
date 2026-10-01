@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import inspect
 import re
 import sys
@@ -13,7 +14,9 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Generic, ParamSpec, TypeVar, cast, overload
 
-from lutra._bundle import project_root
+from lutra._bundle import build_bundle, project_root
+from lutra._gen.lutra.v1.lutra_pb import ActionSpec
+from lutra.value import dumps
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable, Mapping
@@ -21,6 +24,35 @@ if TYPE_CHECKING:
 P = ParamSpec("P")
 R_co = TypeVar("R_co", covariant=True)
 _MAX_ATTEMPTS = 100
+_MAX_CACHE_ERROR_DETAILS = 64 << 10
+_MAX_TASK_VERSION_LENGTH = 200
+_VERSION = re.compile(
+    r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)"
+    r"(?:-(?:0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)"
+    r"(?:\.(?:0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*)?"
+    r"(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?"
+)
+
+
+class CacheableError(Exception):
+    """A deterministic task failure that may be cached."""
+
+    def __init__(self, code: str, details: object = None) -> None:
+        """Create a cacheable error with a stable code and details.
+
+        Raises:
+            ValueError: If the code or encoded details exceed their limits.
+
+        """
+        if not re.fullmatch(r"[a-z][a-z0-9_.-]{0,127}", code):
+            message = "invalid cacheable error code"
+            raise ValueError(message)
+        if len(dumps(details)) > _MAX_CACHE_ERROR_DETAILS:
+            message = "cacheable error details exceed 64 KiB"
+            raise ValueError(message)
+        super().__init__(code)
+        self.code = code
+        self.details = details
 
 
 class RetryMode(StrEnum):
@@ -158,6 +190,8 @@ class TaskEnvironment:
         *,
         retry: RetryMode | str = RetryMode.NONE,
         max_attempts: int | None = None,
+        cache: bool = False,
+        version: str = "",
     ) -> Task[P, R_co]: ...
 
     @overload
@@ -167,6 +201,8 @@ class TaskEnvironment:
         *,
         retry: RetryMode | str = RetryMode.NONE,
         max_attempts: int | None = None,
+        cache: bool = False,
+        version: str = "",
     ) -> Callable[[Callable[P, R_co | Awaitable[R_co]]], Task[P, R_co]]: ...
 
     def task(
@@ -175,6 +211,8 @@ class TaskEnvironment:
         *,
         retry: RetryMode | str = RetryMode.NONE,
         max_attempts: int | None = None,
+        cache: bool = False,
+        version: str = "",
     ) -> Task[P, R_co] | Callable[[Callable[P, R_co | Awaitable[R_co]]], Task[P, R_co]]:
         """Declare a module-level task.
 
@@ -184,7 +222,9 @@ class TaskEnvironment:
         """
 
         def declare(target: Callable[P, R_co | Awaitable[R_co]]) -> Task[P, R_co]:
-            wrapped = Task(self, target, retry=retry, max_attempts=max_attempts)
+            wrapped = Task(
+                self, target, retry=retry, max_attempts=max_attempts, cache=cache, version=version
+            )
             self._tasks.append(wrapped)
             return wrapped
 
@@ -199,17 +239,49 @@ class Invocation(Generic[R_co]):
     args: tuple[object, ...]
     kwargs: dict[str, object]
 
+    def action_spec(self, max_attempts: int) -> ActionSpec:
+        """Build the wire action specification for this invocation.
+
+        Returns:
+            The encoded action specification.
+
+        """
+        input_cbor = dumps([list(self.args), self.kwargs])
+        key = (
+            hashlib.sha256(
+                dumps([
+                    "lutra.task-cache-client.v1",
+                    self.task.environment.name,
+                    self.task.entrypoint_value,
+                    self.task.version,
+                    input_cbor,
+                    self.task.dependency_key(),
+                ])
+            ).digest()
+            if self.task.cache
+            else b""
+        )
+        return ActionSpec(
+            input_cbor=input_cbor,
+            max_attempts=max_attempts,
+            cache=self.task.cache,
+            task_version=self.task.version if self.task.cache else "",
+            cache_key=key,
+        )
+
 
 class Task(Generic[P, R_co]):
     """A callable entrypoint owned by a task environment."""
 
-    def __init__(
+    def __init__(  # ruff: ignore[too-many-arguments]
         self,
         environment: TaskEnvironment,
         function: Callable[P, R_co | Awaitable[R_co]],
         *,
         retry: RetryMode | str = RetryMode.NONE,
         max_attempts: int | None = None,
+        cache: bool = False,
+        version: str = "",
     ) -> None:
         """Wrap a module-level function.
 
@@ -222,6 +294,13 @@ class Task(Generic[P, R_co]):
             raise ValueError(msg)
         self.environment = environment
         self.retry, self.max_attempts = normalize_retry(retry, max_attempts)
+        if type(cache) is not bool:
+            message = "cache must be a boolean"
+            raise ValueError(message)
+        if cache and (len(version) > _MAX_TASK_VERSION_LENGTH or not _VERSION.fullmatch(version)):
+            message = "cached tasks require a semantic version such as 1.2.0"
+            raise ValueError(message)
+        self.cache, self.version = cache, version
         self.source_file = Path(inspect.getfile(cast("FunctionType", function))).resolve()
         module_name = function.__module__
         loaded = sys.modules.get(module_name)
@@ -264,3 +343,24 @@ class Task(Generic[P, R_co]):
 
         """
         return ("./.venv/bin/python", "-m", "lutra.serve", self.entrypoint_value)
+
+    def dependency_key(self) -> bytes:
+        """Hash the locked build inputs independently of task source.
+
+        Returns:
+            The build dependency digest.
+
+        """
+        root = self.environment.source_root
+        context = self.environment.image.build_context
+        if context is not None:
+            return hashlib.sha256(
+                build_bundle((root / context).resolve(), source_only=False)
+            ).digest()
+        metadata = {
+            path.relative_to(root).as_posix(): path.read_bytes()
+            for path in sorted(root.rglob("pyproject.toml"))
+            if not any(part.startswith(".") for part in path.relative_to(root).parts)
+        }
+        metadata["uv.lock"] = (root / "uv.lock").read_bytes()
+        return hashlib.sha256(dumps(metadata)).digest()

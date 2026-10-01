@@ -13,15 +13,14 @@ from connectrpc.codec import proto_json_codec
 
 from lutra._gen.lutra.v1.lutra_connect import LutraServiceClient
 from lutra._gen.lutra.v1.lutra_pb import (
-    ActionSpec,
     CreateTaskActionRequest,
     EnvironmentIdentifier,
     GetTaskActionRequest,
 )
 from lutra.client import _require_action
 from lutra.serve import StdioTransport, TaskAPIClient
-from lutra.task import normalize_retry
-from lutra.value import dumps, loads
+from lutra.task import CacheableError, normalize_retry
+from lutra.value import loads
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -52,6 +51,7 @@ async def run(invocation: Invocation[R], *, max_attempts: int | None = None) -> 
         The decoded child task result.
 
     Raises:
+        CacheableError: If the child returns a deterministic typed failure.
         RuntimeError: If no active task exists or the child task fails.
 
     """
@@ -80,9 +80,7 @@ async def run(invocation: Invocation[R], *, max_attempts: int | None = None) -> 
         CreateTaskActionRequest(
             environment=environment,
             entrypoint_id=child.entrypoint_id,
-            action_spec=ActionSpec(
-                input_cbor=dumps([list(invocation.args), invocation.kwargs]), max_attempts=attempts
-            ),
+            action_spec=invocation.action_spec(attempts),
             idempotency_key=f"{context.action_id}:{next(context.child_numbers)}",
         )
     )
@@ -97,5 +95,13 @@ async def run(invocation: Invocation[R], *, max_attempts: int | None = None) -> 
         if state.status == "succeeded":
             return await loads(state.output_cbor, api_client.resolve_blob)  # type: ignore[bad-return]
         if state.status in {"failed", "canceled"}:
+            if state.status == "failed" and state.output_cbor:
+                failure = await loads(state.output_cbor, api_client.resolve_blob)
+                if (
+                    isinstance(failure, list)
+                    and len(failure) == len(("lutra.cacheable-error.v1", "", None))
+                    and failure[0] == "lutra.cacheable-error.v1"
+                ):
+                    raise CacheableError(failure[1], failure[2])
             raise RuntimeError(state.error or f"child {state.status}")
         await asyncio.sleep(0)

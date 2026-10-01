@@ -2,10 +2,12 @@ package lutra
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
+	"os"
 	"sync"
 	"time"
 
@@ -13,6 +15,7 @@ import (
 	"github.com/brian14708/lutra/internal/db"
 	"github.com/brian14708/lutra/internal/graphexec"
 	"github.com/brian14708/lutra/internal/runlog"
+	"github.com/fxamacker/cbor/v2"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -91,7 +94,56 @@ func graphNode(row db.LoadRunGraphRow) (graphexec.Node, error) {
 	case db.LutraTaskActionStatusCanceled:
 		state = graphexec.Canceled
 	}
-	return graphexec.Node{ID: row.ID, ParentID: row.CallerActionID, Attempt: row.Attempts, Failures: row.Failures, MaxAttempts: max(spec.MaxAttempts, 1), State: state, ImageKey: row.ImageKey, Output: row.OutputCbor, Error: row.Error, NextAttemptAt: row.NextAttemptAt.Time}, nil
+	key := []byte(nil)
+	if spec.GetCache() {
+		key = cacheKey(row, &spec)
+		if len(key) == 0 {
+			return graphexec.Node{}, errors.New("invalid cached task environment")
+		}
+	}
+	return graphexec.Node{ID: row.ID, ParentID: row.CallerActionID, Attempt: row.Attempts, Failures: row.Failures, MaxAttempts: max(spec.MaxAttempts, 1), State: state, ImageKey: row.ImageKey, CacheKey: key, Output: row.OutputCbor, Error: row.Error, NextAttemptAt: row.NextAttemptAt.Time}, nil
+}
+
+func cacheKey(row db.LoadRunGraphRow, spec *lutrav1.ActionSpec) []byte {
+	var environment lutrav1.EnvironmentSpec
+	if err := proto.Unmarshal(row.EnvironmentSpec, &environment); err != nil {
+		return nil
+	}
+	image := environment.GetImage()
+	dependencies := make([]map[string]string, 0, len(environment.GetDependencies()))
+	for _, dependency := range environment.GetDependencies() {
+		dependencies = append(dependencies, map[string]string{
+			"name": dependency.GetName(), "version": dependency.GetVersion(),
+		})
+	}
+	server := map[string]any{
+		"profile":         "lutra.task-cache-server.v1",
+		"provider":        row.Provider,
+		"runtime_version": os.Getenv("LUTRA_PYTHON_RUNTIME_VERSION"),
+		"image": map[string]any{
+			"name": image.GetName(), "reference": image.GetReference(),
+			"resources": map[string]uint64{
+				"cpu_millis":   uint64(image.GetResources().GetCpuMillis()),
+				"memory_bytes": image.GetResources().GetMemoryBytes(),
+			},
+			"env": image.GetEnvVars(), "build_command": image.GetBuildCommand().GetArgs(),
+			"workdir": image.GetWorkdir(),
+		},
+		"dependencies": dependencies,
+	}
+	mode, err := cbor.CanonicalEncOptions().EncMode()
+	if err != nil {
+		return nil
+	}
+	serverBytes, err := mode.Marshal(server)
+	if err != nil {
+		return nil
+	}
+	h := sha256.New()
+	h.Write([]byte("lutra.task-cache.v1\x00"))
+	h.Write(spec.GetCacheKey())
+	h.Write(serverBytes)
+	return h.Sum(nil)
 }
 
 func environmentExecution(row db.LoadRunGraphRow, runID uuid.UUID, attempt int32) (*EnvironmentExecution, error) {
@@ -151,7 +203,7 @@ func (w *RunWorker) drive(parent context.Context, runID, token uuid.UUID) {
 		snapshot = append(snapshot, node)
 		d.rows[row.ID] = row
 	}
-	d.graph = graphexec.New(snapshot, graphexec.Options{RunID: runID, ClaimToken: token, SlotPool: w.slots, Store: graphStore{pool: w.DB, logs: w.Logs}, Runner: d, Images: d})
+	d.graph = graphexec.New(snapshot, graphexec.Options{RunID: runID, ClaimToken: token, SlotPool: w.slots, Store: graphStore{pool: w.DB, logs: w.Logs}, Runner: d, Images: d, Cache: d})
 	if err := d.graph.Run(ctx); err != nil && ctx.Err() == nil {
 		slog.Debug("run finished", "run_id", runID, "error", err)
 	}
@@ -203,6 +255,14 @@ type runDriver struct {
 	mu           sync.Mutex
 	rows         map[uuid.UUID]db.LoadRunGraphRow
 	images       map[string]*imageWait
+}
+
+func (d *runDriver) Lookup(ctx context.Context, owner uuid.UUID, key []byte) ([]byte, error, bool) {
+	return taskCache{worker: d.worker}.Lookup(ctx, owner, key)
+}
+
+func (d *runDriver) Store(ctx context.Context, owner uuid.UUID, key, output []byte, err error) error {
+	return taskCache{worker: d.worker}.Store(ctx, owner, key, output, err)
 }
 
 func (d *runDriver) Ensure(ctx context.Context, key []byte) error {

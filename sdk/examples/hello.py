@@ -14,7 +14,7 @@ import lutra
 environment = lutra.TaskEnvironment(name="greetings")
 
 
-@environment.task
+@environment.task(cache=True, version="0.1.0")
 async def greeting(name: str) -> str:
     await asyncio.sleep(0)
     print(f"Greeting {name}")
