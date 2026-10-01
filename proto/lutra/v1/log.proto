@@ -32,6 +32,7 @@ message ReadRequest {
   string stream = 2;
   int64 after_seq = 3;
   int32 limit = 4;
+  optional bytes key = 5;
 }
 
 message ReadResponse {

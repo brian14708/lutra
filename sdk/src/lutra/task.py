@@ -7,10 +7,11 @@ import re
 import sys
 from dataclasses import dataclass, field
 from decimal import Decimal
+from enum import StrEnum
 from functools import update_wrapper
 from pathlib import Path
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Generic, ParamSpec, TypeVar, cast
+from typing import TYPE_CHECKING, Generic, ParamSpec, TypeVar, cast, overload
 
 from lutra._bundle import project_root
 
@@ -19,6 +20,39 @@ if TYPE_CHECKING:
     from types import FunctionType
 P = ParamSpec("P")
 R_co = TypeVar("R_co", covariant=True)
+_MAX_ATTEMPTS = 100
+
+
+class RetryMode(StrEnum):
+    """Python task retry policy."""
+
+    NONE = "none"
+    IDEMPOTENT = "idempotent"
+
+
+def normalize_retry(retry: RetryMode | str, max_attempts: int | None) -> tuple[RetryMode, int]:
+    """Normalize a declaration or invocation policy.
+
+    Returns:
+        The retry mode and total attempt limit.
+
+    Raises:
+        ValueError: If the mode or limit is invalid.
+
+    """
+    try:
+        mode = RetryMode(retry)
+    except (ValueError, TypeError) as exc:
+        message = f"invalid retry mode: {retry!r}"
+        raise ValueError(message) from exc
+    attempts = (1 if mode is RetryMode.NONE else 3) if max_attempts is None else max_attempts
+    if type(attempts) is not int or attempts < 1 or attempts > _MAX_ATTEMPTS:
+        message = "max_attempts must be between 1 and 100"
+        raise ValueError(message)
+    if mode is RetryMode.NONE and attempts != 1:
+        message = "retry=none only permits one attempt"
+        raise ValueError(message)
+    return mode, attempts
 
 
 @dataclass(frozen=True)
@@ -117,16 +151,44 @@ class TaskEnvironment:
             raise ValueError(msg)
         return roots.pop()
 
-    def task(self, function: Callable[P, R_co | Awaitable[R_co]]) -> Task[P, R_co]:
+    @overload
+    def task(
+        self,
+        function: Callable[P, R_co | Awaitable[R_co]],
+        *,
+        retry: RetryMode | str = RetryMode.NONE,
+        max_attempts: int | None = None,
+    ) -> Task[P, R_co]: ...
+
+    @overload
+    def task(
+        self,
+        function: None = None,
+        *,
+        retry: RetryMode | str = RetryMode.NONE,
+        max_attempts: int | None = None,
+    ) -> Callable[[Callable[P, R_co | Awaitable[R_co]]], Task[P, R_co]]: ...
+
+    def task(
+        self,
+        function: Callable[P, R_co | Awaitable[R_co]] | None = None,
+        *,
+        retry: RetryMode | str = RetryMode.NONE,
+        max_attempts: int | None = None,
+    ) -> Task[P, R_co] | Callable[[Callable[P, R_co | Awaitable[R_co]]], Task[P, R_co]]:
         """Declare a module-level task.
 
         Returns:
             The wrapped entrypoint.
 
         """
-        wrapped = Task(self, function)
-        self._tasks.append(wrapped)
-        return wrapped
+
+        def declare(target: Callable[P, R_co | Awaitable[R_co]]) -> Task[P, R_co]:
+            wrapped = Task(self, target, retry=retry, max_attempts=max_attempts)
+            self._tasks.append(wrapped)
+            return wrapped
+
+        return declare(function) if function is not None else declare
 
 
 @dataclass(frozen=True)
@@ -142,7 +204,12 @@ class Task(Generic[P, R_co]):
     """A callable entrypoint owned by a task environment."""
 
     def __init__(
-        self, environment: TaskEnvironment, function: Callable[P, R_co | Awaitable[R_co]]
+        self,
+        environment: TaskEnvironment,
+        function: Callable[P, R_co | Awaitable[R_co]],
+        *,
+        retry: RetryMode | str = RetryMode.NONE,
+        max_attempts: int | None = None,
     ) -> None:
         """Wrap a module-level function.
 
@@ -154,6 +221,7 @@ class Task(Generic[P, R_co]):
             msg = "tasks must be defined at module scope"
             raise ValueError(msg)
         self.environment = environment
+        self.retry, self.max_attempts = normalize_retry(retry, max_attempts)
         self.source_file = Path(inspect.getfile(cast("FunctionType", function))).resolve()
         module_name = function.__module__
         loaded = sys.modules.get(module_name)

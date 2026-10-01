@@ -170,7 +170,7 @@ func (e *LocalExecutor) Run(ctx context.Context, image *Image, req *EnvironmentE
 	if req.EntrypointID == 0 || req.EntrypointID > uint32(len(req.Spec.GetEntrypoints())) {
 		return nil, errors.New("entrypoint is not registered")
 	}
-	startup := req.Spec.GetEntrypoints()[req.EntrypointID-1]
+	startup := req.Spec.GetEntrypoints()[req.EntrypointID-1].GetCommand()
 	if e.LoadArtifact == nil {
 		return nil, errors.New("image artifact store unavailable")
 	}
@@ -271,7 +271,7 @@ func (j *localJob) Wait(ctx context.Context) ([]byte, error) {
 	defer j.stop()
 	defer j.cleanup()
 	req := j.req
-	result, callErr := j.process.Client().Execute(ctx, connect.NewRequest(&taskv1.ExecuteRequest{InvocationId: req.ActionID, RunId: req.RunID, ActionId: req.ActionID, ContentType: "application/cbor", Input: req.Input}))
+	result, callErr := j.process.Client().Execute(ctx, connect.NewRequest(&taskv1.ExecuteRequest{InvocationId: req.ActionID, RunId: req.RunID, ActionId: req.ActionID, Attempt: req.Attempt, ContentType: "application/cbor", Input: req.Input}))
 	closeErr := j.process.Close()
 	if callErr != nil {
 		return nil, callErr

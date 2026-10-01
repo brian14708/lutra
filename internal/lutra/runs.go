@@ -75,7 +75,11 @@ func (s Service) CreateRun(ctx context.Context, req *connect.Request[lutrav1.Cre
 	if s.Worker == nil {
 		return nil, connect.NewError(connect.CodeUnavailable, errors.New("worker unavailable"))
 	}
-	if err := validateInput(req.Msg.GetInputCbor()); err != nil {
+	actionSpec := req.Msg.GetActionSpec()
+	if actionSpec == nil {
+		return nil, invalidTask("action spec is required")
+	}
+	if err := validateInput(actionSpec.GetInputCbor()); err != nil {
 		return nil, err
 	}
 	if err := validateIdempotency(req.Msg.GetIdempotencyKey(), false); err != nil {
@@ -87,7 +91,11 @@ func (s Service) CreateRun(ctx context.Context, req *connect.Request[lutrav1.Cre
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 	q := db.New(tx)
-	environment, err := lookupTask(ctx, q, req.Msg.GetEnvironment(), req.Msg.GetEntrypointId())
+	environment, entrypoint, err := lookupTask(ctx, q, req.Msg.GetEnvironment(), req.Msg.GetEntrypointId())
+	if err != nil {
+		return nil, err
+	}
+	storedSpec, err := resolvedActionSpec(entrypoint, actionSpec)
 	if err != nil {
 		return nil, err
 	}
@@ -109,7 +117,7 @@ func (s Service) CreateRun(ctx context.Context, req *connect.Request[lutrav1.Cre
 		if lookupErr != nil {
 			return nil, lookupErr
 		}
-		if action.EnvironmentID != environment.ID || action.EntrypointID != int64(req.Msg.GetEntrypointId()) || !bytes.Equal(action.InputCbor, req.Msg.GetInputCbor()) {
+		if action.EnvironmentID != environment.ID || action.EntrypointID != int64(req.Msg.GetEntrypointId()) || !bytes.Equal(action.ActionSpec, storedSpec) {
 			return nil, invalidTask("idempotency key already belongs to a different invocation")
 		}
 		runID = existing.ID
@@ -120,7 +128,7 @@ func (s Service) CreateRun(ctx context.Context, req *connect.Request[lutrav1.Cre
 		if err != nil {
 			return nil, err
 		}
-		rootID, err = q.InsertRootAction(ctx, db.InsertRootActionParams{ID: rootID, RunID: inserted, EnvironmentID: environment.ID, EntrypointID: int64(req.Msg.GetEntrypointId()), InputCbor: req.Msg.GetInputCbor()})
+		rootID, err = q.InsertRootAction(ctx, db.InsertRootActionParams{ID: rootID, RunID: inserted, EnvironmentID: environment.ID, EntrypointID: int64(req.Msg.GetEntrypointId()), ActionSpec: storedSpec})
 		if err != nil {
 			return nil, err
 		}
@@ -146,7 +154,11 @@ func (s Service) CreateTaskAction(ctx context.Context, req *connect.Request[lutr
 	if !ok {
 		return nil, connect.NewError(connect.CodePermissionDenied, errors.New("task actions are only available inside a task"))
 	}
-	if err := validateInput(req.Msg.GetInputCbor()); err != nil {
+	actionSpec := req.Msg.GetActionSpec()
+	if actionSpec == nil {
+		return nil, invalidTask("action spec is required")
+	}
+	if err := validateInput(actionSpec.GetInputCbor()); err != nil {
 		return nil, err
 	}
 	if err := validateIdempotency(req.Msg.GetIdempotencyKey(), true); err != nil {
@@ -158,7 +170,11 @@ func (s Service) CreateTaskAction(ctx context.Context, req *connect.Request[lutr
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 	q := db.New(tx)
-	environment, err := lookupTask(ctx, q, req.Msg.GetEnvironment(), req.Msg.GetEntrypointId())
+	environment, entrypoint, err := lookupTask(ctx, q, req.Msg.GetEnvironment(), req.Msg.GetEntrypointId())
+	if err != nil {
+		return nil, err
+	}
+	storedSpec, err := resolvedActionSpec(entrypoint, actionSpec)
 	if err != nil {
 		return nil, err
 	}
@@ -196,7 +212,7 @@ func (s Service) CreateTaskAction(ctx context.Context, req *connect.Request[lutr
 	existing, lookupErr := q.GetTaskActionByIdempotency(ctx, db.GetTaskActionByIdempotencyParams{RunID: active.runID, IdempotencyKey: key})
 	var actionID uuid.UUID
 	if lookupErr == nil {
-		if existing.CallerActionID == nil || *existing.CallerActionID != active.actionID || existing.EnvironmentID != environment.ID || existing.EntrypointID != int64(req.Msg.GetEntrypointId()) || !bytes.Equal(existing.InputCbor, req.Msg.GetInputCbor()) {
+		if existing.CallerActionID == nil || *existing.CallerActionID != active.actionID || existing.EnvironmentID != environment.ID || existing.EntrypointID != int64(req.Msg.GetEntrypointId()) || !bytes.Equal(existing.ActionSpec, storedSpec) {
 			return nil, invalidTask("idempotency key already belongs to a different action")
 		}
 		actionID = existing.ID
@@ -207,10 +223,10 @@ func (s Service) CreateTaskAction(ctx context.Context, req *connect.Request[lutr
 		if err != nil {
 			return nil, err
 		}
-		actionID, err = q.InsertTaskAction(ctx, db.InsertTaskActionParams{ID: actionID, RunID: active.runID, CallerActionID: &active.actionID, EnvironmentID: environment.ID, EntrypointID: int64(req.Msg.GetEntrypointId()), InputCbor: req.Msg.GetInputCbor(), IdempotencyKey: key})
+		actionID, err = q.InsertTaskAction(ctx, db.InsertTaskActionParams{ID: actionID, RunID: active.runID, CallerActionID: &active.actionID, EnvironmentID: environment.ID, EntrypointID: int64(req.Msg.GetEntrypointId()), ActionSpec: storedSpec, IdempotencyKey: key})
 		if errors.Is(err, pgx.ErrNoRows) {
 			existing, lookupErr = q.GetTaskActionByIdempotency(ctx, db.GetTaskActionByIdempotencyParams{RunID: active.runID, IdempotencyKey: key})
-			if lookupErr != nil || existing.CallerActionID == nil || *existing.CallerActionID != active.actionID || existing.EnvironmentID != environment.ID || existing.EntrypointID != int64(req.Msg.GetEntrypointId()) || !bytes.Equal(existing.InputCbor, req.Msg.GetInputCbor()) {
+			if lookupErr != nil || existing.CallerActionID == nil || *existing.CallerActionID != active.actionID || existing.EnvironmentID != environment.ID || existing.EntrypointID != int64(req.Msg.GetEntrypointId()) || !bytes.Equal(existing.ActionSpec, storedSpec) {
 				return nil, invalidTask("idempotency key already belongs to a different action")
 			}
 			actionID = existing.ID
@@ -273,7 +289,7 @@ func (s Service) readTaskAction(ctx context.Context, id uuid.UUID) (*lutrav1.Tas
 	if err != nil {
 		return nil, err
 	}
-	return actionFromRow(actionRowFromRead(row), upstream), nil
+	return actionFromRow(actionRowFromRead(row), upstream)
 }
 
 type actionRow struct {
@@ -284,13 +300,17 @@ type actionRow struct {
 	EnvironmentName, Version, Status, Error string
 	EnvironmentID                           uuid.UUID
 	EntrypointID                            int64
-	InputCbor, OutputCbor                   []byte
+	ActionSpec, OutputCbor                  []byte
 	Attempts                                int32
 	CreatedAt, UpdatedAt                    pgtype.Timestamptz
 }
 
-func actionFromRow(row actionRow, upstream []db.ListActionUpstreamsRow) *lutrav1.TaskAction {
-	action := &lutrav1.TaskAction{Id: row.ID.String(), RunId: row.RunID.String(), Environment: environmentIdentifier(row.NamespaceID, row.EnvironmentName, row.Version), EntrypointId: uint32(row.EntrypointID), InputCbor: row.InputCbor, OutputCbor: row.OutputCbor, Status: row.Status, Error: row.Error, Attempts: row.Attempts, CreatedAt: formatTime(row.CreatedAt), UpdatedAt: formatTime(row.UpdatedAt)}
+func actionFromRow(row actionRow, upstream []db.ListActionUpstreamsRow) (*lutrav1.TaskAction, error) {
+	var spec lutrav1.ActionSpec
+	if err := proto.Unmarshal(row.ActionSpec, &spec); err != nil {
+		return nil, err
+	}
+	action := &lutrav1.TaskAction{Id: row.ID.String(), RunId: row.RunID.String(), Environment: environmentIdentifier(row.NamespaceID, row.EnvironmentName, row.Version), EntrypointId: uint32(row.EntrypointID), ActionSpec: &spec, OutputCbor: row.OutputCbor, Status: row.Status, Error: row.Error, Attempts: row.Attempts, CreatedAt: formatTime(row.CreatedAt), UpdatedAt: formatTime(row.UpdatedAt)}
 	if row.CallerActionID != nil {
 		action.CallerActionId = row.CallerActionID.String()
 	}
@@ -299,15 +319,15 @@ func actionFromRow(row actionRow, upstream []db.ListActionUpstreamsRow) *lutrav1
 			action.UpstreamActionIds = append(action.UpstreamActionIds, edge.SourceActionID.String())
 		}
 	}
-	return action
+	return action, nil
 }
 
 func actionRowFromRead(row db.ReadTaskActionRow) actionRow {
-	return actionRow{ID: row.ID, RunID: row.RunID, CallerActionID: row.CallerActionID, NamespaceID: row.NamespaceID, EnvironmentName: row.EnvironmentName, Version: row.Version, EntrypointID: row.EntrypointID, EnvironmentID: row.EnvironmentID, InputCbor: row.InputCbor, OutputCbor: row.OutputCbor, Status: string(row.Status), Error: row.Error, Attempts: row.Attempts, CreatedAt: row.CreatedAt, UpdatedAt: row.UpdatedAt}
+	return actionRow{ID: row.ID, RunID: row.RunID, CallerActionID: row.CallerActionID, NamespaceID: row.NamespaceID, EnvironmentName: row.EnvironmentName, Version: row.Version, EntrypointID: row.EntrypointID, EnvironmentID: row.EnvironmentID, ActionSpec: row.ActionSpec, OutputCbor: row.OutputCbor, Status: string(row.Status), Error: row.Error, Attempts: row.Attempts, CreatedAt: row.CreatedAt, UpdatedAt: row.UpdatedAt}
 }
 
 func actionRowFromList(row db.ListTaskActionsRow) actionRow {
-	return actionRow{ID: row.ID, RunID: row.RunID, CallerActionID: row.CallerActionID, NamespaceID: row.NamespaceID, EnvironmentName: row.EnvironmentName, Version: row.Version, EntrypointID: row.EntrypointID, EnvironmentID: row.EnvironmentID, InputCbor: row.InputCbor, OutputCbor: row.OutputCbor, Status: string(row.Status), Error: row.Error, Attempts: row.Attempts, CreatedAt: row.CreatedAt, UpdatedAt: row.UpdatedAt}
+	return actionRow{ID: row.ID, RunID: row.RunID, CallerActionID: row.CallerActionID, NamespaceID: row.NamespaceID, EnvironmentName: row.EnvironmentName, Version: row.Version, EntrypointID: row.EntrypointID, EnvironmentID: row.EnvironmentID, ActionSpec: row.ActionSpec, OutputCbor: row.OutputCbor, Status: string(row.Status), Error: row.Error, Attempts: row.Attempts, CreatedAt: row.CreatedAt, UpdatedAt: row.UpdatedAt}
 }
 
 func (s Service) GetRun(ctx context.Context, req *connect.Request[lutrav1.GetRunRequest]) (*connect.Response[lutrav1.GetRunResponse], error) {
@@ -416,7 +436,11 @@ func (s Service) ListTaskActions(ctx context.Context, req *connect.Request[lutra
 		return nil, err
 	}
 	for _, row := range rows {
-		response.Actions = append(response.Actions, actionFromRow(row, upstream))
+		action, err := actionFromRow(row, upstream)
+		if err != nil {
+			return nil, err
+		}
+		response.Actions = append(response.Actions, action)
 	}
 	if more && len(rows) > 0 {
 		last := rows[len(rows)-1]

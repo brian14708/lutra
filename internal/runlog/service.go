@@ -53,6 +53,34 @@ type Service struct {
 	MaxCursorAge      time.Duration
 }
 
+type checkpointScope struct {
+	runID  uuid.UUID
+	prefix []byte
+}
+
+type checkpointScopeKey struct{}
+
+// WithCheckpointScope limits task-host log calls to one action's checkpoints.
+func WithCheckpointScope(ctx context.Context, runID, actionID uuid.UUID) context.Context {
+	return context.WithValue(ctx, checkpointScopeKey{}, checkpointScope{runID: runID, prefix: []byte(actionID.String() + "/")})
+}
+
+func checkCheckpointScope(ctx context.Context, runID uuid.UUID, stream string, keys ...[]byte) error {
+	scope, ok := ctx.Value(checkpointScopeKey{}).(checkpointScope)
+	if !ok {
+		return nil
+	}
+	if runID != scope.runID || stream != "checkpoint" {
+		return connect.NewError(connect.CodePermissionDenied, errors.New("log is unavailable to task"))
+	}
+	for _, key := range keys {
+		if !bytes.HasPrefix(key, scope.prefix) {
+			return connect.NewError(connect.CodePermissionDenied, errors.New("checkpoint belongs to a different action"))
+		}
+	}
+	return nil
+}
+
 func (s Service) limits() (inline, record, batch int) {
 	inline, record, batch = s.InlineLimit, s.MaxRecord, s.MaxBatch
 	if inline <= 0 {
@@ -80,12 +108,15 @@ func unavailable(err error) error {
 }
 
 func (s Service) validateRun(ctx context.Context, id string) (uuid.UUID, error) {
-	if s.DB == nil {
-		return uuid.Nil, unavailable(errors.New("log database unavailable"))
-	}
 	runID, err := uuid.Parse(id)
 	if err != nil {
 		return uuid.Nil, invalid("invalid run id")
+	}
+	if scope, ok := ctx.Value(checkpointScopeKey{}).(checkpointScope); ok && runID != scope.runID {
+		return uuid.Nil, connect.NewError(connect.CodePermissionDenied, errors.New("log is unavailable to task"))
+	}
+	if s.DB == nil {
+		return uuid.Nil, unavailable(errors.New("log database unavailable"))
 	}
 	exists, err := db.New(s.DB).RunExists(ctx, runID)
 	if err != nil {
@@ -121,6 +152,13 @@ func (s Service) Append(ctx context.Context, req *connect.Request[lutrav1.Append
 	msg := req.Msg
 	runID, err := s.validateRun(ctx, msg.GetRunId())
 	if err != nil {
+		return nil, err
+	}
+	keys := make([][]byte, 0, len(msg.GetEntries()))
+	for _, entry := range msg.GetEntries() {
+		keys = append(keys, entry.GetKey())
+	}
+	if err := checkCheckpointScope(ctx, runID, msg.GetStream(), keys...); err != nil {
 		return nil, err
 	}
 	result, err := s.AppendEntries(ctx, runID, msg.GetStream(), msg.GetAppendId(), msg.GetEntries())
@@ -271,6 +309,9 @@ func (s Service) Read(ctx context.Context, req *connect.Request[lutrav1.ReadRequ
 	if err != nil {
 		return nil, err
 	}
+	if err := checkCheckpointScope(ctx, runID, req.Msg.GetStream(), req.Msg.GetKey()); err != nil {
+		return nil, err
+	}
 	if err := validateStream(req.Msg.GetStream()); err != nil {
 		return nil, err
 	}
@@ -285,7 +326,7 @@ func (s Service) Read(ctx context.Context, req *connect.Request[lutrav1.ReadRequ
 	if limit < 1 || limit > maxReadLimit {
 		return nil, invalid("limit is out of range")
 	}
-	rows, err := db.New(s.DB).ReadLogRecords(ctx, db.ReadLogRecordsParams{RunID: runID, Stream: req.Msg.GetStream(), Seq: after, Limit: int32(limit + 1)})
+	rows, err := db.New(s.DB).ReadLogRecords(ctx, db.ReadLogRecordsParams{RunID: runID, Stream: req.Msg.GetStream(), Seq: after, Key: req.Msg.Key, Limit: int32(limit + 1)})
 	if err != nil {
 		return nil, internal(err)
 	}

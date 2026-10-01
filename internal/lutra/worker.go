@@ -107,7 +107,56 @@ func (w *Worker) claim(ctx context.Context) (uuid.UUID, uuid.UUID, uuid.UUID, in
 		return uuid.Nil, uuid.Nil, uuid.Nil, 0, err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
-	claimed, err := db.New(tx).ClaimTaskAction(ctx, db.ClaimTaskActionParams{
+	q := db.New(tx)
+	expiredRun, recoveryErr := q.NextExpiredRun(ctx)
+	if recoveryErr == nil {
+		if _, err := q.LockRun(ctx, expiredRun); err != nil {
+			return uuid.Nil, uuid.Nil, uuid.Nil, 0, err
+		}
+		expired, err := q.LockExpiredTaskAction(ctx, expiredRun)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return uuid.Nil, uuid.Nil, uuid.Nil, 0, nil
+		}
+		if err != nil {
+			return uuid.Nil, uuid.Nil, uuid.Nil, 0, err
+		}
+		var spec lutrav1.ActionSpec
+		if err := proto.Unmarshal(expired.ActionSpec, &spec); err != nil {
+			return uuid.Nil, uuid.Nil, uuid.Nil, 0, err
+		}
+		status := db.LutraTaskActionStatusQueued
+		if expired.Attempts >= spec.MaxAttempts {
+			status = db.LutraTaskActionStatusFailed
+		}
+		if err := q.RecoverExpiredTaskAction(ctx, db.RecoverExpiredTaskActionParams{ActionID: expired.ID, Status: status}); err != nil {
+			return uuid.Nil, uuid.Nil, uuid.Nil, 0, err
+		}
+		if err := w.Logs.AppendActionStatus(ctx, tx, expired.ID); err != nil {
+			return uuid.Nil, uuid.Nil, uuid.Nil, 0, err
+		}
+		if expired.CallerActionID == nil {
+			if err := w.Logs.AppendStatus(ctx, tx, expired.RunID); err != nil {
+				return uuid.Nil, uuid.Nil, uuid.Nil, 0, err
+			}
+		}
+		rootTerminal := expired.CallerActionID == nil && status == db.LutraTaskActionStatusFailed
+		if rootTerminal {
+			if _, err := q.CloseRunDescendants(ctx, db.CloseRunDescendantsParams{RunID: expired.RunID, ID: expired.ID}); err != nil {
+				return uuid.Nil, uuid.Nil, uuid.Nil, 0, err
+			}
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return uuid.Nil, uuid.Nil, uuid.Nil, 0, err
+		}
+		if rootTerminal {
+			w.cancelDescendants(expired.RunID, expired.ID)
+		}
+		return uuid.Nil, uuid.Nil, uuid.Nil, 0, nil
+	}
+	if !errors.Is(recoveryErr, pgx.ErrNoRows) {
+		return uuid.Nil, uuid.Nil, uuid.Nil, 0, recoveryErr
+	}
+	claimed, err := q.ClaimTaskAction(ctx, db.ClaimTaskActionParams{
 		ClaimToken: token, LeaseSeconds: int32(leaseDuration / time.Second),
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -191,18 +240,26 @@ func (w *Worker) execute(ctx context.Context, actionID, runID uuid.UUID, attempt
 }
 
 func newExecution(claimed db.LoadClaimedTaskActionRow, runID, actionID uuid.UUID, attempt int32) (*EnvironmentExecution, error) {
+	var spec lutrav1.EnvironmentSpec
+	if err := proto.Unmarshal(claimed.Spec, &spec); err != nil {
+		return nil, err
+	}
+	if claimed.EntrypointID < 1 || claimed.EntrypointID > int64(len(spec.Entrypoints)) {
+		return nil, errors.New("entrypoint is not registered")
+	}
+	var actionSpec lutrav1.ActionSpec
+	if err := proto.Unmarshal(claimed.ActionSpec, &actionSpec); err != nil {
+		return nil, err
+	}
 	task := &EnvironmentExecution{
 		Environment:  &lutrav1.EnvironmentIdentifier{NamespaceId: claimed.NamespaceID.String(), Name: claimed.EnvironmentName, Version: claimed.Version},
 		EntrypointID: uint32(claimed.EntrypointID),
 		Provider:     claimed.Provider,
-		Spec:         &lutrav1.EnvironmentSpec{},
-		Input:        claimed.InputCbor,
+		Spec:         &spec,
+		Input:        actionSpec.InputCbor,
 		RunID:        runID.String(),
 		ActionID:     actionID.String(),
 		Attempt:      attempt,
-	}
-	if err := proto.Unmarshal(claimed.Spec, task.Spec); err != nil {
-		return nil, err
 	}
 	task.Environments = append([]*lutrav1.EnvironmentIdentifier{task.Environment}, task.Spec.Dependencies...)
 	return task, nil
@@ -284,14 +341,27 @@ func (w *Worker) finish(actionID, runID, token uuid.UUID, attempt int32, output 
 	var nextAttempt pgtype.Timestamptz
 	if runErr == nil {
 		status = db.LutraTaskActionStatusSucceeded
-	} else if attempt < 3 {
-		delay := time.Second * time.Duration(1<<(attempt-1))
-		status = db.LutraTaskActionStatusQueued
-		errorText = runErr.Error()
-		nextAttempt = pgtype.Timestamptz{Time: time.Now().Add(delay), Valid: true}
 	} else {
-		status = db.LutraTaskActionStatusFailed
-		errorText = runErr.Error()
+		var spec lutrav1.ActionSpec
+		claimed, policyErr := q.LoadClaimedTaskAction(ctx, db.LoadClaimedTaskActionParams{ActionID: actionID, ClaimToken: token})
+		if errors.Is(policyErr, pgx.ErrNoRows) {
+			return nil
+		}
+		if policyErr != nil {
+			return policyErr
+		}
+		if err := proto.Unmarshal(claimed.ActionSpec, &spec); err != nil {
+			return err
+		}
+		if attempt < spec.MaxAttempts {
+			delay := time.Second * time.Duration(1<<min(attempt-1, 30))
+			status = db.LutraTaskActionStatusQueued
+			errorText = runErr.Error()
+			nextAttempt = pgtype.Timestamptz{Time: time.Now().Add(delay), Valid: true}
+		} else {
+			status = db.LutraTaskActionStatusFailed
+			errorText = runErr.Error()
+		}
 	}
 	rows, err := q.FinishTaskAction(ctx, db.FinishTaskActionParams{
 		ActionID: actionID, ClaimToken: token, Attempt: attempt,
@@ -444,6 +514,8 @@ func (w *Worker) executeEnvironment(ctx context.Context, imageKey []byte, token 
 		switch request.URL.Path {
 		case lutrav1connect.LutraServiceCreateTaskActionProcedure,
 			lutrav1connect.LutraServiceGetTaskActionProcedure,
+			lutrav1connect.LogServiceAppendProcedure,
+			lutrav1connect.LogServiceReadProcedure,
 			lutrav1connect.BlobServiceCreateUploadProcedure,
 			lutrav1connect.BlobServicePresignPartProcedure,
 			lutrav1connect.BlobServiceCompleteUploadProcedure,
@@ -455,7 +527,9 @@ func (w *Worker) executeEnvironment(ctx context.Context, imageKey []byte, token 
 			_, _ = response.Write([]byte(`{"code":"permission_denied","message":"procedure is unavailable to task"}`))
 			return
 		}
-		w.TaskAPIHandler.ServeHTTP(response, request.WithContext(context.WithValue(request.Context(), taskContextKey{}, taskContext{runID: runID, actionID: actionID, token: token})))
+		requestCtx := context.WithValue(request.Context(), taskContextKey{}, taskContext{runID: runID, actionID: actionID, token: token})
+		requestCtx = runlog.WithCheckpointScope(requestCtx, runID, actionID)
+		w.TaskAPIHandler.ServeHTTP(response, request.WithContext(requestCtx))
 	})
 	executor, err := w.executor(task.Provider)
 	if err != nil {

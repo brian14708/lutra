@@ -14,7 +14,7 @@ from lutra._gen.lutra.v1.lutra_pb import EnvironmentIdentifier
 from lutra.runtime import RunContext, run_context
 from lutra.serve import TaskAPIClient, serve
 from lutra.serve._host import _redirect_user_stdout
-from lutra.task import Task
+from lutra.task import RetryMode, Task
 from lutra.value import dumps, loads
 
 if TYPE_CHECKING:
@@ -38,7 +38,9 @@ def _load_environments() -> dict[str, EnvironmentIdentifier]:
     return environments
 
 
-def _bundled_handler(entrypoint: str) -> Callable[..., Awaitable[tuple[str, bytes]]]:
+def _bundled_handler(
+    entrypoint: str,
+) -> tuple[Callable[..., Awaitable[tuple[str, bytes]]], RetryMode]:
     module_name, separator, qualname = entrypoint.partition(":")
     if not separator or not module_name or not qualname:
         message = "entrypoint must be module:qualname"
@@ -83,7 +85,7 @@ def _bundled_handler(entrypoint: str) -> Callable[..., Awaitable[tuple[str, byte
         finally:
             run_context.reset(token)
 
-    return handler
+    return handler, target.retry
 
 
 def main() -> None:
@@ -93,13 +95,14 @@ def main() -> None:
     args = parser.parse_args()
     _redirect_user_stdout()
     if "LUTRA_ENVIRONMENTS_JSON" in os.environ:
-        handler = _bundled_handler(args.callable)
+        handler, retry = _bundled_handler(args.callable)
     else:
         module_name, separator, name = args.callable.partition(":")
         if not separator or not module_name or not name:
             parser.error("callable must be module:callable")
         handler = getattr(importlib.import_module(module_name), name)
-    asyncio.run(serve(handler))
+        retry = RetryMode.NONE
+    asyncio.run(serve(handler, retry=retry))
 
 
 if __name__ == "__main__":

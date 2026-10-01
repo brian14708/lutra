@@ -1,8 +1,7 @@
 -- name: ClaimTaskAction :one
 WITH candidate AS MATERIALIZED (
     SELECT id, status FROM lutra.task_actions
-    WHERE (status = 'queued' AND next_attempt_at <= now())
-       OR (status IN ('running', 'waiting') AND lease_until <= now())
+    WHERE status = 'queued' AND next_attempt_at <= now()
     ORDER BY created_at FOR UPDATE SKIP LOCKED LIMIT 1
 )
 UPDATE lutra.task_actions a
@@ -24,12 +23,35 @@ SELECT
   e.provider,
   e.spec,
   e.image_key,
-  a.input_cbor
+  a.action_spec
 FROM lutra.task_actions AS a
 JOIN lutra.task_environments AS e ON e.id = a.environment_id
 WHERE a.id = sqlc.arg(action_id)::uuid
   AND a.claim_token = sqlc.arg(claim_token)::uuid
   AND a.status = 'running';
+
+-- name: LockExpiredTaskAction :one
+SELECT a.id, a.run_id, a.caller_action_id, a.attempts, a.action_spec
+FROM lutra.task_actions AS a
+WHERE a.run_id = $1 AND a.status IN ('running', 'waiting') AND a.lease_until <= now()
+ORDER BY a.lease_until
+LIMIT 1
+FOR UPDATE SKIP LOCKED;
+
+-- name: RecoverExpiredTaskAction :exec
+UPDATE lutra.task_actions a
+SET status = sqlc.arg(status)::lutra.task_action_status,
+    error = 'task action lease expired', claim_token = NULL, lease_until = NULL,
+    next_attempt_at = now() + power(2, least(attempts - 1, 30)) * interval '1 second',
+    updated_at = now()
+WHERE a.id = sqlc.arg(action_id)::uuid;
+
+-- name: NextExpiredRun :one
+SELECT run_id
+FROM lutra.task_actions
+WHERE status IN ('running', 'waiting') AND lease_until <= now()
+ORDER BY lease_until
+LIMIT 1;
 
 -- name: RenewTaskActionLease :execrows
 UPDATE lutra.task_actions

@@ -19,6 +19,7 @@ message ExecuteRequest {
   bytes input = 3;
   string run_id = 4;
   string action_id = 5;
+  int32 attempt = 6;
 }
 
 message ExecuteResponse {

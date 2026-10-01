@@ -16,8 +16,10 @@ from lutra._gen.lutra.v1.blob_pb import GetDownloadRequest
 from lutra._gen.lutra.v1.log_pb import StreamCursor
 from lutra._gen.lutra.v1.lutra_connect import LutraServiceClient
 from lutra._gen.lutra.v1.lutra_pb import (
+    ActionSpec,
     CancelRunRequest,
     CreateRunRequest,
+    Entrypoint,
     EnvironmentIdentifier,
     EnvironmentSpec,
     GetRunRequest,
@@ -32,6 +34,7 @@ from lutra._gen.lutra.v1.lutra_pb import (
 )
 from lutra._gen.lutra.v1.settings_connect import SettingsServiceClient
 from lutra._gen.lutra.v1.settings_pb import ListNamespacesRequest
+from lutra.task import normalize_retry
 from lutra.value import dumps, loads
 
 if TYPE_CHECKING:
@@ -366,7 +369,11 @@ class Client:
                             for dependency in dict.fromkeys(current.dependencies)
                         ],
                         entrypoints=[
-                            StartupCommand(args=list(task.entrypoint())) for task in current.tasks
+                            Entrypoint(
+                                command=StartupCommand(args=list(task.entrypoint())),
+                                max_attempts=task.max_attempts,
+                            )
+                            for task in current.tasks
                         ],
                     )
                 )
@@ -377,19 +384,32 @@ class Client:
             identifiers[current] = response.environment
         return identifiers[environment]
 
-    async def submit(self, invocation: Invocation[R], *, idempotency_key: str = "") -> RunHandle[R]:
+    async def submit(
+        self,
+        invocation: Invocation[R],
+        *,
+        idempotency_key: str = "",
+        max_attempts: int | None = None,
+    ) -> RunHandle[R]:
         """Submit an invocation and return a handle for its run.
 
         Returns:
             A handle for the submitted run.
 
         """
+        _, attempts = normalize_retry(
+            invocation.task.retry,
+            invocation.task.max_attempts if max_attempts is None else max_attempts,
+        )
         environment = await self._prepare(invocation.task.environment)
         result = await self.rpc.create_run(
             CreateRunRequest(
                 environment=environment,
                 entrypoint_id=invocation.task.entrypoint_id,
-                input_cbor=dumps([list(invocation.args), invocation.kwargs]),
+                action_spec=ActionSpec(
+                    input_cbor=dumps([list(invocation.args), invocation.kwargs]),
+                    max_attempts=attempts,
+                ),
                 idempotency_key=idempotency_key,
             )
         )
@@ -400,6 +420,7 @@ class Client:
         invocation: Invocation[R],
         *,
         idempotency_key: str = "",
+        max_attempts: int | None = None,
         logger: logging.Logger | None = None,
     ) -> R:
         """Submit an invocation and wait for its decoded result.
@@ -417,7 +438,9 @@ class Client:
             _log_message(
                 logger, "", "input", f"args={invocation.args!r} kwargs={invocation.kwargs!r}"
             )
-        handle = await self.submit(invocation, idempotency_key=idempotency_key)
+        handle = await self.submit(
+            invocation, idempotency_key=idempotency_key, max_attempts=max_attempts
+        )
         if logger is not None:
             _log_message(logger, handle.id, "run", handle.id)
         return await handle.result(logger=logger)

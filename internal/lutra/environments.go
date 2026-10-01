@@ -148,12 +148,18 @@ func normalizeEnvironment(spec *lutrav1.EnvironmentSpec) (*environmentSpec, erro
 	return &environmentSpec{spec: normalized, specBytes: specBytes, source: digest, buildContext: buildContext}, nil
 }
 
-func validateEntrypoints(entries []*lutrav1.StartupCommand) error {
+func validateEntrypoints(entries []*lutrav1.Entrypoint) error {
 	if len(entries) == 0 || len(entries) > 1000 {
 		return invalidTask("environment requires between 1 and 1000 entrypoints")
 	}
-	for _, command := range entries {
-		if err := validateCommand(command); err != nil {
+	for _, entry := range entries {
+		if entry == nil {
+			return invalidTask("invalid entrypoint")
+		}
+		if _, err := resolveAttempts(entry, 0); err != nil {
+			return err
+		}
+		if err := validateCommand(entry.Command); err != nil {
 			return err
 		}
 	}
@@ -269,17 +275,17 @@ func lookupEnvironment(ctx context.Context, q *db.Queries, id *lutrav1.Environme
 	return row, err
 }
 
-func lookupTask(ctx context.Context, q *db.Queries, id *lutrav1.EnvironmentIdentifier, entrypointID uint32) (db.LutraTaskEnvironment, error) {
+func lookupTask(ctx context.Context, q *db.Queries, id *lutrav1.EnvironmentIdentifier, entrypointID uint32) (db.LutraTaskEnvironment, *lutrav1.Entrypoint, error) {
 	environment, err := lookupEnvironment(ctx, q, id)
 	if err != nil {
-		return environment, err
+		return environment, nil, err
 	}
 	var spec lutrav1.EnvironmentSpec
 	if err := proto.Unmarshal(environment.Spec, &spec); err != nil {
-		return environment, err
+		return environment, nil, err
 	}
 	if entrypointID == 0 || entrypointID > uint32(len(spec.Entrypoints)) {
-		return environment, connect.NewError(connect.CodeNotFound, errors.New("entrypoint is not registered in this environment"))
+		return environment, nil, connect.NewError(connect.CodeNotFound, errors.New("entrypoint is not registered in this environment"))
 	}
-	return environment, nil
+	return environment, spec.Entrypoints[entrypointID-1], nil
 }

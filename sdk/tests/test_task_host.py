@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock
 
 import cbor2
 import pytest
-from lutra import _blob
+from lutra import RetryMode, _blob, current_context
 from lutra._gen.lutra.task.v1.task_pb import ExecuteRequest, ExecuteResponse
 from lutra.serve import TaskAPIClient, _host, normalize_result
 from lutra.serve._host import _Host, _TaskService
@@ -44,6 +44,20 @@ async def test_synchronous_handler_does_not_block_other_calls() -> None:
     )
     assert response.output == b"ok"
     await asyncio.wait_for(slow, timeout=1)
+
+
+@pytest.mark.asyncio
+async def test_task_context_uses_python_retry_mode() -> None:
+    def handler(
+        _invocation_id: str, _content_type: str, _payload: bytes, _api_client: TaskAPIClient
+    ) -> tuple[str, bytes]:
+        return "text/plain", current_context().retry.value.encode()
+
+    service = _TaskService(handler, RetryMode.IDEMPOTENT)
+    service.api_client = TaskAPIClient(cast("_Host", object()))
+    ctx = cast("RequestContext[ExecuteRequest, ExecuteResponse]", None)
+    response = await service.execute(ExecuteRequest(invocation_id="test"), ctx)
+    assert response.output == b"idempotent"
 
 
 @pytest.mark.asyncio

@@ -17,10 +17,14 @@ from connectrpc.codec import proto_json_codec
 from connectrpc.errors import ConnectError
 
 from lutra._blob import upload_blob
+from lutra._context import TaskContext, task_context
 from lutra._gen.lutra.task.v1.task_connect import TaskService, TaskServiceASGIApplication
 from lutra._gen.lutra.task.v1.task_pb import ExecuteRequest, ExecuteResponse
 from lutra._gen.lutra.v1.blob_connect import BlobServiceClient
 from lutra._gen.lutra.v1.blob_pb import GetDownloadRequest
+from lutra._gen.lutra.v1.log_connect import LogServiceClient
+from lutra.checkpoint import CheckpointManager
+from lutra.task import RetryMode
 from lutra.value import BlobRef, _parse_blob_name, dumps
 
 if TYPE_CHECKING:
@@ -62,8 +66,9 @@ def _envelope(value: object) -> bytes:
 
 
 class _TaskService:
-    def __init__(self, handler: Callable[..., Any]) -> None:
+    def __init__(self, handler: Callable[..., Any], retry: RetryMode = RetryMode.NONE) -> None:
         self._handler = handler
+        self._retry = retry
         self.api_client: TaskAPIClient | None = None
 
     @classmethod
@@ -80,6 +85,15 @@ class _TaskService:
         run_token, action_token = self.api_client.set_execution_context(
             request.run_id, request.action_id
         )
+        context_token = task_context.set(
+            TaskContext(
+                request.run_id,
+                request.action_id,
+                request.attempt,
+                self._retry,
+                CheckpointManager(self.api_client, request.run_id, request.action_id),
+            )
+        )
         args = (request.invocation_id, request.content_type, request.input, self.api_client)
         try:
             if inspect.iscoroutinefunction(self._handler):
@@ -91,6 +105,7 @@ class _TaskService:
             content_type, output = await normalize_result(result, self.api_client)
             return ExecuteResponse(content_type=content_type, output=output)
         finally:
+            task_context.reset(context_token)
             self.api_client.reset_execution_context(run_token, action_token)
 
 
@@ -138,6 +153,13 @@ class TaskAPIClient:
         self._run_id: ContextVar[str] = ContextVar("lutra_run_id", default="")
         self._action_id: ContextVar[str] = ContextVar("lutra_action_id", default="")
         self.blob = BlobServiceClient(
+            "http://stdio",
+            codec=proto_json_codec(),
+            send_compression=None,
+            accept_compression=(),
+            http_client=pyqwest.Client(transport=StdioTransport(self)),
+        )
+        self.log = LogServiceClient(
             "http://stdio",
             codec=proto_json_codec(),
             send_compression=None,
@@ -413,7 +435,7 @@ class _Host:
                 raise ValueError(message)
 
 
-async def serve(handler: Callable[..., Any]) -> None:
+async def serve(handler: Callable[..., Any], *, retry: RetryMode = RetryMode.NONE) -> None:
     """Serve one task handler until stdin closes.
 
     Raises:
@@ -423,7 +445,7 @@ async def serve(handler: Callable[..., Any]) -> None:
     original_stdout = sys.stdout
     _redirect_user_stdout()
     print("task host started")  # ruff: ignore[print]
-    service = _TaskService(handler)
+    service = _TaskService(handler, retry)
     host = _Host(TaskServiceASGIApplication(service, read_max_bytes=_MAX_LINE, compressions=()))
     service.api_client = TaskAPIClient(host)
     reader = asyncio.StreamReader(limit=_MAX_LINE)

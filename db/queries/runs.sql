@@ -10,7 +10,7 @@ FROM lutra.runs
 WHERE namespace_id = $1 AND root_idempotency_key = $2;
 
 -- name: InsertRootAction :one
-INSERT INTO lutra.task_actions (id, run_id, environment_id, entrypoint_id, input_cbor, status)
+INSERT INTO lutra.task_actions (id, run_id, environment_id, entrypoint_id, action_spec, status)
 VALUES ($1, $2, $3, $4, $5, 'queued')
 RETURNING id;
 
@@ -18,13 +18,13 @@ RETURNING id;
 UPDATE lutra.runs SET root_action_id = $1 WHERE id = $2;
 
 -- name: InsertTaskAction :one
-INSERT INTO lutra.task_actions (id, run_id, caller_action_id, environment_id, entrypoint_id, input_cbor, status, idempotency_key)
+INSERT INTO lutra.task_actions (id, run_id, caller_action_id, environment_id, entrypoint_id, action_spec, status, idempotency_key)
 VALUES ($1, $2, $3, $4, $5, $6, 'queued', $7)
 ON CONFLICT (run_id, idempotency_key) WHERE idempotency_key IS NOT NULL DO NOTHING
 RETURNING id;
 
 -- name: GetTaskActionByIdempotency :one
-SELECT id, run_id, caller_action_id, environment_id, entrypoint_id, input_cbor
+SELECT id, run_id, caller_action_id, environment_id, entrypoint_id, action_spec
 FROM lutra.task_actions
 WHERE run_id = $1 AND idempotency_key = $2;
 
@@ -62,7 +62,7 @@ SELECT
   e.version,
   a.entrypoint_id,
   a.environment_id,
-  a.input_cbor,
+  a.action_spec,
   a.output_cbor,
   a.status,
   a.error,
@@ -76,7 +76,7 @@ WHERE a.id = $1;
 -- name: ListTaskActions :many
 SELECT a.id, a.run_id, a.caller_action_id, e.namespace_id,
        e.name AS environment_name, e.version, a.entrypoint_id, a.environment_id,
-       a.input_cbor, a.output_cbor, a.status, a.error, a.attempts,
+       a.action_spec, a.output_cbor, a.status, a.error, a.attempts,
        a.created_at, a.updated_at
 FROM lutra.task_actions a
 JOIN lutra.task_environments e ON e.id = a.environment_id

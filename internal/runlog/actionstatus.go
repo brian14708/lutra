@@ -10,6 +10,7 @@ import (
 	"github.com/fxamacker/cbor/v2"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"google.golang.org/protobuf/proto"
 )
 
 type actionStatusEvent struct {
@@ -21,6 +22,7 @@ type actionStatusEvent struct {
 	Attempt        int32  `cbor:"attempt"`
 	Error          string `cbor:"error"`
 	UpdatedAt      string `cbor:"updated_at"`
+	MaxAttempts    int32  `cbor:"max_attempts"`
 }
 
 func DecodeActionStatus(value []byte) (*lutrav1.TaskActionStatus, error) {
@@ -45,7 +47,7 @@ func DecodeActionStatus(value []byte) (*lutrav1.TaskActionStatus, error) {
 	default:
 		return nil, errors.New("invalid task status event")
 	}
-	return &lutrav1.TaskActionStatus{ActionId: event.ActionID, CallerActionId: event.CallerActionID, EntrypointId: event.EntrypointID, Status: event.Status, Attempt: event.Attempt, Error: event.Error, UpdatedAt: event.UpdatedAt}, nil
+	return &lutrav1.TaskActionStatus{ActionId: event.ActionID, CallerActionId: event.CallerActionID, EntrypointId: event.EntrypointID, Status: event.Status, Attempt: event.Attempt, Error: event.Error, UpdatedAt: event.UpdatedAt, MaxAttempts: event.MaxAttempts}, nil
 }
 
 func (s Service) AppendActionStatus(ctx context.Context, tx pgx.Tx, id uuid.UUID) error {
@@ -56,11 +58,15 @@ func (s Service) AppendActionStatus(ctx context.Context, tx pgx.Tx, id uuid.UUID
 	if row.CallerActionID == nil {
 		return nil
 	}
+	var spec lutrav1.ActionSpec
+	if err := proto.Unmarshal(row.ActionSpec, &spec); err != nil {
+		return err
+	}
 	mode, err := cbor.CanonicalEncOptions().EncMode()
 	if err != nil {
 		return err
 	}
-	value, err := mode.Marshal(actionStatusEvent{Type: "task.status.v1", ActionID: id.String(), CallerActionID: row.CallerActionID.String(), EntrypointID: uint32(row.EntrypointID), Status: string(row.Status), Attempt: row.Attempts, Error: row.Error, UpdatedAt: row.UpdatedAt.Time.UTC().Format(time.RFC3339Nano)})
+	value, err := mode.Marshal(actionStatusEvent{Type: "task.status.v1", ActionID: id.String(), CallerActionID: row.CallerActionID.String(), EntrypointID: uint32(row.EntrypointID), Status: string(row.Status), Attempt: row.Attempts, Error: row.Error, UpdatedAt: row.UpdatedAt.Time.UTC().Format(time.RFC3339Nano), MaxAttempts: spec.MaxAttempts})
 	if err != nil {
 		return err
 	}

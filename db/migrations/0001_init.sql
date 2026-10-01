@@ -81,7 +81,7 @@ CREATE TABLE lutra.task_actions (
     caller_action_id uuid,
     environment_id uuid NOT NULL REFERENCES lutra.task_environments(id),
     entrypoint_id bigint NOT NULL CHECK (entrypoint_id BETWEEN 1 AND 4294967295),
-    input_cbor bytea NOT NULL,
+    action_spec bytea NOT NULL,
     output_cbor bytea,
     status lutra.task_action_status NOT NULL DEFAULT 'queued',
     error text NOT NULL DEFAULT '',

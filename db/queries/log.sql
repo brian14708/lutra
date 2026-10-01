@@ -33,7 +33,10 @@ VALUES ($1, $2, $3, $4, $5, $6, $7, now());
 -- name: ReadLogRecords :many
 SELECT stream, seq, key, value_cbor, value_uri, created_at
 FROM lutra.run_log_records
-WHERE run_id = $1 AND stream = $2 AND seq > $3
+WHERE run_id = $1
+  AND stream = $2
+  AND seq > $3
+  AND (sqlc.narg(key)::bytea IS NULL OR key = sqlc.narg(key)::bytea)
 ORDER BY seq
 LIMIT $4;
 

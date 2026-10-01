@@ -13,12 +13,14 @@ from connectrpc.codec import proto_json_codec
 
 from lutra._gen.lutra.v1.lutra_connect import LutraServiceClient
 from lutra._gen.lutra.v1.lutra_pb import (
+    ActionSpec,
     CreateTaskActionRequest,
     EnvironmentIdentifier,
     GetTaskActionRequest,
 )
 from lutra.client import _require_action
 from lutra.serve import StdioTransport, TaskAPIClient
+from lutra.task import normalize_retry
 from lutra.value import dumps, loads
 
 if TYPE_CHECKING:
@@ -43,7 +45,7 @@ class RunContext:
 run_context: ContextVar[RunContext] = ContextVar("lutra_run")
 
 
-async def run(invocation: Invocation[R]) -> R:
+async def run(invocation: Invocation[R], *, max_attempts: int | None = None) -> R:
     """Submit a child task invocation through the current task host.
 
     Returns:
@@ -53,9 +55,16 @@ async def run(invocation: Invocation[R]) -> R:
         RuntimeError: If no active task exists or the child task fails.
 
     """
-    context = run_context.get()
+    try:
+        context = run_context.get()
+    except LookupError as exc:
+        message = "no active Lutra task"
+        raise RuntimeError(message) from exc
     api_client = context.api_client
     child = invocation.task
+    _, attempts = normalize_retry(
+        child.retry, child.max_attempts if max_attempts is None else max_attempts
+    )
     environment = context.environments.get(child.environment.name)
     if environment is None:
         msg = f"environment {child.environment.name!r} is not a registered dependency"
@@ -71,7 +80,9 @@ async def run(invocation: Invocation[R]) -> R:
         CreateTaskActionRequest(
             environment=environment,
             entrypoint_id=child.entrypoint_id,
-            input_cbor=dumps([list(invocation.args), invocation.kwargs]),
+            action_spec=ActionSpec(
+                input_cbor=dumps([list(invocation.args), invocation.kwargs]), max_attempts=attempts
+            ),
             idempotency_key=f"{context.action_id}:{next(context.child_numbers)}",
         )
     )
