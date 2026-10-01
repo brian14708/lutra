@@ -3,16 +3,19 @@
 from __future__ import annotations
 
 import argparse
-import base64
 import hashlib
 import io
 import json
 import os
+import posixpath
+import re
 import shutil
 import stat
 import struct
 import tarfile
 import tempfile
+from dataclasses import dataclass
+from datetime import datetime
 from operator import itemgetter
 from pathlib import Path
 from typing import TYPE_CHECKING, BinaryIO, cast
@@ -88,6 +91,7 @@ def _write_tar(
     with tarfile.open(fileobj=target, mode="w", format=tarfile.PAX_FORMAT) as archive:
         for path, name in _members(source):
             arcname = f"{prefix}/{name}" if prefix else name
+            _safe_name(arcname)
             info = path.lstat()
             size = info.st_size if stat.S_ISREG(info.st_mode) else 0
             if (
@@ -120,9 +124,14 @@ def _write_tar(
     return members
 
 
-def _frame(source: BinaryIO, output: BinaryIO, length: int) -> str:
-    digest = hashlib.sha256()
-    with zstandard.ZstdCompressor(level=_ZSTD_LEVEL).stream_writer(output, closefd=False) as writer:
+def _frame(
+    source: BinaryIO,
+    output: BinaryIO,
+    length: int,
+    compressor: zstandard.ZstdCompressor,
+    digest: hashlib._Hash | None = None,
+) -> None:
+    with compressor.stream_writer(output, closefd=False) as writer:
         remaining = length
         while remaining:
             chunk = source.read(min(1 << 20, remaining))
@@ -130,33 +139,18 @@ def _frame(source: BinaryIO, output: BinaryIO, length: int) -> str:
                 msg = "tar data ended unexpectedly"
                 raise ArchiveError(msg)
             writer.write(chunk)
-            digest.update(chunk)
+            if digest is not None:
+                digest.update(chunk)
             remaining -= len(chunk)
-    return digest.hexdigest()
 
 
-def _segment(
-    source: BinaryIO, output: BinaryIO, length: int, entries: list[dict[str, object]]
-) -> None:
-    if length == 0:
-        return
-    data = source.read(length)
-    if len(data) != length:
-        msg = "tar data ended unexpectedly"
-        raise ArchiveError(msg)
-    output.write(zstandard.ZstdCompressor(level=_ZSTD_LEVEL).compress(data))
-    entries.append({
-        "type": 2,
-        "payload": base64.b64encode(data).decode("ascii"),
-        "position": len(entries),
-    })
-
-
-def _metadata(output: BinaryIO, data: bytes) -> tuple[int, int, int]:
+def _metadata(
+    output: BinaryIO, data: bytes, compressor: zstandard.ZstdCompressor
+) -> tuple[int, int, int]:
     if len(data) > _MAX_METADATA:
         msg = "archive metadata is too large"
         raise ArchiveError(msg)
-    compressed = zstandard.ZstdCompressor(level=_ZSTD_LEVEL).compress(data)
+    compressed = compressor.compress(data)
     if len(compressed) > _MAX_SKIP_SIZE:
         msg = "archive metadata is too large"
         raise ArchiveError(msg)
@@ -166,68 +160,83 @@ def _metadata(output: BinaryIO, data: bytes) -> tuple[int, int, int]:
     return offset, len(compressed), len(data)
 
 
+def _write_archive(
+    raw: BinaryIO, output: BinaryIO, members: list[tuple[tarfile.TarInfo, int]], tar_length: int
+) -> None:
+    compressor = zstandard.ZstdCompressor(level=_ZSTD_LEVEL)
+    manifest: list[dict[str, object]] = []
+    cursor = 0
+    for member, offset_data in members:
+        if offset_data > cursor:
+            _frame(raw, output, offset_data - cursor, compressor)
+        cursor = offset_data
+        item: dict[str, object] = {
+            "type": "dir" if member.isdir() else "symlink" if member.issym() else "reg",
+            "name": member.name,
+            "mode": member.mode,
+            "modtime": "1970-01-01T00:00:00Z",
+        }
+        if member.issym():
+            item["linkName"] = member.linkname
+        if member.isfile() and member.size:
+            digest = hashlib.sha256()
+            start = output.tell()
+            _frame(raw, output, member.size, compressor, digest)
+            item.update(
+                size=member.size,
+                digest=f"sha256:{digest.hexdigest()}",
+                offset=start,
+                endOffset=output.tell(),
+            )
+            cursor += member.size
+        manifest.append(item)
+    _frame(raw, output, tar_length - cursor, compressor)
+    manifest_bytes = json.dumps({"version": 1, "entries": manifest}, separators=(",", ":")).encode()
+    manifest_location = _metadata(output, manifest_bytes, compressor)
+    output.write(_FOOTER.pack(_SKIP_MAGIC, 64, *manifest_location, 1, 0, 0, 0, _FOOTER_MAGIC))
+    if output.tell() > _MAX_ARCHIVE_SIZE:
+        msg = "archive exceeds size limit"
+        raise ArchiveError(msg)
+
+
 def create_archive(source: Path, output: Path, *, prefix: str = "") -> None:
-    """Write a sorted zstd:chunked tar archive with normalized tar metadata."""
+    """Write a sorted zstd:chunked tar archive with normalized tar metadata.
+
+    Raises:
+        ArchiveError: If the source is unsafe, unsupported, or exceeds archive limits.
+
+    """
     source = Path(source)
     output = Path(output)
     if prefix:
         _safe_name(prefix)
     with tempfile.TemporaryFile() as raw:
         members = _write_tar(source, raw, prefix=prefix)
-        raw.seek(0, os.SEEK_END)
         tar_length = raw.tell()
+        if tar_length > _MAX_ARCHIVE_SIZE:
+            msg = "archive exceeds size or entry limit"
+            raise ArchiveError(msg)
         raw.seek(0)
-        manifest: list[dict[str, object]] = []
-        tarsplit: list[dict[str, object]] = []
-        with output.open("wb") as compressed:
-            cursor = 0
-            for member, offset_data in members:
-                _segment(raw, compressed, offset_data - cursor, tarsplit)
-                cursor = offset_data
-                item: dict[str, object] = {
-                    "type": "dir" if member.isdir() else "symlink" if member.issym() else "reg",
-                    "name": member.name,
-                    "mode": member.mode,
-                    "modtime": "1970-01-01T00:00:00Z",
-                }
-                if member.issym():
-                    item["linkname"] = member.linkname
-                if member.isfile():
-                    item["size"] = member.size
-                    if member.size:
-                        start = compressed.tell()
-                        digest = _frame(raw, compressed, member.size)
-                        item.update(
-                            digest=f"sha256:{digest}", offset=start, endOffset=compressed.tell()
-                        )
-                        tarsplit.append({
-                            "type": 1,
-                            "name": member.name,
-                            "size": member.size,
-                            "position": len(tarsplit),
-                        })
-                    cursor += member.size
-                manifest.append(item)
-            _segment(raw, compressed, tar_length - cursor, tarsplit)
-            manifest_bytes = json.dumps(
-                {"version": 1, "entries": manifest}, separators=(",", ":")
-            ).encode()
-            split_bytes = b"".join(
-                json.dumps(entry, separators=(",", ":")).encode() + b"\n" for entry in tarsplit
-            )
-            manifest_location = _metadata(compressed, manifest_bytes)
-            split_location = _metadata(compressed, split_bytes)
-            compressed.write(
-                _FOOTER.pack(_SKIP_MAGIC, 64, *manifest_location, 1, *split_location, _FOOTER_MAGIC)
-            )
+        with tempfile.NamedTemporaryFile(
+            dir=output.parent, prefix=f".{output.name}.", delete=False
+        ) as compressed:
+            temporary = Path(compressed.name)
+            try:
+                _write_archive(raw, cast("BinaryIO", compressed), members, tar_length)
+                compressed.close()
+                temporary.replace(output)
+            except BaseException:
+                temporary.unlink(missing_ok=True)
+                raise
 
 
 def _safe_name(name: str) -> tuple[str, ...]:
-    parts = tuple(name.rstrip("/").split("/"))
+    parts = tuple(name.removesuffix("/").split("/"))
     if (
         not name
         or name.startswith("/")
         or "\\" in name
+        or "\x00" in name
         or any(part in {"", ".", ".."} for part in parts)
     ):
         msg = f"unsafe archive path: {name!r}"
@@ -235,12 +244,37 @@ def _safe_name(name: str) -> tuple[str, ...]:
     return parts
 
 
+def _decompress_frame(source: BinaryIO, length: int, size: int, output: BinaryIO) -> str:
+    bounded = _LimitedReader(source, length)
+    decoder = zstandard.ZstdDecompressor(max_window_size=_MAX_ARCHIVE_SIZE >> 10).decompressobj()
+    digest = hashlib.sha256()
+    copied = 0
+    while chunk := bounded.read(16 << 10):
+        try:
+            data = decoder.decompress(chunk)
+        except zstandard.ZstdError as error:
+            msg = "invalid compressed archive frame"
+            raise ArchiveError(msg) from error
+        copied += len(data)
+        if copied > size:
+            msg = "archive decompressed size mismatch"
+            raise ArchiveError(msg)
+        output.write(data)
+        digest.update(data)
+        if decoder.eof:
+            break
+    if copied != size or not decoder.eof or decoder.unused_data or bounded.remaining:
+        msg = "archive frame size or completion mismatch"
+        raise ArchiveError(msg)
+    return f"sha256:{digest.hexdigest()}"
+
+
 def _read_metadata(source: BinaryIO, offset: int, compressed: int, size: int, end: int) -> bytes:
     if (
-        size > _MAX_METADATA
-        or compressed > _MAX_METADATA
+        not 0 < size <= _MAX_METADATA
+        or not 0 < compressed <= _MAX_METADATA
         or offset < _SKIP_HEADER.size
-        or offset + compressed > end
+        or offset + compressed != end
     ):
         msg = "invalid archive metadata range"
         raise ArchiveError(msg)
@@ -248,115 +282,181 @@ def _read_metadata(source: BinaryIO, offset: int, compressed: int, size: int, en
     if source.read(_SKIP_HEADER.size) != _SKIP_HEADER.pack(_SKIP_MAGIC, compressed):
         msg = "invalid archive metadata frame"
         raise ArchiveError(msg)
-    try:
-        data = zstandard.ZstdDecompressor().decompress(
-            source.read(compressed), max_output_size=size
-        )
-    except zstandard.ZstdError as error:
-        msg = "invalid compressed archive metadata"
-        raise ArchiveError(msg) from error
-    if len(data) != size:
-        msg = "archive metadata size mismatch"
-        raise ArchiveError(msg)
-    return data
+    output = io.BytesIO()
+    _decompress_frame(source, compressed, size, output)
+    return output.getvalue()
 
 
-def _footer_locations(source: BinaryIO) -> tuple[tuple[int, int, int], tuple[int, int, int]]:
+def _footer_locations(source: BinaryIO) -> tuple[tuple[int, int, int], int]:
     source.seek(0, os.SEEK_END)
     end = source.tell()
-    if end < _FOOTER.size:
-        msg = "missing zstd:chunked footer"
+    if not _FOOTER.size <= end <= _MAX_ARCHIVE_SIZE:
+        msg = "missing footer or archive exceeds size limit"
         raise ArchiveError(msg)
     source.seek(end - _FOOTER.size)
     fields = _FOOTER.unpack(source.read(_FOOTER.size))
     if (fields[0], fields[1], fields[5], fields[9]) != (_SKIP_MAGIC, 64, 1, _FOOTER_MAGIC):
         msg = "invalid zstd:chunked footer"
         raise ArchiveError(msg)
-    return fields[2:5], fields[6:9]
+    if fields[6:9] != (0, 0, 0):
+        msg = "tar-split data is not supported"
+        raise ArchiveError(msg)
+    return fields[2:5], end - _FOOTER.size
 
 
-def _manifest(source: BinaryIO) -> list[dict[str, object]]:
-    manifest_location, split_location = _footer_locations(source)
-    source.seek(0, os.SEEK_END)
-    end = source.tell() - _FOOTER.size
-    manifest_data = _read_metadata(source, *manifest_location, end)
-    _read_metadata(source, *split_location, end)
+@dataclass(frozen=True)
+class _Entry:
+    name: str
+    kind: str
+    size: int
+    start: int
+    end: int
+    digest: str
+
+
+def _integer(entry: dict[str, object], field: str, maximum: int = _MAX_ARCHIVE_SIZE) -> int:
+    value = entry.get(field, 0)
+    if type(value) is not int or not 0 <= value <= maximum:
+        msg = f"invalid archive entry {field}"
+        raise ArchiveError(msg)
+    return value
+
+
+def _string(entry: dict[str, object], field: str) -> str:
+    value = entry.get(field, "")
+    if not isinstance(value, str):
+        msg = f"invalid archive entry {field}"
+        raise ArchiveError(msg)
+    return value
+
+
+def _validate_link(name: str, link: str) -> None:
+    if not link or "\\x00" in link or "\\\\" in link:
+        msg = "invalid archive symlink target"
+        raise ArchiveError(msg)
+    if link.startswith("/"):
+        resolved = Path(posixpath.normpath(link))
+        if not any(resolved.is_relative_to(root) for root in ("/nix/store", "/usr")):
+            msg = "archive symlink escapes allowed runtime roots"
+            raise ArchiveError(msg)
+    else:
+        resolved_name = posixpath.normpath(posixpath.join(posixpath.dirname(name), link))
+        if resolved_name == ".." or resolved_name.startswith("../"):
+            msg = "archive symlink escapes destination"
+            raise ArchiveError(msg)
+
+
+def _entry_metadata(entry: dict[str, object]) -> None:
+    _integer(entry, "mode", 0o7777)
+    _integer(entry, "uid", (1 << 32) - 1)
+    _integer(entry, "gid", (1 << 32) - 1)
+    modtime = _string(entry, "modtime")
+    if modtime:
+        try:
+            parsed = datetime.fromisoformat(modtime)
+        except ValueError as error:
+            msg = "invalid archive entry modtime"
+            raise ArchiveError(msg) from error
+        if (
+            not re.fullmatch(
+                r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})", modtime
+            )
+            or parsed.tzinfo is None
+        ):
+            msg = "invalid archive entry modtime"
+            raise ArchiveError(msg)
+
+
+def _parse_entry(value: object, limit: int) -> _Entry:
+    if not isinstance(value, dict):
+        msg = "invalid archive entry"
+        raise ArchiveError(msg)
+    name, kind = _string(value, "name"), _string(value, "type")
+    _safe_name(name)
+    if kind not in {"reg", "dir", "symlink"} or (kind != "dir" and name.endswith("/")):
+        msg = "unsupported archive entry type or path"
+        raise ArchiveError(msg)
+    _entry_metadata(value)
+    size = _integer(value, "size")
+    start, end = _integer(value, "offset"), _integer(value, "endOffset")
+    digest, link = _string(value, "digest"), _string(value, "linkName")
+    if kind == "reg" and size:
+        if end <= start or end > limit:
+            msg = "invalid archive file range"
+            raise ArchiveError(msg)
+        if re.fullmatch(r"sha256:[0-9a-f]{64}", digest) is None:
+            msg = "invalid archive file digest"
+            raise ArchiveError(msg)
+    elif size or start or end or digest:
+        msg = "invalid empty or non-regular archive entry"
+        raise ArchiveError(msg)
+    if kind == "symlink":
+        _validate_link(name, link)
+    elif link:
+        msg = "invalid archive entry linkName"
+        raise ArchiveError(msg)
+    return _Entry(name, kind, size, start, end, digest)
+
+
+def _manifest(source: BinaryIO) -> dict[str, _Entry]:
+    location, end = _footer_locations(source)
+    data = _read_metadata(source, *location, end)
     try:
-        document = json.loads(manifest_data)
-    except (TypeError, ValueError) as error:
+        document = json.loads(data)
+    except (ValueError, RecursionError) as error:
         msg = "invalid archive manifest"
         raise ArchiveError(msg) from error
-    if not isinstance(document, dict) or document.get("version") != 1:
+    if (
+        not isinstance(document, dict)
+        or type(document.get("version")) is not int
+        or document["version"] != 1
+    ):
         msg = "invalid archive manifest"
         raise ArchiveError(msg)
-    entries = document.get("entries")
-    if not isinstance(entries, list):
-        msg = "invalid archive manifest"
+    values = document.get("entries")
+    if not isinstance(values, list) or len(values) > _MAX_ARCHIVE_ENTRIES:
+        msg = "invalid archive entries or entry limit exceeded"
         raise ArchiveError(msg)
-    seen: set[str] = set()
-    for entry in entries:
-        if not isinstance(entry, dict):
-            msg = "invalid archive entry"
+    entries: dict[str, _Entry] = {}
+    ranges: list[tuple[int, int]] = []
+    total_size = 0
+    for value in values:
+        entry = _parse_entry(value, location[0] - _SKIP_HEADER.size)
+        key = "/".join(_safe_name(entry.name))
+        if key in entries:
+            msg = "duplicate archive path"
             raise ArchiveError(msg)
-        name = entry.get("name")
-        if (
-            not isinstance(name, str)
-            or name in seen
-            or entry.get("type") not in {"dir", "reg", "symlink"}
-        ):
-            msg = "invalid archive entry"
+        entries[key] = entry
+        total_size += entry.size
+        if total_size > _MAX_ARCHIVE_SIZE:
+            msg = "archive exceeds size limit"
             raise ArchiveError(msg)
-        _safe_name(name)
-        seen.add(name)
+        if entry.size:
+            ranges.append((entry.start, entry.end))
+    previous_end = 0
+    for start, finish in sorted(ranges):
+        if start < previous_end:
+            msg = "overlapping archive file ranges"
+            raise ArchiveError(msg)
+        previous_end = finish
     return entries
 
 
-def _stream_content(reader: BinaryIO, output: BinaryIO, digest: hashlib._Hash, size: int) -> int:
-    copied = 0
-    while chunk := reader.read(1 << 20):
-        copied += len(chunk)
-        if copied > size:
-            break
-        digest.update(chunk)
-        output.write(chunk)
-    return copied
+def zstd_chunked_manifest_metadata(archive: Path) -> dict[str, str]:
+    """Return standard zstd:chunked annotations for an archive manifest.
 
+    Returns:
+        Manifest checksum and position annotations.
 
-def _copy_content(source: BinaryIO, entry: dict[str, object], limit: int, output: BinaryIO) -> None:
-    size = entry.get("size", 0)
-    if not isinstance(size, int) or size < 0:
-        msg = "invalid archive file size"
-        raise ArchiveError(msg)
-    if size == 0:
-        return
-    start, end = entry.get("offset"), entry.get("endOffset")
-    if (
-        not isinstance(start, int)
-        or not isinstance(end, int)
-        or start < 0
-        or end <= start
-        or end > limit
-    ):
-        msg = "invalid archive file range"
-        raise ArchiveError(msg)
-    source.seek(start)
-    digest = hashlib.sha256()
-    try:
-        bounded = _LimitedReader(source, end - start)
-        with zstandard.ZstdDecompressor().stream_reader(
-            cast("BinaryIO", bounded), read_across_frames=True
-        ) as reader:
-            copied = _stream_content(reader, output, digest, size)
-    except zstandard.ZstdError as error:
-        msg = "invalid compressed archive file"
-        raise ArchiveError(msg) from error
-    if (
-        copied != size
-        or bounded.remaining != 0
-        or entry.get("digest") != f"sha256:{digest.hexdigest()}"
-    ):
-        msg = "archive file checksum mismatch"
-        raise ArchiveError(msg)
+    """
+    with Path(archive).open("rb") as source:
+        location, end = _footer_locations(source)
+        data = _read_metadata(source, *location, end)
+    offset, compressed, size = location
+    return {
+        "zstd-chunked-manifest-checksum": (f"sha256:{hashlib.sha256(data).hexdigest()}"),
+        "zstd-chunked-manifest-position": f"{offset}:{compressed}:{size}:1",
+    }
 
 
 def read_archive(archive: Path, name: str) -> bytes:
@@ -367,19 +467,22 @@ def read_archive(archive: Path, name: str) -> bytes:
 
     Raises:
         KeyError: If the file is absent.
+        ArchiveError: If the archive is malformed or the file fails verification.
 
     """
     _safe_name(name)
     with Path(archive).open("rb") as source:
-        entries = _manifest(source)
-        source.seek(0, os.SEEK_END)
-        limit = source.tell() - _FOOTER.size
-        for entry in entries:
-            if entry["name"] == name and entry["type"] == "reg":
-                output = io.BytesIO()
-                _copy_content(source, entry, limit, output)
-                return output.getvalue()
-    raise KeyError(name)
+        entry = _manifest(source).get(name)
+        if entry is None or entry.kind != "reg":
+            raise KeyError(name)
+        output = io.BytesIO()
+        if entry.size:
+            source.seek(entry.start)
+            digest = _decompress_frame(source, entry.end - entry.start, entry.size, output)
+            if digest != entry.digest:
+                msg = "archive file checksum mismatch"
+                raise ArchiveError(msg)
+        return output.getvalue()
 
 
 def _extract_symlink(target: Path, link: str, root: Path) -> None:

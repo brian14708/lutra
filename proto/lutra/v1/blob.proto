@@ -18,6 +18,7 @@ message CreateUploadRequest {
   bytes content_sha256 = 1;
   int64 size = 2;
   string mime_type = 3;
+  map<string, string> metadata = 4;
 }
 
 message CreateUploadResponse {

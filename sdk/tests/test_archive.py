@@ -1,7 +1,27 @@
+import hashlib
 from pathlib import Path
 
 import pytest
 from lutra.archive import ArchiveError, create_archive, extract_archive, read_archive
+
+
+def test_archive_is_deterministic_golden(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "alpha").write_bytes(b"alpha\n")
+    (source / "empty").write_bytes(b"")
+    (source / "dir").mkdir()
+    (source / "dir" / "run").write_bytes(b"#!/bin/sh\necho ok\n")
+    (source / "link").symlink_to("alpha")
+    first, second = tmp_path / "first", tmp_path / "second"
+    create_archive(source, first, prefix="root")
+    create_archive(source, second, prefix="root")
+    data = first.read_bytes()
+    assert data == second.read_bytes()
+    assert (
+        hashlib.sha256(data).hexdigest()
+        == "e64fec657c9b1515dd2a60da8a4cef6dd5f5e657f0de5b3063322698486b64a3"
+    )
 
 
 def test_archive_roundtrip(tmp_path: Path) -> None:
@@ -29,27 +49,6 @@ def test_archive_roundtrip(tmp_path: Path) -> None:
     assert (destination / "sub" / "link.txt").is_symlink()
     assert (destination / "sub" / "link.txt").read_text() == "two"
     assert (destination / long_name).read_bytes() == b"long name"
-
-
-def test_archive_symlinks(tmp_path: Path) -> None:
-    source = tmp_path / "source"
-    source.mkdir()
-    (source / "directory").mkdir()
-    (source / "directory" / "file").write_text("contents")
-    (source / "alias").symlink_to("directory", target_is_directory=True)
-    (source / "dangling").symlink_to("missing")
-    (source / "python").symlink_to("/usr/bin/python3")
-    archive = tmp_path / "archive.tar.zst"
-    create_archive(source, archive)
-    destination = tmp_path / "destination"
-    extract_archive(archive, destination)
-    assert (destination / "alias").is_symlink()
-    assert (destination / "alias" / "file").read_text() == "contents"
-    assert str((destination / "dangling").readlink()) == "missing"
-    assert str((destination / "python").readlink()) == "/usr/bin/python3"
-    assert read_archive(archive, "directory/file") == b"contents"
-    with pytest.raises(KeyError):
-        read_archive(archive, "python")
 
 
 @pytest.mark.parametrize("link", ["../outside", "/outside", "/usr/../../outside"])

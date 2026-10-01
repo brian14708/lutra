@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"mime"
 	"net/http"
@@ -27,6 +28,24 @@ const (
 	partSize    = 8 << 20
 	urlLifetime = 15 * time.Minute
 )
+
+func uploadMetadata(values map[string]string) (map[string]string, []byte, error) {
+	if len(values) > 32 {
+		return nil, nil, errors.New("too many blob metadata entries")
+	}
+	clean := make(map[string]string, len(values))
+	for key, value := range values {
+		if len(key) == 0 || len(key) > 64 || len(value) > 1024 || strings.ToLower(key) != key {
+			return nil, nil, errors.New("invalid blob metadata")
+		}
+		clean[key] = value
+	}
+	data, err := json.Marshal(clean)
+	if err != nil || len(data) > 16<<10 {
+		return nil, nil, errors.New("invalid blob metadata")
+	}
+	return clean, data, nil
+}
 
 // Service implements the blob ConnectRPC API.
 type Service struct {
@@ -122,8 +141,12 @@ func (s Service) CreateUpload(ctx context.Context, req *connect.Request[lutrav1.
 	if _, _, err := mime.ParseMediaType(mimeType); err != nil {
 		return nil, connect.NewError(connect.CodeInvalidArgument, errors.New("invalid MIME type"))
 	}
+	metadata, metadataJSON, err := uploadMetadata(msg.GetMetadata())
+	if err != nil {
+		return nil, connect.NewError(connect.CodeInvalidArgument, err)
+	}
 	queries := db.New(s.DB)
-	_, err := queries.GetBlobBySHA256(ctx, digest)
+	_, err = queries.GetBlobBySHA256(ctx, digest)
 	if err == nil {
 		return connect.NewResponse(&lutrav1.CreateUploadResponse{AlreadyExists: true}), nil
 	}
@@ -143,7 +166,7 @@ func (s Service) CreateUpload(ctx context.Context, req *connect.Request[lutrav1.
 	multipart := pgtype.Text{}
 	if size > partSize {
 		parts = partCount(size)
-		uploadID, err := s.Store.NewMultipartUpload(ctx, s.Bucket, key, minio.PutObjectOptions{ContentType: mimeType})
+		uploadID, err := s.Store.NewMultipartUpload(ctx, s.Bucket, key, minio.PutObjectOptions{ContentType: mimeType, UserMetadata: metadata})
 		if err != nil {
 			return nil, connect.NewError(connect.CodeUnavailable, err)
 		}
@@ -151,7 +174,7 @@ func (s Service) CreateUpload(ctx context.Context, req *connect.Request[lutrav1.
 	}
 	err = queries.CreateBlobUpload(ctx, db.CreateBlobUploadParams{
 		SessionID: id, Sha256: digest, ObjectKey: objectID,
-		Size: size, MimeType: mimeType, MultipartID: multipart,
+		Size: size, MimeType: mimeType, Metadata: metadataJSON, MultipartID: multipart,
 	})
 	if err != nil {
 		if multipart.Valid {
@@ -199,10 +222,17 @@ func (s Service) PresignPart(ctx context.Context, req *connect.Request[lutrav1.P
 		params := url.Values{"partNumber": {strconv.Itoa(int(number))}, "uploadId": {session.MultipartID.String}}
 		signed, err = s.Signer.Presign(ctx, http.MethodPut, s.Bucket, ObjectKey(session.ObjectKey), urlLifetime, params)
 	} else {
+		var metadata map[string]string
+		if err := json.Unmarshal(session.Metadata, &metadata); err != nil {
+			return nil, connect.NewError(connect.CodeInternal, errors.New("invalid stored blob metadata"))
+		}
 		header := http.Header{
 			"If-None-Match":         {"*"},
 			"Content-Type":          {session.MimeType},
 			"x-amz-checksum-sha256": {base64.StdEncoding.EncodeToString(session.Sha256)},
+		}
+		for key, value := range metadata {
+			header.Set("X-Amz-Meta-"+key, value)
 		}
 		headers = make(map[string]string, len(header))
 		for key, values := range header {

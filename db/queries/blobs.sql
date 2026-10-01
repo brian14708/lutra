@@ -2,8 +2,8 @@
 SELECT * FROM lutra.blobs WHERE sha256 = $1;
 
 -- name: CreateBlobUpload :exec
-INSERT INTO lutra.blob_uploads (session_id, sha256, object_key, size, mime_type, multipart_id)
-VALUES ($1, $2, $3, $4, $5, $6);
+INSERT INTO lutra.blob_uploads (session_id, sha256, object_key, size, mime_type, metadata, multipart_id)
+VALUES ($1, $2, $3, $4, $5, $6, $7);
 
 -- name: GetBlobUpload :one
 SELECT * FROM lutra.blob_uploads WHERE session_id = $1 AND expires_at > now();

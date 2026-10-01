@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import tempfile
 from contextlib import suppress
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import httpx
@@ -16,6 +18,7 @@ from lutra._gen.lutra.v1.blob_pb import (
     CreateUploadRequest,
     PresignPartRequest,
 )
+from lutra.archive import create_archive, zstd_chunked_manifest_metadata
 
 if TYPE_CHECKING:
     from lutra._gen.lutra.v1.blob_connect import BlobServiceClient
@@ -59,11 +62,19 @@ async def _upload(
         return completed.uri
 
 
-async def upload_blob(client: BlobServiceClient, contents: bytes, mime_type: str) -> str:
+async def upload_blob(
+    client: BlobServiceClient,
+    contents: bytes,
+    mime_type: str,
+    *,
+    metadata: dict[str, str] | None = None,
+) -> str:
     digest = hashlib.sha256(contents).digest()
     uri = f"blob:{mime_type},{base64.b64encode(digest).decode('ascii')}"
     created = await client.create_upload(
-        CreateUploadRequest(content_sha256=digest, size=len(contents), mime_type=mime_type)
+        CreateUploadRequest(
+            content_sha256=digest, size=len(contents), mime_type=mime_type, metadata=metadata or {}
+        )
     )
     if created.already_exists:
         return uri
@@ -74,3 +85,28 @@ async def upload_blob(client: BlobServiceClient, contents: bytes, mime_type: str
         msg = "blob service returned a different URI"
         raise ValueError(msg)
     return uri
+
+
+async def upload_directory(client: BlobServiceClient, directory: Path, *, prefix: str = "") -> str:
+    """Create and upload a deterministic zstd archive for a directory.
+
+    Returns:
+        The content-addressed blob URI.
+
+    Raises:
+        ValueError: If directory is not a real directory.
+
+    """
+    directory = Path(directory)
+    if not directory.is_dir() or directory.is_symlink():
+        message = "upload directory must be a real directory"
+        raise ValueError(message)
+    with tempfile.TemporaryDirectory() as temporary:
+        archive = Path(temporary) / "archive.tar.zst"
+        create_archive(directory, archive, prefix=prefix)
+        return await upload_blob(
+            client,
+            archive.read_bytes(),
+            "application/x-tar+zstd",
+            metadata=zstd_chunked_manifest_metadata(archive),
+        )

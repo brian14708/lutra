@@ -13,6 +13,7 @@ CREATE TABLE lutra.blob_uploads (
     object_key uuid NOT NULL UNIQUE,
     size bigint NOT NULL CHECK (size >= 0),
     mime_type text NOT NULL,
+    metadata jsonb NOT NULL DEFAULT '{}'::jsonb,
     multipart_id text,
     created_at timestamptz NOT NULL DEFAULT now(),
     expires_at timestamptz NOT NULL DEFAULT now() + interval '24 hours'
