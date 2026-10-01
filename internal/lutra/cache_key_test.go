@@ -20,7 +20,7 @@ func TestTaskCacheKeyContract(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	row := db.LoadRunGraphRow{EnvironmentSpec: encoded, EnvironmentName: "work", EntrypointID: 1, Provider: "local", Version: "registration-a", NamespaceID: uuid.New()}
+	row := db.LoadRunTasksRow{EnvironmentSpec: encoded, EnvironmentName: "work", EntrypointID: 1, Provider: "local", Version: "registration-a", NamespaceID: uuid.New()}
 	spec := &lutrav1.ActionSpec{Cache: true, InputCbor: []byte{0x82, 0x80, 0xa0}, DependencyDigest: bytes.Repeat([]byte{7}, 32)}
 	baseline := cacheKey(row, spec)
 	if len(baseline) != 32 {

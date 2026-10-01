@@ -147,11 +147,7 @@ func (s *Subscription) Run(ctx context.Context, cursors []Cursor, send func(*lut
 					break
 				}
 				if row.Seq.Valid {
-					value, err := s.service.rowValue(ctx, row.ValueCbor, row.ValueUri)
-					if err != nil {
-						return err
-					}
-					err = send(&lutrav1.TailResponse{Stream: c.Stream, Seq: row.Seq.Int64, Key: row.Key, ValueCbor: value, CreatedUnixNanos: row.CreatedAt.Time.UnixNano()})
+					err = send(&lutrav1.TailResponse{Stream: c.Stream, Seq: row.Seq.Int64, Key: row.Key, ValueCbor: row.ValueCbor, CreatedUnixNanos: row.CreatedAt.Time.UnixNano()})
 					if err != nil && !errors.Is(err, ErrStop) {
 						return err
 					}

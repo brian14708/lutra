@@ -8,7 +8,6 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"errors"
-	"io"
 	"regexp"
 	"time"
 
@@ -19,7 +18,6 @@ import (
 	"github.com/fxamacker/cbor/v2"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/minio/minio-go/v7"
 )
@@ -253,16 +251,18 @@ func (s Service) AppendTx(ctx context.Context, tx pgx.Tx, runID uuid.UUID, strea
 			key = []byte{}
 		}
 		valueCbor := value
-		valueURI := pgtype.Text{}
 		if len(value) > inlineLimit && s.Store != nil && s.Bucket != "" {
 			uri, uploadErr := s.storeValue(ctx, tx, value)
 			if uploadErr != nil {
 				return nil, uploadErr
 			}
-			valueCbor = nil
-			valueURI = pgtype.Text{String: uri, Valid: true}
+			var err error
+			valueCbor, err = cbor.Marshal(cbor.Tag{Number: 32, Content: uri})
+			if err != nil {
+				return nil, internal(err)
+			}
 		}
-		if err := queries.InsertLogRecord(ctx, db.InsertLogRecordParams{RunID: runID, Stream: stream, Seq: first + int64(i), Key: key, ValueCbor: valueCbor, ValueUri: valueURI, PayloadSize: int64(len(value))}); err != nil {
+		if err := queries.InsertLogRecord(ctx, db.InsertLogRecordParams{RunID: runID, Stream: stream, Seq: first + int64(i), Key: key, ValueCbor: valueCbor}); err != nil {
 			return nil, internal(err)
 		}
 	}
@@ -301,7 +301,7 @@ func (s Service) storeValue(ctx context.Context, tx pgx.Tx, value []byte) (strin
 }
 
 func blobURI(digest []byte) string {
-	return "blob:" + logValueMIME + "," + base64.StdEncoding.EncodeToString(digest)
+	return "blob:" + logValueMIME + ";resolve," + base64.StdEncoding.EncodeToString(digest)
 }
 
 func (s Service) Read(ctx context.Context, req *connect.Request[lutrav1.ReadRequest]) (*connect.Response[lutrav1.ReadResponse], error) {
@@ -336,44 +336,9 @@ func (s Service) Read(ctx context.Context, req *connect.Request[lutrav1.ReadRequ
 	}
 	records := make([]*lutrav1.LogRecord, 0, len(rows))
 	for _, row := range rows {
-		value, err := s.rowValue(ctx, row.ValueCbor, row.ValueUri)
-		if err != nil {
-			return nil, err
-		}
-		records = append(records, &lutrav1.LogRecord{Stream: row.Stream, Seq: row.Seq, Key: row.Key, ValueCbor: value, CreatedUnixNanos: row.CreatedAt.Time.UnixNano()})
+		records = append(records, &lutrav1.LogRecord{Stream: row.Stream, Seq: row.Seq, Key: row.Key, ValueCbor: row.ValueCbor, CreatedUnixNanos: row.CreatedAt.Time.UnixNano()})
 	}
 	return connect.NewResponse(&lutrav1.ReadResponse{Records: records, Truncated: truncated}), nil
-}
-
-func (s Service) rowValue(ctx context.Context, inline []byte, uri pgtype.Text) ([]byte, error) {
-	if len(inline) != 0 {
-		return inline, nil
-	}
-	if !uri.Valid || s.Store == nil || s.Bucket == "" {
-		return nil, unavailable(errors.New("log blob store unavailable"))
-	}
-	digest, mimeType, err := blob.ParseURI(uri.String)
-	if err != nil || mimeType != logValueMIME {
-		return nil, internal(errors.New("invalid log blob URI"))
-	}
-	entry, err := db.New(s.DB).GetBlobBySHA256(ctx, digest)
-	if err != nil {
-		return nil, unavailable(err)
-	}
-	reader, _, _, err := s.Store.GetObject(ctx, s.Bucket, blob.ObjectKey(entry.ObjectKey), minio.GetObjectOptions{})
-	if err != nil {
-		return nil, unavailable(err)
-	}
-	defer func() { _ = reader.Close() }()
-	_, maxRecord, _ := s.limits()
-	value, err := io.ReadAll(io.LimitReader(reader, int64(maxRecord)+1))
-	if err != nil {
-		return nil, unavailable(err)
-	}
-	if len(value) > maxRecord {
-		return nil, connect.NewError(connect.CodeResourceExhausted, errors.New("log blob exceeds record limit"))
-	}
-	return value, nil
 }
 
 func (s Service) Tail(ctx context.Context, req *connect.Request[lutrav1.TailRequest], stream *connect.ServerStream[lutrav1.TailResponse]) error {

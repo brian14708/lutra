@@ -14,8 +14,8 @@ import (
 	lutrav1 "github.com/brian14708/lutra/gen/lutra/v1"
 	"github.com/brian14708/lutra/internal/blob"
 	"github.com/brian14708/lutra/internal/db"
-	"github.com/brian14708/lutra/internal/graphexec"
 	"github.com/brian14708/lutra/internal/runlog"
+	"github.com/brian14708/lutra/internal/tasktree"
 	"github.com/fxamacker/cbor/v2"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -34,12 +34,12 @@ const localTaskImage = "local-python"
 type taskContextKey struct{}
 
 type taskContext struct {
-	runID    uuid.UUID
-	actionID uuid.UUID
-	token    uuid.UUID
-	attempt  int32
-	graph    *graphexec.Executor
-	add      func(context.Context, uuid.UUID) error
+	runID       uuid.UUID
+	actionID    uuid.UUID
+	token       uuid.UUID
+	attempt     int32
+	coordinator *tasktree.Coordinator
+	add         func(context.Context, uuid.UUID) error
 }
 
 func sourceURI(digest []byte) string {
@@ -233,7 +233,7 @@ func (s Service) CreateTaskAction(ctx context.Context, req *connect.Request[lutr
 		return nil, connect.NewError(connect.CodePermissionDenied, errors.New("child environment is not a declared dependency"))
 	}
 	key := pgtype.Text{String: req.Msg.GetIdempotencyKey(), Valid: true}
-	existing, lookupErr := q.GetTaskActionByIdempotency(ctx, db.GetTaskActionByIdempotencyParams{RunID: active.runID, IdempotencyKey: key})
+	existing, lookupErr := q.GetTaskActionByIdempotency(ctx, db.GetTaskActionByIdempotencyParams{RunID: active.runID, CallerActionID: &active.actionID, IdempotencyKey: key})
 	var actionID uuid.UUID
 	if lookupErr == nil {
 		if existing.CallerActionID == nil || *existing.CallerActionID != active.actionID || existing.EnvironmentID != environment.ID || existing.EntrypointID != int64(req.Msg.GetEntrypointId()) || !bytes.Equal(existing.ActionSpec, storedSpec) {
@@ -249,7 +249,7 @@ func (s Service) CreateTaskAction(ctx context.Context, req *connect.Request[lutr
 		}
 		actionID, err = q.InsertTaskAction(ctx, db.InsertTaskActionParams{ID: actionID, RunID: active.runID, CallerActionID: &active.actionID, EnvironmentID: environment.ID, EntrypointID: int64(req.Msg.GetEntrypointId()), ActionSpec: storedSpec, IdempotencyKey: key})
 		if errors.Is(err, pgx.ErrNoRows) {
-			existing, lookupErr = q.GetTaskActionByIdempotency(ctx, db.GetTaskActionByIdempotencyParams{RunID: active.runID, IdempotencyKey: key})
+			existing, lookupErr = q.GetTaskActionByIdempotency(ctx, db.GetTaskActionByIdempotencyParams{RunID: active.runID, CallerActionID: &active.actionID, IdempotencyKey: key})
 			if lookupErr != nil || existing.CallerActionID == nil || *existing.CallerActionID != active.actionID || existing.EnvironmentID != environment.ID || existing.EntrypointID != int64(req.Msg.GetEntrypointId()) || !bytes.Equal(existing.ActionSpec, storedSpec) {
 				return nil, invalidTask("idempotency key already belongs to a different action")
 			}
@@ -263,14 +263,11 @@ func (s Service) CreateTaskAction(ctx context.Context, req *connect.Request[lutr
 			}
 		}
 	}
-	if err := q.InsertTaskActionEdge(ctx, db.InsertTaskActionEdgeParams{RunID: active.runID, SourceActionID: actionID, DependentActionID: active.actionID}); err != nil {
-		return nil, err
-	}
 	if err := tx.Commit(ctx); err != nil {
 		return nil, err
 	}
 	if active.add == nil {
-		return nil, invalidTask("run graph is unavailable")
+		return nil, invalidTask("run coordinator is unavailable")
 	}
 	if err := active.add(ctx, actionID); err != nil {
 		return nil, err
@@ -315,11 +312,7 @@ func (s Service) readTaskAction(ctx context.Context, id uuid.UUID) (*lutrav1.Tas
 	if err != nil {
 		return nil, connect.NewError(connect.CodeInternal, err)
 	}
-	upstream, err := db.New(s.DB).ListActionUpstreams(ctx, db.ListActionUpstreamsParams{RunID: row.RunID, ActionIds: []uuid.UUID{row.ID}})
-	if err != nil {
-		return nil, err
-	}
-	return actionFromRow(actionRowFromRead(row), upstream)
+	return actionFromRow(actionRowFromRead(row))
 }
 
 type actionRow struct {
@@ -335,7 +328,7 @@ type actionRow struct {
 	CreatedAt, UpdatedAt                    pgtype.Timestamptz
 }
 
-func actionFromRow(row actionRow, upstream []db.ListActionUpstreamsRow) (*lutrav1.TaskAction, error) {
+func actionFromRow(row actionRow) (*lutrav1.TaskAction, error) {
 	var spec lutrav1.ActionSpec
 	if err := proto.Unmarshal(row.ActionSpec, &spec); err != nil {
 		return nil, err
@@ -343,11 +336,6 @@ func actionFromRow(row actionRow, upstream []db.ListActionUpstreamsRow) (*lutrav
 	action := &lutrav1.TaskAction{Id: row.ID.String(), RunId: row.RunID.String(), Environment: environmentIdentifier(row.NamespaceID, row.EnvironmentName, row.Version), EntrypointId: uint32(row.EntrypointID), ActionSpec: &spec, OutputCbor: row.OutputCbor, Status: row.Status, Error: row.Error, Attempts: row.Attempts, CreatedAt: formatTime(row.CreatedAt), UpdatedAt: formatTime(row.UpdatedAt)}
 	if row.CallerActionID != nil {
 		action.CallerActionId = row.CallerActionID.String()
-	}
-	for _, edge := range upstream {
-		if edge.DependentActionID == row.ID {
-			action.UpstreamActionIds = append(action.UpstreamActionIds, edge.SourceActionID.String())
-		}
 	}
 	return action, nil
 }
@@ -401,11 +389,11 @@ func (s Service) GetTaskAction(ctx context.Context, req *connect.Request[lutrav1
 		if !ok {
 			return nil, invalidTask("waiting is only available inside a task")
 		}
-		if active.graph == nil {
-			return nil, invalidTask("run graph is unavailable")
+		if active.coordinator == nil {
+			return nil, invalidTask("run coordinator is unavailable")
 		}
-		if _, err := active.graph.Wait(ctx, active.actionID, active.attempt, id); err != nil {
-			node, lookupErr := active.graph.Get(ctx, id)
+		if _, err := active.coordinator.Wait(ctx, active.actionID, active.attempt, id); err != nil {
+			node, lookupErr := active.coordinator.Get(ctx, id)
 			if lookupErr != nil || !node.State.Terminal() {
 				return nil, err
 			}
@@ -463,16 +451,8 @@ func (s Service) ListTaskActions(ctx context.Context, req *connect.Request[lutra
 		rows = rows[:pageSize]
 	}
 	response := &lutrav1.ListTaskActionsResponse{}
-	ids := make([]uuid.UUID, 0, len(rows))
 	for _, row := range rows {
-		ids = append(ids, row.ID)
-	}
-	upstream, err := q.ListActionUpstreams(ctx, db.ListActionUpstreamsParams{RunID: runID, ActionIds: ids})
-	if err != nil {
-		return nil, err
-	}
-	for _, row := range rows {
-		action, err := actionFromRow(row, upstream)
+		action, err := actionFromRow(row)
 		if err != nil {
 			return nil, err
 		}
@@ -509,6 +489,9 @@ func (s Service) CancelRun(ctx context.Context, req *connect.Request[lutrav1.Can
 		}
 	}
 	if _, err := q.ClearRunClaim(ctx, id); err != nil {
+		return nil, err
+	}
+	if _, err := tx.Exec(ctx, "SELECT pg_notify('lutra_run_cancel', $1)", id.String()); err != nil {
 		return nil, err
 	}
 	if err := tx.Commit(ctx); err != nil {

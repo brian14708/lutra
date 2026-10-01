@@ -4,12 +4,116 @@ import (
 	"context"
 	"crypto/rand"
 	"errors"
+	"fmt"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/brian14708/lutra/internal/db"
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
+
+func TestCacheLeaseCannotPublishAfterTransactionDeadline(t *testing.T) {
+	service, pool := databaseService(t)
+	ctx := context.Background()
+	_, lease, err := service.Acquire(ctx, testKey(t, KindTaskResult))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = lease.Release(ctx) }()
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := tx.Exec(ctx, "UPDATE lutra.cache_entries SET lease_until = transaction_timestamp() + interval '20 milliseconds' WHERE id = $1", lease.id); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(ctx, "SELECT pg_sleep(0.05)"); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := db.New(tx).CompleteCacheEntry(ctx, db.CompleteCacheEntryParams{ID: lease.id, ClaimToken: lease.token, ResultCbor: []byte{0xf6}})
+	if err != nil || rows != 0 {
+		t.Fatalf("expired cache lease published in old transaction: rows=%d, err=%v", rows, err)
+	}
+}
+
+func TestPinnedWaiterReclaimsDatabaseExpiredGeneration(t *testing.T) {
+	for _, kind := range []Kind{KindTaskResult, KindImage} {
+		t.Run(map[Kind]string{KindTaskResult: "task", KindImage: "image"}[kind], func(t *testing.T) {
+			_, admin := databaseService(t)
+			ctx := context.Background()
+			schema := "cache_clock_" + strings.ReplaceAll(uuid.NewString(), "-", "")
+			if _, err := admin.Exec(ctx, fmt.Sprintf(`
+CREATE SCHEMA %[1]s;
+CREATE TABLE %[1]s.clock (offset_seconds integer NOT NULL, reads integer NOT NULL);
+INSERT INTO %[1]s.clock VALUES (0, 0);
+CREATE FUNCTION %[1]s.clock_timestamp() RETURNS timestamptz LANGUAGE plpgsql VOLATILE AS $$
+DECLARE offset_value integer;
+BEGIN
+    UPDATE %[1]s.clock SET reads = reads + 1 RETURNING offset_seconds INTO offset_value;
+    RETURN pg_catalog.clock_timestamp() + offset_value * interval '1 second';
+END $$;
+CREATE FUNCTION %[1]s.now() RETURNS timestamptz LANGUAGE sql VOLATILE AS $$
+    SELECT %[1]s.clock_timestamp()
+$$;`, schema)); err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _, _ = admin.Exec(context.Background(), "DROP SCHEMA "+schema+" CASCADE") })
+			config, err := pgxpool.ParseConfig(os.Getenv("LUTRA_TEST_DATABASE_URL"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			config.ConnConfig.RuntimeParams["search_path"] = schema + ",pg_catalog"
+			pool, err := pgxpool.NewWithConfig(ctx, config)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(pool.Close)
+			service := New(pool)
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+			key := testKey(t, kind)
+			_, first, err := service.Acquire(ctx, key)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = first.Release(ctx) }()
+			if _, err := admin.Exec(ctx, "UPDATE "+schema+".clock SET reads = 0"); err != nil {
+				t.Fatal(err)
+			}
+			type acquired struct {
+				lease *Lease
+				err   error
+			}
+			wait := make(chan acquired, 1)
+			go func() { _, next, err := service.Acquire(ctx, key); wait <- acquired{next, err} }()
+			for {
+				var reads int
+				if err := admin.QueryRow(ctx, "SELECT reads FROM "+schema+".clock").Scan(&reads); err != nil {
+					t.Fatal(err)
+				}
+				if reads > 0 {
+					break
+				}
+				time.Sleep(time.Millisecond)
+			}
+			// The waiter has checked expiry at offset zero. Advance only database time.
+			if _, err := admin.Exec(ctx, "UPDATE "+schema+".clock SET offset_seconds = 3600"); err != nil {
+				t.Fatal(err)
+			}
+			result := <-wait
+			if result.err != nil || result.lease == nil || result.lease.id == first.id {
+				t.Fatalf("waiter did not reclaim expired generation: %v, %v", result.lease, result.err)
+			}
+			if err := result.lease.Release(ctx); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
 
 func databaseService(t *testing.T) (*Service, *pgxpool.Pool) {
 	t.Helper()

@@ -94,6 +94,7 @@ message CreateTaskActionRequest {
   EnvironmentIdentifier environment = 1;
   uint32 entrypoint_id = 2;
   ActionSpec action_spec = 3;
+  // Stable within the parent task across retries and replay.
   string idempotency_key = 4;
 }
 message CreateTaskActionResponse {
@@ -175,6 +176,6 @@ message TaskAction {
   int32 attempts = 9;
   string created_at = 10;
   string updated_at = 11;
-  repeated string upstream_action_ids = 12;
+  reserved 12;
   uint32 entrypoint_id = 13;
 }

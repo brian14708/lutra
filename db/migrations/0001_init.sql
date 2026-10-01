@@ -15,7 +15,6 @@ CREATE TABLE lutra.blob_uploads (
     mime_type text NOT NULL,
     metadata jsonb NOT NULL DEFAULT '{}'::jsonb,
     multipart_id text,
-    created_at timestamptz NOT NULL DEFAULT now(),
     expires_at timestamptz NOT NULL DEFAULT now() + interval '24 hours'
 );
 CREATE INDEX blob_uploads_expiry_idx ON lutra.blob_uploads (expires_at);
@@ -45,7 +44,6 @@ CREATE TABLE lutra.task_environments (
     provider text NOT NULL,
     spec bytea NOT NULL,
     image_key bytea NOT NULL CHECK (length(image_key) = 32),
-    created_at timestamptz NOT NULL DEFAULT now(),
     UNIQUE (namespace_id, name, version)
 );
 
@@ -58,15 +56,12 @@ CREATE TABLE lutra.cache_entries (
     claim_token uuid NOT NULL,
     lease_until timestamptz NOT NULL,
     result_cbor bytea,
-    created_at timestamptz NOT NULL DEFAULT now(),
-    updated_at timestamptz NOT NULL DEFAULT now(),
     CHECK (
         (status = 'building' AND result_cbor IS NULL)
         OR (status IN ('ready', 'failed') AND result_cbor IS NOT NULL)
     )
 );
 CREATE UNIQUE INDEX cache_active_idx ON lutra.cache_entries (key) WHERE status IN ('building', 'ready');
-CREATE INDEX cache_lease_idx ON lutra.cache_entries (lease_until) WHERE status = 'building';
 
 CREATE TYPE lutra.task_action_status AS ENUM ('queued', 'running', 'waiting', 'succeeded', 'failed', 'canceled');
 
@@ -77,7 +72,6 @@ CREATE TABLE lutra.runs (
     root_idempotency_key text,
     claim_token uuid,
     lease_until timestamptz,
-    attempts integer NOT NULL DEFAULT 0,
     created_at timestamptz NOT NULL DEFAULT now()
 );
 CREATE UNIQUE INDEX runs_idempotency_idx ON lutra.runs (namespace_id, root_idempotency_key) WHERE root_idempotency_key IS NOT NULL;
@@ -103,30 +97,17 @@ CREATE TABLE lutra.task_actions (
     UNIQUE (run_id, id)
 );
 CREATE UNIQUE INDEX task_actions_one_root_idx ON lutra.task_actions (run_id) WHERE caller_action_id IS NULL;
-CREATE UNIQUE INDEX task_actions_idempotency_idx ON lutra.task_actions (run_id, idempotency_key) WHERE idempotency_key IS NOT NULL;
-CREATE INDEX task_actions_run_caller_idx ON lutra.task_actions (run_id, caller_action_id, created_at, id);
+CREATE UNIQUE INDEX task_actions_idempotency_idx ON lutra.task_actions (run_id, caller_action_id, idempotency_key) WHERE idempotency_key IS NOT NULL;
+CREATE INDEX task_actions_run_order_idx ON lutra.task_actions (run_id, created_at, id);
 
 ALTER TABLE lutra.runs
     ADD COLUMN root_action_id uuid,
     ADD CONSTRAINT runs_root_action_fk FOREIGN KEY (id, root_action_id) REFERENCES lutra.task_actions(run_id, id) DEFERRABLE INITIALLY DEFERRED;
 
-CREATE TABLE lutra.task_action_edges (
-    run_id uuid NOT NULL REFERENCES lutra.runs(id) ON DELETE CASCADE,
-    source_action_id uuid NOT NULL,
-    dependent_action_id uuid NOT NULL,
-    PRIMARY KEY (run_id, source_action_id, dependent_action_id),
-    CHECK (source_action_id <> dependent_action_id),
-    FOREIGN KEY (run_id, source_action_id) REFERENCES lutra.task_actions(run_id, id) ON DELETE CASCADE,
-    FOREIGN KEY (run_id, dependent_action_id) REFERENCES lutra.task_actions(run_id, id) ON DELETE CASCADE
-);
-CREATE INDEX task_action_edges_dependent_idx ON lutra.task_action_edges (run_id, dependent_action_id);
-
 CREATE TABLE lutra.run_log_streams (
     run_id uuid NOT NULL REFERENCES lutra.runs(id) ON DELETE CASCADE,
     stream text NOT NULL CHECK (stream ~ '^[a-zA-Z_][a-zA-Z0-9_.-]{0,127}$'),
     next_seq bigint NOT NULL DEFAULT 1 CHECK (next_seq >= 1),
-    created_at timestamptz NOT NULL DEFAULT now(),
-    updated_at timestamptz NOT NULL DEFAULT now(),
     PRIMARY KEY (run_id, stream)
 );
 
@@ -137,7 +118,6 @@ CREATE TABLE lutra.run_log_appends (
     batch_digest bytea NOT NULL CHECK (length(batch_digest) = 32),
     first_seq bigint NOT NULL CHECK (first_seq >= 1),
     last_seq bigint NOT NULL CHECK (last_seq >= first_seq),
-    created_at timestamptz NOT NULL DEFAULT now(),
     PRIMARY KEY (run_id, stream, append_id),
     FOREIGN KEY (run_id, stream) REFERENCES lutra.run_log_streams(run_id, stream) ON DELETE CASCADE
 );
@@ -147,13 +127,10 @@ CREATE TABLE lutra.run_log_records (
     stream text NOT NULL,
     seq bigint NOT NULL CHECK (seq >= 1),
     key bytea NOT NULL CHECK (length(key) <= 1024),
-    value_cbor bytea,
-    value_uri text,
-    payload_size bigint NOT NULL CHECK (payload_size > 0),
+    value_cbor bytea NOT NULL CHECK (length(value_cbor) > 0),
     created_at timestamptz NOT NULL DEFAULT now(),
     PRIMARY KEY (run_id, stream, seq),
-    FOREIGN KEY (run_id, stream) REFERENCES lutra.run_log_streams(run_id, stream) ON DELETE CASCADE,
-    CHECK ((value_cbor IS NOT NULL) <> (value_uri IS NOT NULL))
+    FOREIGN KEY (run_id, stream) REFERENCES lutra.run_log_streams(run_id, stream) ON DELETE CASCADE
 );
 CREATE INDEX run_log_records_key_idx ON lutra.run_log_records (run_id, stream, key, seq);
 
@@ -161,7 +138,6 @@ CREATE INDEX run_log_records_key_idx ON lutra.run_log_records (run_id, stream, k
 DROP TABLE IF EXISTS lutra.run_log_records;
 DROP TABLE IF EXISTS lutra.run_log_appends;
 DROP TABLE IF EXISTS lutra.run_log_streams;
-DROP TABLE IF EXISTS lutra.task_action_edges;
 ALTER TABLE IF EXISTS lutra.runs DROP CONSTRAINT IF EXISTS runs_root_action_fk;
 DROP TABLE IF EXISTS lutra.task_actions;
 DROP TABLE IF EXISTS lutra.runs;

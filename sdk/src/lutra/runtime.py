@@ -1,12 +1,11 @@
-"""Runtime context used by task bodies for nested submissions."""
+"""Child tasks submitted by a running task."""
 
 from __future__ import annotations
 
 import asyncio
 from contextvars import ContextVar
-from dataclasses import dataclass, field
-from itertools import count
-from typing import TYPE_CHECKING, TypeVar
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Generic, TypeVar, cast
 
 import pyqwest
 from connectrpc.codec import proto_json_codec
@@ -23,36 +22,78 @@ from lutra.task import CacheableError, normalize_retry
 from lutra.value import loads
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
-
     from lutra.task import Invocation
 
 R = TypeVar("R")
+_MAX_CHILD_KEY_BYTES = 200
+_CACHEABLE_FAILURE_FIELDS = 3
 
 
 @dataclass
 class RunContext:
-    """Context needed to submit child actions from a running task."""
+    """Context needed to submit child tasks from a running task."""
 
     api_client: TaskAPIClient
     environments: dict[str, EnvironmentIdentifier]
     run_id: str
     action_id: str
-    child_numbers: Iterator[int] = field(default_factory=lambda: count(1))
 
 
 run_context: ContextVar[RunContext] = ContextVar("lutra_run")
 
 
-async def run(invocation: Invocation[R], *, max_attempts: int | None = None) -> R:
-    """Submit a child task invocation through the current task host.
+@dataclass(frozen=True)
+class ChildHandle(Generic[R]):
+    """A committed child that can be awaited independently of other children."""
+
+    id: str
+    client: LutraServiceClient
+    api_client: TaskAPIClient
+
+    async def result(self) -> R:
+        """Wait for and decode this child's result.
+
+        Returns:
+            The decoded result.
+
+        Raises:
+            CacheableError: If the child returns a deterministic typed failure.
+            RuntimeError: If the server omits the action or the child fails.
+
+        """
+        while True:
+            state = (
+                await self.client.get_task_action(GetTaskActionRequest(id=self.id, wait=True))
+            ).action
+            if state is None:
+                message = "server returned no task action"
+                raise RuntimeError(message)
+            if state.status == "succeeded":
+                return cast("R", await loads(state.output_cbor, self.api_client.resolve_blob))
+            if state.status in {"failed", "canceled"}:
+                if state.status == "failed" and state.output_cbor:
+                    failure = await loads(state.output_cbor, self.api_client.resolve_blob)
+                    if (
+                        isinstance(failure, list)
+                        and len(failure) == _CACHEABLE_FAILURE_FIELDS
+                        and failure[0] == "lutra.cacheable-error.v1"
+                    ):
+                        raise CacheableError(failure[1], failure[2])
+                raise RuntimeError(state.error or f"child {state.status}")
+            await asyncio.sleep(0)
+
+
+async def spawn(
+    invocation: Invocation[R], *, key: str, max_attempts: int | None = None
+) -> ChildHandle[R]:
+    """Commit a child with a stable key scoped to the current parent task.
 
     Returns:
-        The decoded child task result.
+        A handle for independent waits.
 
     Raises:
-        CacheableError: If the child returns a deterministic typed failure.
-        RuntimeError: If no active task exists or the child task fails.
+        RuntimeError: If no task is active or the environment is not registered.
+        ValueError: If the key is empty or exceeds 200 UTF-8 bytes.
 
     """
     try:
@@ -60,48 +101,40 @@ async def run(invocation: Invocation[R], *, max_attempts: int | None = None) -> 
     except LookupError as exc:
         message = "no active Lutra task"
         raise RuntimeError(message) from exc
-    api_client = context.api_client
+    if not key or len(key.encode()) > _MAX_CHILD_KEY_BYTES:
+        message = "key must be 1 to 200 UTF-8 bytes"
+        raise ValueError(message)
     child = invocation.task
     _, attempts = normalize_retry(
         child.retry, child.max_attempts if max_attempts is None else max_attempts
     )
     environment = context.environments.get(child.environment.name)
     if environment is None:
-        msg = f"environment {child.environment.name!r} is not a registered dependency"
-        raise RuntimeError(msg)
+        message = f"environment {child.environment.name!r} is not a registered dependency"
+        raise RuntimeError(message)
     client = LutraServiceClient(
         "http://stdio",
         codec=proto_json_codec(),
         send_compression=None,
         accept_compression=(),
-        http_client=pyqwest.Client(transport=StdioTransport(api_client)),
+        http_client=pyqwest.Client(transport=StdioTransport(context.api_client)),
     )
     response = await client.create_task_action(
         CreateTaskActionRequest(
             environment=environment,
             entrypoint_id=child.entrypoint_id,
             action_spec=invocation.action_spec(attempts),
-            idempotency_key=f"{context.action_id}:{next(context.child_numbers)}",
+            idempotency_key=key,
         )
     )
-    submitted = _require_action(response.action)
-    while True:
-        state = (
-            await client.get_task_action(GetTaskActionRequest(id=submitted.id, wait=True))
-        ).action
-        if state is None:
-            message = "server returned no task action"
-            raise RuntimeError(message)
-        if state.status == "succeeded":
-            return await loads(state.output_cbor, api_client.resolve_blob)  # type: ignore[bad-return]
-        if state.status in {"failed", "canceled"}:
-            if state.status == "failed" and state.output_cbor:
-                failure = await loads(state.output_cbor, api_client.resolve_blob)
-                if (
-                    isinstance(failure, list)
-                    and len(failure) == len(("lutra.cacheable-error.v1", "", None))
-                    and failure[0] == "lutra.cacheable-error.v1"
-                ):
-                    raise CacheableError(failure[1], failure[2])
-            raise RuntimeError(state.error or f"child {state.status}")
-        await asyncio.sleep(0)
+    return ChildHandle(_require_action(response.action).id, client, context.api_client)
+
+
+async def run(invocation: Invocation[R], *, key: str, max_attempts: int | None = None) -> R:
+    """Submit and wait for one child task.
+
+    Returns:
+        The decoded child result.
+
+    """
+    return await (await spawn(invocation, key=key, max_attempts=max_attempts)).result()

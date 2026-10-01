@@ -5,10 +5,10 @@ import (
 	"errors"
 
 	"github.com/brian14708/lutra/internal/cache"
-	"github.com/brian14708/lutra/internal/graphexec"
+	"github.com/brian14708/lutra/internal/tasktree"
 )
 
-func (d *runDriver) Acquire(ctx context.Context, key []byte) ([]byte, error, graphexec.CacheLease, error) {
+func (d *runDriver) Acquire(ctx context.Context, key []byte) ([]byte, error, tasktree.CacheLease, error) {
 	var digest [32]byte
 	if len(key) != len(digest) {
 		return nil, nil, nil, errors.New("invalid task cache key")

@@ -133,6 +133,14 @@ func (s *Service) Acquire(ctx context.Context, key Key) (Result, *Lease, error) 
 			return nil, nil, err
 		}
 		var entry db.LutraCacheEntry
+		if key.Kind == KindImage {
+			err = q.ExpireCacheClaim(ctx, stored[:])
+		} else {
+			err = q.DeleteExpiredTaskClaim(ctx, stored[:])
+		}
+		if err != nil {
+			return nil, nil, err
+		}
 		if observed != uuid.Nil {
 			entry, err = q.CacheGeneration(ctx, observed)
 			if errors.Is(err, pgx.ErrNoRows) {
@@ -140,14 +148,6 @@ func (s *Service) Acquire(ctx context.Context, key Key) (Result, *Lease, error) 
 				continue
 			}
 		} else {
-			if key.Kind == KindImage {
-				err = q.ExpireCacheClaim(ctx, stored[:])
-			} else {
-				err = q.DeleteExpiredTaskClaim(ctx, stored[:])
-			}
-			if err != nil {
-				return nil, nil, err
-			}
 			entry, err = q.ActiveCacheEntry(ctx, stored[:])
 			if errors.Is(err, pgx.ErrNoRows) {
 				id, idErr := uuid.NewV7()
@@ -204,9 +204,6 @@ func (s *Service) Acquire(ctx context.Context, key Key) (Result, *Lease, error) 
 			observed = uuid.Nil
 		case db.LutraCacheStatusBuilding:
 			observed = entry.ID
-			if !entry.LeaseUntil.Time.After(time.Now()) {
-				observed = uuid.Nil
-			}
 		default:
 			return nil, nil, fmt.Errorf("invalid cache status %q", entry.Status)
 		}

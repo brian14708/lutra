@@ -5,39 +5,39 @@ import (
 	"errors"
 
 	"github.com/brian14708/lutra/internal/db"
-	"github.com/brian14708/lutra/internal/graphexec"
 	"github.com/brian14708/lutra/internal/runlog"
+	"github.com/brian14708/lutra/internal/tasktree"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 var ErrLeaseLost = errors.New("run lease lost")
 
-// graphStore is the narrow SQL adapter used by the in-process graph scheduler.
-// It never reads scheduling state. The executor owns that state in memory.
-type graphStore struct {
+// taskStore persists coordinator transitions.
+// It never reads scheduling state. The coordinator owns that state in memory.
+type taskStore struct {
 	pool *pgxpool.Pool
 	logs runlog.Service
 }
 
-func graphStatus(s graphexec.State) db.LutraTaskActionStatus {
+func taskStatus(s tasktree.State) db.LutraTaskActionStatus {
 	switch s {
-	case graphexec.Running:
+	case tasktree.Running:
 		return db.LutraTaskActionStatusRunning
-	case graphexec.Waiting:
+	case tasktree.Waiting:
 		return db.LutraTaskActionStatusWaiting
-	case graphexec.Done:
+	case tasktree.Done:
 		return db.LutraTaskActionStatusSucceeded
-	case graphexec.Failed:
+	case tasktree.Failed:
 		return db.LutraTaskActionStatusFailed
-	case graphexec.Canceled:
+	case tasktree.Canceled:
 		return db.LutraTaskActionStatusCanceled
 	default:
 		return db.LutraTaskActionStatusQueued
 	}
 }
 
-func (s graphStore) Transition(ctx context.Context, t graphexec.Transition) error {
+func (s taskStore) Transition(ctx context.Context, t tasktree.Transition) error {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return err
@@ -53,7 +53,7 @@ func (s graphStore) Transition(ctx context.Context, t graphexec.Transition) erro
 		next = pgtype.Timestamptz{Time: t.NextAttemptAt, Valid: true}
 	}
 	rows, err := q.TransitionRunTaskAction(ctx, db.TransitionRunTaskActionParams{
-		Status: graphStatus(t.State), Attempt: t.Attempt, Failures: t.Failures,
+		Status: taskStatus(t.State), Attempt: t.Attempt, Failures: t.Failures,
 		OutputCbor: t.Output, Error: t.Error, NextAttemptAt: next,
 		ActionID: t.NodeID, RunID: t.RunID, ClaimToken: t.ClaimToken,
 		ExpectedAttempt: t.ExpectedAttempt,

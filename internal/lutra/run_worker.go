@@ -8,34 +8,40 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"strconv"
 	"sync"
 	"time"
 
 	lutrav1 "github.com/brian14708/lutra/gen/lutra/v1"
 	"github.com/brian14708/lutra/internal/cache"
 	"github.com/brian14708/lutra/internal/db"
-	"github.com/brian14708/lutra/internal/graphexec"
 	"github.com/brian14708/lutra/internal/runlog"
+	"github.com/brian14708/lutra/internal/tasktree"
 	"github.com/fxamacker/cbor/v2"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/minio/minio-go/v7"
 	"google.golang.org/protobuf/proto"
 )
 
 type RunWorker struct {
-	DB                *pgxpool.Pool
-	Capacity, MaxRuns int
-	Logs              runlog.Service
-	Store             *minio.Core
-	Bucket            string
-	TaskAPIHandler    http.Handler
-	slots             graphexec.Slots
-	adapter           *Worker
-	Cache             *cache.Service
-	ctx               context.Context
-	wg                sync.WaitGroup
+	DB                            *pgxpool.Pool
+	Capacity, MaxRuns             int
+	ProcessTarget, ProcessCeiling int
+	Logs                          runlog.Service
+	Store                         *minio.Core
+	Bucket                        string
+	TaskAPIHandler                http.Handler
+	slots                         tasktree.Slots
+	processes                     *tasktree.ProcessPool
+	adapter                       *Worker
+	Cache                         *cache.Service
+	ctx                           context.Context
+	cancelMu                      sync.Mutex
+	owners                        map[uuid.UUID]context.CancelFunc
+	wg                            sync.WaitGroup
 }
 
 func (w *RunWorker) Start(ctx context.Context) {
@@ -46,14 +52,65 @@ func (w *RunWorker) Start(ctx context.Context) {
 		w.MaxRuns = 16
 	}
 	w.ctx = ctx
-	w.slots = graphexec.NewSlots(w.Capacity)
+	w.owners = make(map[uuid.UUID]context.CancelFunc)
+	w.slots = tasktree.NewSlots(w.Capacity)
+	if w.ProcessTarget < 1 {
+		w.ProcessTarget, _ = strconv.Atoi(os.Getenv("LUTRA_WORKER_PROCESS_TARGET"))
+	}
+	if w.ProcessTarget < 1 {
+		w.ProcessTarget = max(4*w.Capacity, w.MaxRuns)
+	}
+	if w.ProcessCeiling < 1 {
+		w.ProcessCeiling, _ = strconv.Atoi(os.Getenv("LUTRA_WORKER_PROCESS_CEILING"))
+	}
+	if w.ProcessCeiling < 1 {
+		w.ProcessCeiling = 4 * w.ProcessTarget
+	}
+	w.processes = tasktree.NewProcessPool(w.ProcessTarget, w.ProcessCeiling)
 	w.Cache = cache.New(w.DB)
 	w.adapter = &Worker{DB: w.DB, Logs: w.Logs, Store: w.Store, Bucket: w.Bucket, TaskAPIHandler: w.TaskAPIHandler, queries: db.New(w.DB), Cache: w.Cache}
 	w.wg.Add(1)
 	go func() { defer w.wg.Done(); w.loop(ctx) }()
+	w.wg.Add(1)
+	go func() { defer w.wg.Done(); w.listenCancels(ctx, nil) }()
 }
 
 func (w *RunWorker) Wait() { w.wg.Wait() }
+
+func (w *RunWorker) listenCancels(ctx context.Context, ready chan<- struct{}) {
+	for ctx.Err() == nil {
+		conn, err := w.DB.Acquire(ctx)
+		if err == nil {
+			_, err = conn.Exec(ctx, "LISTEN lutra_run_cancel")
+			if err == nil && ready != nil {
+				close(ready)
+				ready = nil
+			}
+			for err == nil && ctx.Err() == nil {
+				var notification *pgconn.Notification
+				notification, err = conn.Conn().WaitForNotification(ctx)
+				if err == nil {
+					if id, parseErr := uuid.Parse(notification.Payload); parseErr == nil {
+						w.cancelMu.Lock()
+						cancel := w.owners[id]
+						w.cancelMu.Unlock()
+						if cancel != nil {
+							cancel()
+						}
+					}
+				}
+			}
+			conn.Release()
+		}
+		if ctx.Err() == nil {
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(time.Second):
+			}
+		}
+	}
+}
 
 func (w *RunWorker) loop(ctx context.Context) {
 	owners := make(chan struct{}, w.MaxRuns)
@@ -82,31 +139,31 @@ func (w *RunWorker) loop(ctx context.Context) {
 	}
 }
 
-func graphNode(row db.LoadRunGraphRow) (graphexec.Node, error) {
+func taskNode(row db.LoadRunTasksRow) (tasktree.Node, error) {
 	var spec lutrav1.ActionSpec
 	if err := proto.Unmarshal(row.ActionSpec, &spec); err != nil {
-		return graphexec.Node{}, err
+		return tasktree.Node{}, err
 	}
-	state := graphexec.Pending
+	state := tasktree.Pending
 	switch row.Status {
 	case db.LutraTaskActionStatusSucceeded:
-		state = graphexec.Done
+		state = tasktree.Done
 	case db.LutraTaskActionStatusFailed:
-		state = graphexec.Failed
+		state = tasktree.Failed
 	case db.LutraTaskActionStatusCanceled:
-		state = graphexec.Canceled
+		state = tasktree.Canceled
 	}
 	key := []byte(nil)
 	if spec.GetCache() {
 		key = cacheKey(row, &spec)
 		if len(key) == 0 {
-			return graphexec.Node{}, errors.New("invalid cached task environment")
+			return tasktree.Node{}, errors.New("invalid cached task environment")
 		}
 	}
-	return graphexec.Node{ID: row.ID, ParentID: row.CallerActionID, Attempt: row.Attempts, Failures: row.Failures, MaxAttempts: max(spec.MaxAttempts, 1), State: state, ImageKey: row.ImageKey, CacheKey: key, Output: row.OutputCbor, Error: row.Error, NextAttemptAt: row.NextAttemptAt.Time}, nil
+	return tasktree.Node{ID: row.ID, ParentID: row.CallerActionID, Attempt: row.Attempts, Failures: row.Failures, MaxAttempts: max(spec.MaxAttempts, 1), State: state, ImageKey: row.ImageKey, CacheKey: key, Output: row.OutputCbor, Error: row.Error, NextAttemptAt: row.NextAttemptAt.Time}, nil
 }
 
-func cacheKey(row db.LoadRunGraphRow, spec *lutrav1.ActionSpec) []byte {
+func cacheKey(row db.LoadRunTasksRow, spec *lutrav1.ActionSpec) []byte {
 	var environment lutrav1.EnvironmentSpec
 	if err := proto.Unmarshal(row.EnvironmentSpec, &environment); err != nil {
 		return nil
@@ -160,7 +217,7 @@ func cacheKey(row db.LoadRunGraphRow, spec *lutrav1.ActionSpec) []byte {
 	return h.Sum(nil)
 }
 
-func environmentExecution(row db.LoadRunGraphRow, runID uuid.UUID, attempt int32) (*EnvironmentExecution, error) {
+func environmentExecution(row db.LoadRunTasksRow, runID uuid.UUID, attempt int32) (*EnvironmentExecution, error) {
 	var spec lutrav1.EnvironmentSpec
 	var action lutrav1.ActionSpec
 	if err := proto.Unmarshal(row.EnvironmentSpec, &spec); err != nil {
@@ -180,6 +237,14 @@ func environmentExecution(row db.LoadRunGraphRow, runID uuid.UUID, attempt int32
 func (w *RunWorker) drive(parent context.Context, runID, token uuid.UUID) {
 	ctx, cancel := context.WithCancel(parent)
 	defer cancel()
+	w.cancelMu.Lock()
+	w.owners[runID] = cancel
+	w.cancelMu.Unlock()
+	defer func() {
+		w.cancelMu.Lock()
+		delete(w.owners, runID)
+		w.cancelMu.Unlock()
+	}()
 	q := db.New(w.DB)
 	defer func() {
 		cleanup, stop := context.WithTimeout(context.Background(), 5*time.Second)
@@ -199,26 +264,26 @@ func (w *RunWorker) drive(parent context.Context, runID, token uuid.UUID) {
 	if _, err = tq.ResetRunActions(ctx, db.ResetRunActionsParams{RunID: runID, ClaimToken: token}); err != nil {
 		return
 	}
-	rows, err := tq.LoadRunGraph(ctx, runID)
+	rows, err := tq.LoadRunTasks(ctx, runID)
 	if err != nil {
 		return
 	}
 	if err = tx.Commit(ctx); err != nil {
 		return
 	}
-	d := &runDriver{worker: w, runID: runID, token: token, rows: make(map[uuid.UUID]db.LoadRunGraphRow), images: make(map[string]*imageWait)}
-	snapshot := make([]graphexec.Node, 0, len(rows))
+	d := &runDriver{worker: w, runID: runID, token: token, rows: make(map[uuid.UUID]db.LoadRunTasksRow), images: make(map[string]*imageWait)}
+	snapshot := make([]tasktree.Node, 0, len(rows))
 	for _, row := range rows {
-		node, nodeErr := graphNode(row)
+		node, nodeErr := taskNode(row)
 		if nodeErr != nil {
-			slog.Error("restore graph", "error", nodeErr)
+			slog.Error("restore task tree", "error", nodeErr)
 			return
 		}
 		snapshot = append(snapshot, node)
 		d.rows[row.ID] = row
 	}
-	d.graph = graphexec.New(snapshot, graphexec.Options{RunID: runID, ClaimToken: token, SlotPool: w.slots, Store: graphStore{pool: w.DB, logs: w.Logs}, Runner: d, Images: d, Cache: d})
-	if err := d.graph.Run(ctx); err != nil && ctx.Err() == nil {
+	d.coordinator = tasktree.New(snapshot, tasktree.Options{RunID: runID, ClaimToken: token, SlotPool: w.slots, ReadyQueue: 4 * w.Capacity, ProcessPool: w.processes, Store: taskStore{pool: w.DB, logs: w.Logs}, Runner: d, Images: d, Cache: d})
+	if err := d.coordinator.Run(ctx); err != nil && ctx.Err() == nil {
 		slog.Debug("run finished", "run_id", runID, "error", err)
 	}
 }
@@ -250,9 +315,9 @@ type imageWait struct {
 type runDriver struct {
 	worker       *RunWorker
 	runID, token uuid.UUID
-	graph        *graphexec.Executor
+	coordinator  *tasktree.Coordinator
 	mu           sync.Mutex
-	rows         map[uuid.UUID]db.LoadRunGraphRow
+	rows         map[uuid.UUID]db.LoadRunTasksRow
 	images       map[string]*imageWait
 }
 
@@ -262,7 +327,7 @@ func (d *runDriver) Ensure(ctx context.Context, key []byte) error {
 	if wait == nil {
 		wait = &imageWait{done: make(chan struct{})}
 		d.images[string(key)] = wait
-		var row db.LoadRunGraphRow
+		var row db.LoadRunTasksRow
 		for _, candidate := range d.rows {
 			if string(candidate.ImageKey) == string(key) {
 				row = candidate
@@ -295,7 +360,7 @@ func (d *runDriver) Ensure(ctx context.Context, key []byte) error {
 	}
 }
 
-func (d *runDriver) Run(ctx context.Context, attempt graphexec.Attempt) ([]byte, error) {
+func (d *runDriver) Run(ctx context.Context, attempt tasktree.Attempt) ([]byte, error) {
 	d.mu.Lock()
 	row, ok := d.rows[attempt.NodeID]
 	image := d.images[string(row.ImageKey)]
@@ -307,12 +372,12 @@ func (d *runDriver) Run(ctx context.Context, attempt graphexec.Attempt) ([]byte,
 	if err != nil {
 		return nil, err
 	}
-	identity := taskContext{runID: d.runID, actionID: attempt.NodeID, token: d.token, attempt: attempt.Number, graph: d.graph}
+	identity := taskContext{runID: d.runID, actionID: attempt.NodeID, token: d.token, attempt: attempt.Number, coordinator: d.coordinator}
 	identity.add = func(ctx context.Context, child uuid.UUID) error {
-		if _, err := d.graph.Get(ctx, child); err == nil {
+		if _, err := d.coordinator.Get(ctx, child); err == nil {
 			return nil
 		}
-		rows, err := db.New(d.worker.DB).LoadRunGraph(ctx, d.runID)
+		rows, err := db.New(d.worker.DB).LoadRunTasks(ctx, d.runID)
 		if err != nil {
 			return err
 		}
@@ -320,14 +385,14 @@ func (d *runDriver) Run(ctx context.Context, attempt graphexec.Attempt) ([]byte,
 			if row.ID != child {
 				continue
 			}
-			node, err := graphNode(row)
+			node, err := taskNode(row)
 			if err != nil {
 				return err
 			}
 			d.mu.Lock()
 			d.rows[child] = row
 			d.mu.Unlock()
-			return d.graph.Add(ctx, attempt.NodeID, attempt.Number, node)
+			return d.coordinator.Add(ctx, attempt.NodeID, attempt.Number, node)
 		}
 		return fmt.Errorf("child action %s is missing", child)
 	}

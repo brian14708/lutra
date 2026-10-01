@@ -3,7 +3,7 @@
 from lutra._context import TaskContext, current_context
 from lutra.checkpoint import CheckpointEvent, CheckpointManager, CheckpointNotFound
 from lutra.client import Client, RunHandle
-from lutra.runtime import run
+from lutra.runtime import ChildHandle, run, spawn
 from lutra.task import (
     CacheableError,
     Invocation,
@@ -19,6 +19,7 @@ __all__ = [
     "CheckpointEvent",
     "CheckpointManager",
     "CheckpointNotFound",
+    "ChildHandle",
     "Client",
     "Invocation",
     "Resources",
@@ -30,4 +31,5 @@ __all__ = [
     "TaskImage",
     "current_context",
     "run",
+    "spawn",
 ]

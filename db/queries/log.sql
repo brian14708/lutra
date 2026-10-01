@@ -14,7 +14,7 @@ ON CONFLICT (run_id, stream) DO NOTHING;
 
 -- name: UpdateLogStreamNextSeq :exec
 UPDATE lutra.run_log_streams
-SET next_seq = $3, updated_at = now()
+SET next_seq = $3
 WHERE run_id = $1 AND stream = $2;
 
 -- name: GetLogAppend :one
@@ -27,16 +27,24 @@ INSERT INTO lutra.run_log_appends (run_id, stream, append_id, batch_digest, firs
 VALUES ($1, $2, $3, $4, $5, $6);
 
 -- name: InsertLogRecord :exec
-INSERT INTO lutra.run_log_records (run_id, stream, seq, value_cbor, value_uri, payload_size, key, created_at)
-VALUES ($1, $2, $3, $4, $5, $6, $7, now());
+INSERT INTO lutra.run_log_records (run_id, stream, seq, value_cbor, key, created_at)
+VALUES ($1, $2, $3, $4, $5, now());
 
 -- name: ReadLogRecords :many
-SELECT stream, seq, key, value_cbor, value_uri, created_at
-FROM lutra.run_log_records
-WHERE run_id = $1
-  AND stream = $2
-  AND seq > $3
-  AND (sqlc.narg(key)::bytea IS NULL OR key = sqlc.narg(key)::bytea)
+SELECT stream, seq, key, value_cbor, created_at
+FROM (
+  (SELECT stream, seq, key, value_cbor, created_at
+   FROM lutra.run_log_records r
+   WHERE r.run_id = $1 AND r.stream = $2 AND r.seq > $3
+     AND sqlc.narg(key)::bytea IS NULL
+   ORDER BY r.seq LIMIT $4)
+  UNION ALL
+  (SELECT stream, seq, key, value_cbor, created_at
+   FROM lutra.run_log_records r
+   WHERE r.run_id = $1 AND r.stream = $2 AND r.seq > $3
+     AND sqlc.narg(key)::bytea IS NOT NULL AND r.key = sqlc.narg(key)::bytea
+   ORDER BY r.seq LIMIT $4)
+) records
 ORDER BY seq
 LIMIT $4;
 
@@ -50,28 +58,30 @@ WITH boundary AS MATERIALIZED (
 ), matched AS MATERIALIZED (
   -- Separate branches keep key bounds indexable with generic prepared plans.
   SELECT candidates.* FROM (
-    SELECT r.stream, r.seq, r.key, r.value_cbor, r.value_uri, r.created_at
+    (SELECT r.stream, r.seq, r.key, r.value_cbor, r.created_at
     FROM lutra.run_log_records r, boundary b
     WHERE r.run_id = sqlc.arg(run_id) AND r.stream = sqlc.arg(stream)
       AND r.seq > sqlc.arg(after_seq) AND r.seq <= b.end_seq
       AND sqlc.narg(lower_key)::bytea IS NULL
+    ORDER BY r.seq LIMIT sqlc.arg(batch_size)::integer)
     UNION ALL
-    SELECT r.stream, r.seq, r.key, r.value_cbor, r.value_uri, r.created_at
+    SELECT r.stream, r.seq, r.key, r.value_cbor, r.created_at
     FROM lutra.run_log_records r, boundary b
     WHERE r.run_id = sqlc.arg(run_id) AND r.stream = sqlc.arg(stream)
       AND r.seq > sqlc.arg(after_seq) AND r.seq <= b.end_seq
       AND sqlc.narg(lower_key)::bytea IS NOT NULL AND sqlc.narg(upper_key)::bytea IS NULL
       AND r.key >= sqlc.narg(lower_key)
     UNION ALL
-    SELECT r.stream, r.seq, r.key, r.value_cbor, r.value_uri, r.created_at
+    SELECT r.stream, r.seq, r.key, r.value_cbor, r.created_at
     FROM lutra.run_log_records r, boundary b
     WHERE r.run_id = sqlc.arg(run_id) AND r.stream = sqlc.arg(stream)
       AND r.seq > sqlc.arg(after_seq) AND r.seq <= b.end_seq
+      AND sqlc.narg(lower_key)::bytea IS NOT NULL
       AND r.key >= sqlc.narg(lower_key) AND r.key < sqlc.narg(upper_key)
   ) candidates
   ORDER BY candidates.seq LIMIT sqlc.arg(batch_size)::integer
 )
-SELECT m.stream, m.seq, m.key, m.value_cbor, m.value_uri, m.created_at,
+SELECT m.stream, m.seq, m.key, m.value_cbor, m.created_at,
   CASE WHEN (SELECT count(*) FROM matched) = sqlc.arg(batch_size)::integer
     THEN (SELECT max(seq) FROM matched) ELSE b.end_seq END::bigint AS inspect_seq
 FROM boundary b LEFT JOIN matched m ON true

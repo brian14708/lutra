@@ -1,7 +1,8 @@
-package graphexec
+package tasktree
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -17,8 +18,10 @@ func (c leaseCache) Acquire(ctx context.Context, _ []byte) ([]byte, error, Cache
 }
 
 type recordingLease struct {
-	ctx      context.Context
-	finished bool
+	ctx       context.Context
+	finished  bool
+	finishErr error
+	released  bool
 }
 
 func (l *recordingLease) Context() context.Context { return l.ctx }
@@ -26,9 +29,9 @@ func (l *recordingLease) Finish(_ context.Context, output []byte, err error) err
 	if err == nil && len(output) == 1 && output[0] == 0x02 {
 		l.finished = true
 	}
-	return nil
+	return l.finishErr
 }
-func (*recordingLease) Release(context.Context) error { panic("completed lease was released") }
+func (l *recordingLease) Release(context.Context) error { l.released = true; return nil }
 
 type markedSlots struct{}
 
@@ -67,6 +70,28 @@ type hitCache struct{}
 
 func (hitCache) Acquire(context.Context, []byte) ([]byte, error, CacheLease, error) {
 	return []byte{0x01}, nil, nil, nil
+}
+
+type failingCache struct{ err error }
+
+func (c failingCache) Acquire(context.Context, []byte) ([]byte, error, CacheLease, error) {
+	return nil, nil, nil, c.err
+}
+
+func TestCacheLookupFailureLeavesActionForReplay(t *testing.T) {
+	want := errors.New("cache database unavailable")
+	root := id()
+	executor := New([]Node{{ID: root, CacheKey: []byte{1}}}, Options{
+		Cache:  failingCache{err: want},
+		Runner: runnerFunc(func(context.Context, Attempt) ([]byte, error) { panic("cache lookup ran task") }),
+	})
+	if err := executor.Run(context.Background()); !errors.Is(err, want) {
+		t.Fatalf("lookup outcome: %v", err)
+	}
+	node, err := executor.Get(context.Background(), root)
+	if err != nil || node.State.Terminal() {
+		t.Fatalf("lookup failure terminalized action: %+v, %v", node, err)
+	}
 }
 
 func TestCacheHitSkipsImageAndRunner(t *testing.T) {
@@ -110,6 +135,9 @@ func TestCacheLeaseCoversImageSlotAndRunner(t *testing.T) {
 	if !lease.finished {
 		t.Fatal("task result was not published")
 	}
+	if lease.released {
+		t.Fatal("completed lease was released")
+	}
 }
 
 func TestLostLeaseDuringImageWaitFinishesAction(t *testing.T) {
@@ -129,6 +157,30 @@ func TestLostLeaseDuringImageWaitFinishesAction(t *testing.T) {
 	}
 	if !lease.released {
 		t.Fatal("lost lease was not released")
+	}
+	for _, node := range executor.nodes {
+		if node.State.Terminal() {
+			t.Fatalf("lost lease terminalized action: %+v", node)
+		}
+	}
+}
+
+func TestCachePublicationFailurePreservesTaskResult(t *testing.T) {
+	lease := &recordingLease{finishErr: errors.New("cache unavailable")}
+	root := id()
+	executor := New([]Node{{ID: root, CacheKey: []byte{1}}}, Options{
+		Cache:  leaseCache{lease: lease},
+		Runner: runnerFunc(func(context.Context, Attempt) ([]byte, error) { return []byte{0x02}, nil }),
+	})
+	if err := executor.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	node, err := executor.Get(context.Background(), root)
+	if err != nil || node.State != Done || len(node.Output) != 1 || node.Output[0] != 0x02 {
+		t.Fatalf("task result changed by cache publication: %+v, %v", node, err)
+	}
+	if !lease.released {
+		t.Fatal("failed cache publication left lease open")
 	}
 }
 
