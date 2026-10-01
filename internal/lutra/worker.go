@@ -18,6 +18,7 @@ import (
 	lutrav1 "github.com/brian14708/lutra/gen/lutra/v1"
 	lutrav1connect "github.com/brian14708/lutra/gen/lutra/v1/lutrav1connect"
 	"github.com/brian14708/lutra/internal/blob"
+	"github.com/brian14708/lutra/internal/cache"
 	"github.com/brian14708/lutra/internal/db"
 	"github.com/brian14708/lutra/internal/runlog"
 	"github.com/google/uuid"
@@ -35,6 +36,7 @@ type Worker struct {
 	Bucket         string
 	Logs           runlog.Service
 	queries        *db.Queries
+	Cache          *cache.Service
 }
 
 func (w *Worker) openBundle(ctx context.Context, digest []byte) (io.ReadCloser, error) {

@@ -191,7 +191,7 @@ class TaskEnvironment:
         retry: RetryMode | str = RetryMode.NONE,
         max_attempts: int | None = None,
         cache: bool = False,
-        version: str = "",
+        version: str | None = None,
     ) -> Task[P, R_co]: ...
 
     @overload
@@ -202,7 +202,7 @@ class TaskEnvironment:
         retry: RetryMode | str = RetryMode.NONE,
         max_attempts: int | None = None,
         cache: bool = False,
-        version: str = "",
+        version: str | None = None,
     ) -> Callable[[Callable[P, R_co | Awaitable[R_co]]], Task[P, R_co]]: ...
 
     def task(
@@ -212,7 +212,7 @@ class TaskEnvironment:
         retry: RetryMode | str = RetryMode.NONE,
         max_attempts: int | None = None,
         cache: bool = False,
-        version: str = "",
+        version: str | None = None,
     ) -> Task[P, R_co] | Callable[[Callable[P, R_co | Awaitable[R_co]]], Task[P, R_co]]:
         """Declare a module-level task.
 
@@ -247,26 +247,13 @@ class Invocation(Generic[R_co]):
 
         """
         input_cbor = dumps([list(self.args), self.kwargs])
-        key = (
-            hashlib.sha256(
-                dumps([
-                    "lutra.task-cache-client.v1",
-                    self.task.environment.name,
-                    self.task.entrypoint_value,
-                    self.task.version,
-                    input_cbor,
-                    self.task.dependency_key(),
-                ])
-            ).digest()
-            if self.task.cache
-            else b""
-        )
+        dependency_digest = self.task.dependency_key() if self.task.cache else b""
         return ActionSpec(
             input_cbor=input_cbor,
             max_attempts=max_attempts,
             cache=self.task.cache,
-            task_version=self.task.version if self.task.cache else "",
-            cache_key=key,
+            task_version=self.task.version or "" if self.task.cache else "",
+            dependency_digest=dependency_digest,
         )
 
 
@@ -281,7 +268,7 @@ class Task(Generic[P, R_co]):
         retry: RetryMode | str = RetryMode.NONE,
         max_attempts: int | None = None,
         cache: bool = False,
-        version: str = "",
+        version: str | None = None,
     ) -> None:
         """Wrap a module-level function.
 
@@ -297,7 +284,11 @@ class Task(Generic[P, R_co]):
         if type(cache) is not bool:
             message = "cache must be a boolean"
             raise ValueError(message)
-        if cache and (len(version) > _MAX_TASK_VERSION_LENGTH or not _VERSION.fullmatch(version)):
+        if (
+            cache
+            and version is not None
+            and (len(version) > _MAX_TASK_VERSION_LENGTH or not _VERSION.fullmatch(version))
+        ):
             message = "cached tasks require a semantic version such as 1.2.0"
             raise ValueError(message)
         self.cache, self.version = cache, version

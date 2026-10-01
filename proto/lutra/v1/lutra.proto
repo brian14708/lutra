@@ -70,7 +70,8 @@ message ActionSpec {
   int32 max_attempts = 2;
   bool cache = 3;
   string task_version = 4;
-  bytes cache_key = 5;
+  // SHA-256 of locked dependency inputs. The server includes it in the complete cache key.
+  bytes dependency_digest = 5;
 }
 
 message RegisterEnvironmentRequest {

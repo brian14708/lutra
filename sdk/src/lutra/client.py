@@ -389,7 +389,7 @@ class Client:
                                 command=StartupCommand(args=list(task.entrypoint())),
                                 max_attempts=task.max_attempts,
                                 cache=task.cache,
-                                task_version=task.version if task.cache else "",
+                                task_version=task.version or "" if task.cache else "",
                             )
                             for task in current.tasks
                         ],

@@ -27,5 +27,5 @@ func resolvedActionSpec(entry *lutrav1.Entrypoint, requested *lutrav1.ActionSpec
 	if err != nil {
 		return nil, err
 	}
-	return proto.Marshal(&lutrav1.ActionSpec{InputCbor: requested.GetInputCbor(), MaxAttempts: attempts, Cache: requested.GetCache(), TaskVersion: requested.GetTaskVersion(), CacheKey: requested.GetCacheKey()})
+	return proto.Marshal(&lutrav1.ActionSpec{InputCbor: requested.GetInputCbor(), MaxAttempts: attempts, Cache: requested.GetCache(), TaskVersion: requested.GetTaskVersion(), DependencyDigest: requested.GetDependencyDigest()})
 }

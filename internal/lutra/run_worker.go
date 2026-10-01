@@ -12,6 +12,7 @@ import (
 	"time"
 
 	lutrav1 "github.com/brian14708/lutra/gen/lutra/v1"
+	"github.com/brian14708/lutra/internal/cache"
 	"github.com/brian14708/lutra/internal/db"
 	"github.com/brian14708/lutra/internal/graphexec"
 	"github.com/brian14708/lutra/internal/runlog"
@@ -32,6 +33,7 @@ type RunWorker struct {
 	TaskAPIHandler    http.Handler
 	slots             graphexec.Slots
 	adapter           *Worker
+	Cache             *cache.Service
 	ctx               context.Context
 	wg                sync.WaitGroup
 }
@@ -45,10 +47,10 @@ func (w *RunWorker) Start(ctx context.Context) {
 	}
 	w.ctx = ctx
 	w.slots = graphexec.NewSlots(w.Capacity)
-	w.adapter = &Worker{DB: w.DB, Logs: w.Logs, Store: w.Store, Bucket: w.Bucket, TaskAPIHandler: w.TaskAPIHandler, queries: db.New(w.DB)}
-	w.wg.Add(2)
+	w.Cache = cache.New(w.DB)
+	w.adapter = &Worker{DB: w.DB, Logs: w.Logs, Store: w.Store, Bucket: w.Bucket, TaskAPIHandler: w.TaskAPIHandler, queries: db.New(w.DB), Cache: w.Cache}
+	w.wg.Add(1)
 	go func() { defer w.wg.Done(); w.loop(ctx) }()
-	go func() { defer w.wg.Done(); w.sweep(ctx) }()
 }
 
 func (w *RunWorker) Wait() { w.wg.Wait() }
@@ -109,6 +111,14 @@ func cacheKey(row db.LoadRunGraphRow, spec *lutrav1.ActionSpec) []byte {
 	if err := proto.Unmarshal(row.EnvironmentSpec, &environment); err != nil {
 		return nil
 	}
+	if row.EntrypointID < 1 || row.EntrypointID > int64(len(environment.Entrypoints)) {
+		return nil
+	}
+	entrypoint := environment.Entrypoints[row.EntrypointID-1]
+	version := spec.GetTaskVersion()
+	if version == "" {
+		version = environment.GetSourceUri()
+	}
 	image := environment.GetImage()
 	dependencies := make([]map[string]string, 0, len(environment.GetDependencies()))
 	for _, dependency := range environment.GetDependencies() {
@@ -117,16 +127,22 @@ func cacheKey(row db.LoadRunGraphRow, spec *lutrav1.ActionSpec) []byte {
 		})
 	}
 	server := map[string]any{
-		"profile":         "lutra.task-cache-server.v1",
-		"provider":        row.Provider,
-		"runtime_version": os.Getenv("LUTRA_PYTHON_RUNTIME_VERSION"),
+		"profile":           "lutra.task-cache.v2",
+		"environment":       environment.GetName(),
+		"entrypoint_id":     row.EntrypointID,
+		"command":           entrypoint.GetCommand().GetArgs(),
+		"task_version":      version,
+		"input_cbor":        spec.GetInputCbor(),
+		"dependency_digest": spec.GetDependencyDigest(),
+		"provider":          row.Provider,
+		"runtime_version":   os.Getenv("LUTRA_PYTHON_RUNTIME_VERSION"),
 		"image": map[string]any{
 			"name": image.GetName(), "reference": image.GetReference(),
 			"resources": map[string]uint64{
 				"cpu_millis":   uint64(image.GetResources().GetCpuMillis()),
 				"memory_bytes": image.GetResources().GetMemoryBytes(),
 			},
-			"env": image.GetEnvVars(), "build_command": image.GetBuildCommand().GetArgs(),
+			"env": image.GetEnvVars(), "build_context_uri": image.GetBuildContextUri(), "build_command": image.GetBuildCommand().GetArgs(),
 			"workdir": image.GetWorkdir(),
 		},
 		"dependencies": dependencies,
@@ -140,8 +156,6 @@ func cacheKey(row db.LoadRunGraphRow, spec *lutrav1.ActionSpec) []byte {
 		return nil
 	}
 	h := sha256.New()
-	h.Write([]byte("lutra.task-cache.v1\x00"))
-	h.Write(spec.GetCacheKey())
 	h.Write(serverBytes)
 	return h.Sum(nil)
 }
@@ -228,21 +242,6 @@ func (w *RunWorker) renew(ctx context.Context, runID, token uuid.UUID, cancel co
 	}
 }
 
-func (w *RunWorker) sweep(ctx context.Context) {
-	t := time.NewTicker(10 * time.Second)
-	defer t.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-t.C:
-			if err := db.New(w.DB).SweepExpiredImageBuilds(ctx); err != nil && ctx.Err() == nil {
-				slog.Error("expire image builds", "error", err)
-			}
-		}
-	}
-}
-
 type imageWait struct {
 	done  chan struct{}
 	image *Image
@@ -255,14 +254,6 @@ type runDriver struct {
 	mu           sync.Mutex
 	rows         map[uuid.UUID]db.LoadRunGraphRow
 	images       map[string]*imageWait
-}
-
-func (d *runDriver) Lookup(ctx context.Context, owner uuid.UUID, key []byte) ([]byte, error, bool) {
-	return taskCache{worker: d.worker}.Lookup(ctx, owner, key)
-}
-
-func (d *runDriver) Store(ctx context.Context, owner uuid.UUID, key, output []byte, err error) error {
-	return taskCache{worker: d.worker}.Store(ctx, owner, key, output, err)
 }
 
 func (d *runDriver) Ensure(ctx context.Context, key []byte) error {

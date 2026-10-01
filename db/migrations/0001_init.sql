@@ -49,38 +49,27 @@ CREATE TABLE lutra.task_environments (
     UNIQUE (namespace_id, name, version)
 );
 
--- Mutable generations are deliberately excluded from environment identity.
-CREATE TYPE lutra.image_build_status AS ENUM ('building', 'ready', 'failed');
-
-CREATE TABLE lutra.image_builds (
+-- Cache generations are independent of runs and namespaces.
+CREATE TYPE lutra.cache_status AS ENUM ('building', 'ready', 'failed');
+CREATE TABLE lutra.cache_entries (
     id uuid PRIMARY KEY,
-    image_key bytea NOT NULL CHECK (length(image_key) = 32),
-    status lutra.image_build_status NOT NULL,
+    key bytea NOT NULL CHECK (length(key) = 32),
+    status lutra.cache_status NOT NULL,
     claim_token uuid NOT NULL,
     lease_until timestamptz NOT NULL,
-    artifact_uri text NOT NULL DEFAULT '',
-    error text NOT NULL DEFAULT '',
+    result_cbor bytea,
     created_at timestamptz NOT NULL DEFAULT now(),
-    CHECK (status <> 'ready' OR artifact_uri <> '')
+    updated_at timestamptz NOT NULL DEFAULT now(),
+    CHECK (
+        (status = 'building' AND result_cbor IS NULL)
+        OR (status IN ('ready', 'failed') AND result_cbor IS NOT NULL)
+    )
 );
-CREATE UNIQUE INDEX image_building_idx ON lutra.image_builds(image_key) WHERE status = 'building';
+CREATE UNIQUE INDEX cache_active_idx ON lutra.cache_entries (key) WHERE status IN ('building', 'ready');
+CREATE INDEX cache_lease_idx ON lutra.cache_entries (lease_until) WHERE status = 'building';
 
 CREATE TYPE lutra.task_action_status AS ENUM ('queued', 'running', 'waiting', 'succeeded', 'failed', 'canceled');
 
-CREATE TYPE lutra.task_cache_status AS ENUM ('building', 'ready');
-CREATE TABLE lutra.task_cache (
-    cache_key bytea PRIMARY KEY CHECK (length(cache_key) = 32),
-    status lutra.task_cache_status NOT NULL,
-    claim_token uuid NOT NULL,
-    lease_until timestamptz NOT NULL,
-    output_cbor bytea,
-    error_code text NOT NULL DEFAULT '',
-    error_details bytea,
-    created_at timestamptz NOT NULL DEFAULT now(),
-    updated_at timestamptz NOT NULL DEFAULT now(),
-    CHECK (status <> 'ready' OR output_cbor IS NOT NULL OR error_code <> '')
-);
-CREATE INDEX task_cache_lease_idx ON lutra.task_cache (lease_until);
 
 CREATE TABLE lutra.runs (
     id uuid PRIMARY KEY,
@@ -176,11 +165,9 @@ DROP TABLE IF EXISTS lutra.task_action_edges;
 ALTER TABLE IF EXISTS lutra.runs DROP CONSTRAINT IF EXISTS runs_root_action_fk;
 DROP TABLE IF EXISTS lutra.task_actions;
 DROP TABLE IF EXISTS lutra.runs;
-DROP TABLE IF EXISTS lutra.task_cache;
-DROP TYPE IF EXISTS lutra.task_cache_status;
-DROP TABLE IF EXISTS lutra.image_builds;
+DROP TABLE IF EXISTS lutra.cache_entries;
 DROP TABLE IF EXISTS lutra.task_environments;
-DROP TYPE IF EXISTS lutra.image_build_status;
+DROP TYPE IF EXISTS lutra.cache_status;
 DROP TYPE IF EXISTS lutra.task_action_status;
 DROP TABLE IF EXISTS lutra.blob_uploads;
 DROP TABLE IF EXISTS lutra.blobs;

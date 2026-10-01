@@ -3,17 +3,13 @@ package lutra
 import (
 	"context"
 	"errors"
-	"time"
 
 	"github.com/brian14708/lutra/internal/blob"
-	"github.com/brian14708/lutra/internal/db"
-	"github.com/google/uuid"
-	"github.com/jackc/pgx/v5"
+	"github.com/brian14708/lutra/internal/cache"
 )
 
 const maxImageSize = 2 << 30
 
-// storeArtifact persists a built image archive as a blob.
 func (w *Worker) storeArtifact(ctx context.Context, data []byte) (string, error) {
 	if w.Store == nil || w.Bucket == "" {
 		return "", errors.New("image artifact store unavailable")
@@ -21,7 +17,6 @@ func (w *Worker) storeArtifact(ctx context.Context, data []byte) (string, error)
 	return blob.Put(ctx, w.Store, w.Bucket, w.queries, archiveMIME, data)
 }
 
-// loadArtifact resolves an image artifact URI and verifies its content digest.
 func (w *Worker) loadArtifact(ctx context.Context, uri string) ([]byte, error) {
 	digest, mimeType, err := blob.ParseURI(uri)
 	if err != nil || mimeType != archiveMIME || uri != blob.URI(archiveMIME, digest) {
@@ -37,134 +32,28 @@ func (w *Worker) loadArtifact(ctx context.Context, uri string) ([]byte, error) {
 	return w.readVerified(ctx, record.ObjectKey, digest, maxImageSize)
 }
 
-// ensureImage returns a ready image for the key, building it when no ready or
-// in-flight build exists.
 func (w *Worker) ensureImage(ctx context.Context, imageKey []byte, executor Executor, req *EnvironmentExecution) (*Image, error) {
-	var observed uuid.UUID
-	for {
-		var build db.LutraImageBuild
-		var owned bool
-		var err error
-		if observed == uuid.Nil {
-			build, owned, err = w.claimImageBuild(ctx, imageKey)
-		} else {
-			build, err = w.queries.GetImageBuild(ctx, observed)
-		}
-		if err != nil {
-			return nil, err
-		}
-		if build.ID == uuid.Nil {
-			continue
-		}
-		observed = build.ID
-		if build.Status == db.LutraImageBuildStatusReady {
-			return &Image{ArtifactURI: build.ArtifactUri}, nil
-		}
-		if owned {
-			return w.buildImage(ctx, build, executor, req)
-		}
-		if build.Status == db.LutraImageBuildStatusFailed {
-			if build.Error == "build lease expired" {
-				observed = uuid.Nil
-				continue
-			}
-			return nil, errors.New(build.Error)
-		}
-		if !build.LeaseUntil.Time.After(time.Now()) {
-			observed = uuid.Nil
-		}
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		case <-time.After(100 * time.Millisecond):
-		}
+	var digest [32]byte
+	if len(imageKey) != len(digest) {
+		return nil, errors.New("invalid image key")
 	}
-}
-
-func (w *Worker) claimImageBuild(ctx context.Context, imageKey []byte) (db.LutraImageBuild, bool, error) {
-	tx, err := w.DB.Begin(ctx)
-	if err != nil {
-		return db.LutraImageBuild{}, false, err
-	}
-	defer func() { _ = tx.Rollback(ctx) }()
-	q := db.New(tx)
-	if err := q.ExpireImageBuilds(ctx, imageKey); err != nil {
-		return db.LutraImageBuild{}, false, err
-	}
-	current, err := q.LatestImageBuild(ctx, imageKey)
-	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
-		return current, false, err
-	}
-	if err == nil && (current.Status == db.LutraImageBuildStatusReady || current.Status == db.LutraImageBuildStatusBuilding) {
-		return current, false, tx.Commit(ctx)
-	}
-	id, err := uuid.NewV7()
-	if err != nil {
-		return current, false, err
-	}
-	current, err = q.InsertImageBuild(ctx, db.InsertImageBuildParams{ID: id, ImageKey: imageKey, ClaimToken: uuid.New()})
-	if errors.Is(err, pgx.ErrNoRows) {
-		return current, false, tx.Commit(ctx)
-	}
-	if err != nil {
-		return current, false, err
-	}
-	// A competing build may have finished while the unique-index insert waited.
-	previous, err := q.ReadyImageBuild(ctx, imageKey)
-	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
-		return current, false, err
-	}
-	if err == nil {
-		if err := q.DeleteUnneededImageBuild(ctx, current.ID); err != nil {
-			return current, false, err
-		}
-		return previous, false, tx.Commit(ctx)
-	}
-	return current, true, tx.Commit(ctx)
-}
-
-func (w *Worker) buildImage(ctx context.Context, build db.LutraImageBuild, executor Executor, req *EnvironmentExecution) (*Image, error) {
-	buildCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
-	renewDone := make(chan struct{})
-	go func() {
-		defer close(renewDone)
-		ticker := time.NewTicker(10 * time.Second)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-buildCtx.Done():
-				return
-			case <-ticker.C:
-				rows, err := w.queries.RenewImageBuild(buildCtx, db.RenewImageBuildParams{ID: build.ID, ClaimToken: build.ClaimToken})
-				if err != nil || rows != 1 {
-					cancel()
-					return
-				}
-			}
-		}
-	}()
-	image, buildErr := executor.Build(buildCtx, req)
-	cancel()
-	<-renewDone
-	status, errorText, artifactURI := db.LutraImageBuildStatusReady, "", ""
-	if buildErr != nil {
-		status = db.LutraImageBuildStatusFailed
-		errorText = buildErr.Error()
-	} else {
-		artifactURI = image.ArtifactURI
-	}
-	finishCtx, finishCancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer finishCancel()
-	rows, err := w.queries.FinishImageBuild(finishCtx, db.FinishImageBuildParams{ID: build.ID, ClaimToken: build.ClaimToken, Status: status, ArtifactUri: artifactURI, Error: errorText})
+	copy(digest[:], imageKey)
+	result, lease, err := w.Cache.Acquire(ctx, cache.Key{Kind: cache.KindImage, Digest: digest})
 	if err != nil {
 		return nil, err
 	}
-	if rows != 1 {
-		return nil, errors.New("image build lease lost")
+	if lease == nil {
+		return &Image{ArtifactURI: result.(cache.ImageResult).ArtifactURI}, nil
 	}
+	image, buildErr := executor.Build(lease.Context(), req)
 	if buildErr != nil {
+		if err := lease.Fail(ctx, buildErr.Error()); err != nil {
+			return nil, err
+		}
 		return nil, buildErr
+	}
+	if err := lease.Complete(ctx, cache.ImageResult{ArtifactURI: image.ArtifactURI}); err != nil {
+		return nil, err
 	}
 	return image, nil
 }

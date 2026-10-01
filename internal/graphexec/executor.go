@@ -73,8 +73,12 @@ type Images interface {
 	Ensure(context.Context, []byte) error
 }
 type Cache interface {
-	Lookup(context.Context, uuid.UUID, []byte) ([]byte, error, bool)
-	Store(context.Context, uuid.UUID, []byte, []byte, error) error
+	Acquire(context.Context, []byte) ([]byte, error, CacheLease, error)
+}
+type CacheLease interface {
+	Context() context.Context
+	Finish(context.Context, []byte, error) error
+	Release(context.Context) error
 }
 type Clock interface {
 	Now() time.Time
@@ -360,7 +364,8 @@ func (e *Executor) dispatchLocked() {
 }
 
 func (e *Executor) execute(id uuid.UUID) {
-	var cacheOwner uuid.UUID
+	var cacheLease CacheLease
+	workCtx := e.ctx
 	e.mu.Lock()
 	n := clone(*e.nodes[id])
 	if n.State != Ready || e.ctx.Err() != nil {
@@ -368,14 +373,15 @@ func (e *Executor) execute(id uuid.UUID) {
 		return
 	}
 	if len(n.CacheKey) > 0 && e.opts.Cache != nil {
-		owner := uuid.New()
 		e.mu.Unlock()
-		output, err, hit := e.opts.Cache.Lookup(e.ctx, owner, n.CacheKey)
-		if !hit {
+		output, taskErr, lease, acquireErr := e.opts.Cache.Acquire(e.ctx, n.CacheKey)
+		if lease != nil {
+			cacheLease = lease
+			workCtx = lease.Context()
 			defer func() {
-				cleanup, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-				defer cancel()
-				_ = e.opts.Cache.Store(cleanup, owner, n.CacheKey, nil, context.Canceled)
+				if cacheLease != nil {
+					_ = cacheLease.Release(context.WithoutCancel(e.ctx))
+				}
 			}()
 		}
 		e.mu.Lock()
@@ -384,11 +390,24 @@ func (e *Executor) execute(id uuid.UUID) {
 			e.mu.Unlock()
 			return
 		}
-		if hit {
-			n.CacheHit = err == nil || isCacheable(err)
+		if workCtx.Err() != nil {
+			e.mu.Unlock()
+			e.failBeforeRun(id, errors.New("cache lease lost"))
+			return
+		}
+		if acquireErr != nil {
+			n.State, n.Error = Failed, acquireErr.Error()
+			if e.commitLocked(e.ctx, n) == nil {
+				_ = e.closeLocked(e.ctx, id, "parent action failed")
+			}
+			e.mu.Unlock()
+			return
+		}
+		if lease == nil {
+			n.CacheHit = true
 			n.Output = output
-			if err != nil {
-				n.State, n.Error = Failed, err.Error()
+			if taskErr != nil {
+				n.State, n.Error = Failed, taskErr.Error()
 			} else {
 				n.State, n.Output, n.Error = Done, output, ""
 			}
@@ -398,21 +417,25 @@ func (e *Executor) execute(id uuid.UUID) {
 			e.mu.Unlock()
 			return
 		}
-		cacheOwner = owner
 	}
 	if len(n.ImageKey) > 0 && e.opts.Images != nil {
 		n.State = Waiting
 		n.WaitingOn = WaitingForImage
-		if e.commitLocked(e.ctx, n) != nil {
+		if e.commitLocked(workCtx, n) != nil {
 			e.mu.Unlock()
 			return
 		}
 		e.mu.Unlock()
-		err := e.opts.Images.Ensure(e.ctx, n.ImageKey)
+		err := e.opts.Images.Ensure(workCtx, n.ImageKey)
 		e.mu.Lock()
 		n = clone(*e.nodes[id])
 		if n.State.Terminal() || e.ctx.Err() != nil {
 			e.mu.Unlock()
+			return
+		}
+		if workCtx.Err() != nil {
+			e.mu.Unlock()
+			e.failBeforeRun(id, errors.New("cache lease lost"))
 			return
 		}
 		n.WaitingOn = ""
@@ -426,16 +449,19 @@ func (e *Executor) execute(id uuid.UUID) {
 			return
 		}
 		n.State = Ready
-		if e.commitLocked(e.ctx, n) != nil {
+		if e.commitLocked(workCtx, n) != nil {
 			e.mu.Unlock()
 			return
 		}
 	}
 	e.mu.Unlock()
-	if e.opts.SlotPool.Acquire(e.ctx) != nil {
+	if err := e.opts.SlotPool.Acquire(workCtx); err != nil {
+		if e.ctx.Err() == nil {
+			e.failBeforeRun(id, err)
+		}
 		return
 	}
-	taskCtx, cancel := context.WithCancel(e.ctx)
+	taskCtx, cancel := context.WithCancel(workCtx)
 	a := &active{ctx: taskCtx, cancel: cancel, held: true}
 	e.mu.Lock()
 	n = clone(*e.nodes[id])
@@ -443,6 +469,13 @@ func (e *Executor) execute(id uuid.UUID) {
 		e.mu.Unlock()
 		cancel()
 		e.opts.SlotPool.Release()
+		return
+	}
+	if workCtx.Err() != nil {
+		e.mu.Unlock()
+		cancel()
+		e.opts.SlotPool.Release()
+		e.failBeforeRun(id, errors.New("cache lease lost"))
 		return
 	}
 	n.State = Running
@@ -464,10 +497,14 @@ func (e *Executor) execute(id uuid.UUID) {
 	} else {
 		out, err = e.opts.Runner.Run(taskCtx, attempt)
 	}
-	if len(n.CacheKey) > 0 && e.opts.Cache != nil && taskCtx.Err() == nil {
-		if cacheErr := e.opts.Cache.Store(taskCtx, cacheOwner, n.CacheKey, out, err); cacheErr != nil {
+	if workCtx.Err() != nil && e.ctx.Err() == nil {
+		out, err = nil, errors.New("cache lease lost")
+	}
+	if cacheLease != nil && taskCtx.Err() == nil {
+		if cacheErr := cacheLease.Finish(taskCtx, out, err); cacheErr != nil {
 			err = cacheErr
 		}
+		cacheLease = nil
 	}
 	// Release capacity and remove the attempt before a retry can be dispatched.
 	a.resumeMu.Lock()
@@ -514,6 +551,22 @@ func (e *Executor) execute(id uuid.UUID) {
 	}
 	e.mu.Unlock()
 	a.resumeMu.Unlock()
+}
+
+func (e *Executor) failBeforeRun(id uuid.UUID, err error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.ctx.Err() != nil {
+		return
+	}
+	n := clone(*e.nodes[id])
+	if n.State.Terminal() {
+		return
+	}
+	n.State, n.Error = Failed, err.Error()
+	if e.commitLocked(e.ctx, n) == nil {
+		_ = e.closeLocked(e.ctx, id, "parent action failed")
+	}
 }
 
 type cacheable interface{ Cacheable() bool }
