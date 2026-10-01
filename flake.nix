@@ -112,7 +112,7 @@
             settings.processes = commonProcesses // {
               build.command = "just build";
               server = {
-                command = "go run ./cmd/server";
+                command = "go run ./cmd/server -dev-worker";
                 depends_on = {
                   build.condition = "process_completed_successfully";
                   pgsql.condition = "process_healthy";

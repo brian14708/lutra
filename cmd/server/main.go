@@ -4,11 +4,11 @@ package main
 import (
 	"context"
 	"errors"
+	"flag"
 	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
-	"strconv"
 	"syscall"
 	"time"
 
@@ -30,6 +30,8 @@ import (
 )
 
 func main() {
+	embeddedWorker := flag.Bool("dev-worker", false, "run an embedded worker for local development")
+	flag.Parse()
 	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
 	db, err := pgxpool.New(context.Background(), os.Getenv("DATABASE_URL"))
 	if err != nil {
@@ -88,16 +90,13 @@ func main() {
 		connect.WithInterceptors(otelInterceptor),
 	)
 	rpcMux.Handle(blobPath, blobHandler)
-	capacity, _ := strconv.Atoi(os.Getenv("LUTRA_WORKER_CONCURRENCY"))
 	logs := runlog.Service{DB: db, Store: blobStore, Bucket: storeConfig.Bucket}
 	if err := logs.ConfigureFromEnv(); err != nil {
 		logger.Error("log configuration failed", "error", err)
 		os.Exit(1)
 	}
-	worker := &lutra.Worker{DB: db, Capacity: capacity, TaskAPIHandler: rpcMux, Store: blobStore, Bucket: storeConfig.Bucket, Logs: logs}
-	worker.Start(cleanupCtx)
 	servicePath, serviceHandler := lutrav1connect.NewLutraServiceHandler(
-		lutra.Service{Worker: worker},
+		lutra.Service{DB: db, Logs: logs},
 		connect.WithInterceptors(otelInterceptor),
 		connect.WithReadMaxBytes(64<<20),
 	)
@@ -138,6 +137,11 @@ func main() {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	if *embeddedWorker {
+		worker := &lutra.RunWorker{DB: db, Logs: logs, Store: blobStore, Bucket: storeConfig.Bucket, TaskAPIHandler: rpcMux}
+		worker.Start(ctx)
+		defer func() { stop(); worker.Wait() }()
+	}
 	select {
 	case err := <-serverErr:
 		if !errors.Is(err, http.ErrServerClosed) {

@@ -67,9 +67,7 @@ type Executor interface {
 
 // Job is a started task execution. The provider owns its lifetime: Wait
 // blocks until the task finishes, releasing resources, and Kill terminates it
-// early, e.g. on cancellation. ID is the provider's stable reference to the
-// execution, persisted on the action so a recovered or distributed worker can
-// reattach to it.
+// early, e.g. on cancellation. Recovery replays tasks in fresh sandboxes.
 type Job interface {
 	ID() string
 	Wait(context.Context) ([]byte, error)
@@ -82,26 +80,23 @@ type Job interface {
 type LocalExecutor struct {
 	// StoreArtifact persists a built image archive and returns its artifact
 	// URI; LoadArtifact resolves and verifies that URI.
-	StoreArtifact func(context.Context, []byte) (string, error)
-	LoadArtifact  func(context.Context, string) ([]byte, error)
-	OpenBundle    func(context.Context, []byte) (io.ReadCloser, error)
+	StoreArtifact  func(context.Context, []byte) (string, error)
+	LoadArtifact   func(context.Context, string) ([]byte, error)
+	OpenBundle     func(context.Context, []byte) (io.ReadCloser, error)
+	RuntimeVersion string
 }
 
 func (e *LocalExecutor) ImageKey(spec *lutrav1.EnvironmentSpec) ([]byte, error) {
-	python, err := exec.LookPath("python3")
-	if err != nil {
-		return nil, err
-	}
-	python, err = filepath.EvalSymlinks(python)
-	if err != nil {
-		return nil, err
+	runtimeVersion := e.RuntimeVersion
+	if runtimeVersion == "" {
+		runtimeVersion = "python3-default"
 	}
 	mode, err := cbor.CanonicalEncOptions().EncMode()
 	if err != nil {
 		return nil, err
 	}
 	value, err := mode.Marshal(map[string]any{
-		"profile": "lutra.image.local-python.v0", "build_context_uri": spec.GetImage().GetBuildContextUri(), "build_command": spec.GetImage().GetBuildCommand().GetArgs(), "workdir": spec.GetImage().GetWorkdir(), "python": python,
+		"profile": "lutra.image.local-python.v1", "runtime_version": runtimeVersion, "build_context_uri": spec.GetImage().GetBuildContextUri(), "build_command": spec.GetImage().GetBuildCommand().GetArgs(), "workdir": spec.GetImage().GetWorkdir(),
 	})
 	if err != nil {
 		return nil, err

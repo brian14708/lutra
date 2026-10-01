@@ -3,6 +3,14 @@ UPDATE lutra.image_builds
 SET status = 'failed', error = 'build lease expired'
 WHERE image_key = $1 AND status = 'building' AND lease_until <= now();
 
+-- name: SweepExpiredImageBuilds :exec
+UPDATE lutra.image_builds
+SET status = 'failed', error = 'build lease expired'
+WHERE status = 'building' AND lease_until <= now();
+
+-- name: GetImageBuild :one
+SELECT * FROM lutra.image_builds WHERE id = $1;
+
 -- name: LatestImageBuild :one
 SELECT *
 FROM lutra.image_builds
@@ -31,9 +39,9 @@ UPDATE lutra.image_builds
 SET status = sqlc.arg(status)::lutra.image_build_status,
   artifact_uri = sqlc.arg(artifact_uri)::text,
   error = sqlc.arg(error)::text
-WHERE id = sqlc.arg(id)::uuid AND claim_token = sqlc.arg(claim_token)::uuid AND status = 'building';
+WHERE id = sqlc.arg(id)::uuid AND claim_token = sqlc.arg(claim_token)::uuid AND status = 'building' AND lease_until > now();
 
 -- name: RenewImageBuild :execrows
 UPDATE lutra.image_builds
 SET lease_until = now() + '30 seconds'::interval
-WHERE id = $1 AND claim_token = $2 AND status = 'building';
+WHERE id = $1 AND claim_token = $2 AND status = 'building' AND lease_until > now();

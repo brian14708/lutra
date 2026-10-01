@@ -14,6 +14,7 @@ import (
 	lutrav1 "github.com/brian14708/lutra/gen/lutra/v1"
 	"github.com/brian14708/lutra/internal/blob"
 	"github.com/brian14708/lutra/internal/db"
+	"github.com/brian14708/lutra/internal/graphexec"
 	"github.com/brian14708/lutra/internal/runlog"
 	"github.com/fxamacker/cbor/v2"
 	"github.com/google/uuid"
@@ -35,6 +36,9 @@ type taskContext struct {
 	runID    uuid.UUID
 	actionID uuid.UUID
 	token    uuid.UUID
+	attempt  int32
+	graph    *graphexec.Executor
+	add      func(context.Context, uuid.UUID) error
 }
 
 func sourceURI(digest []byte) string {
@@ -72,7 +76,7 @@ func validateIdempotency(key string, required bool) error {
 }
 
 func (s Service) CreateRun(ctx context.Context, req *connect.Request[lutrav1.CreateRunRequest]) (*connect.Response[lutrav1.CreateRunResponse], error) {
-	if s.Worker == nil {
+	if s.DB == nil {
 		return nil, connect.NewError(connect.CodeUnavailable, errors.New("worker unavailable"))
 	}
 	actionSpec := req.Msg.GetActionSpec()
@@ -85,7 +89,7 @@ func (s Service) CreateRun(ctx context.Context, req *connect.Request[lutrav1.Cre
 	if err := validateIdempotency(req.Msg.GetIdempotencyKey(), false); err != nil {
 		return nil, err
 	}
-	tx, err := s.Worker.DB.Begin(ctx)
+	tx, err := s.DB.Begin(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -135,7 +139,7 @@ func (s Service) CreateRun(ctx context.Context, req *connect.Request[lutrav1.Cre
 		if err := q.UpdateRunRootAction(ctx, db.UpdateRunRootActionParams{RootActionID: &rootID, ID: inserted}); err != nil {
 			return nil, err
 		}
-		if err := s.Worker.Logs.AppendStatus(ctx, tx, runID); err != nil {
+		if err := s.Logs.AppendStatus(ctx, tx, runID); err != nil {
 			return nil, err
 		}
 	}
@@ -164,7 +168,7 @@ func (s Service) CreateTaskAction(ctx context.Context, req *connect.Request[lutr
 	if err := validateIdempotency(req.Msg.GetIdempotencyKey(), true); err != nil {
 		return nil, err
 	}
-	tx, err := s.Worker.DB.Begin(ctx)
+	tx, err := s.DB.Begin(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -190,7 +194,7 @@ func (s Service) CreateTaskAction(ctx context.Context, req *connect.Request[lutr
 		return nil, invalidTask("run is not active")
 	}
 	caller, err := q.GetActiveCaller(ctx, active.actionID)
-	if err != nil || caller.RunID != active.runID || caller.ClaimToken == nil || *caller.ClaimToken != active.token {
+	if err != nil || caller.RunID != active.runID || caller.ClaimToken == nil || *caller.ClaimToken != active.token || caller.Attempts != active.attempt {
 		return nil, invalidTask("caller action is not active")
 	}
 	var callerSpec lutrav1.EnvironmentSpec
@@ -234,7 +238,7 @@ func (s Service) CreateTaskAction(ctx context.Context, req *connect.Request[lutr
 			return nil, err
 		}
 		if err == nil {
-			if err := s.Worker.Logs.AppendActionStatus(ctx, tx, actionID); err != nil {
+			if err := s.Logs.AppendActionStatus(ctx, tx, actionID); err != nil {
 				return nil, err
 			}
 		}
@@ -245,6 +249,12 @@ func (s Service) CreateTaskAction(ctx context.Context, req *connect.Request[lutr
 	if err := tx.Commit(ctx); err != nil {
 		return nil, err
 	}
+	if active.add == nil {
+		return nil, invalidTask("run graph is unavailable")
+	}
+	if err := active.add(ctx, actionID); err != nil {
+		return nil, err
+	}
 	action, err := s.readTaskAction(ctx, actionID)
 	if err != nil {
 		return nil, err
@@ -253,7 +263,7 @@ func (s Service) CreateTaskAction(ctx context.Context, req *connect.Request[lutr
 }
 
 func (s Service) readRun(ctx context.Context, id uuid.UUID) (*lutrav1.Run, error) {
-	return readRun(ctx, db.New(s.Worker.DB), id)
+	return readRun(ctx, db.New(s.DB), id)
 }
 
 func readRun(ctx context.Context, q *db.Queries, id uuid.UUID) (*lutrav1.Run, error) {
@@ -278,14 +288,14 @@ func environmentIdentifier(namespaceID uuid.UUID, name, version string) *lutrav1
 func formatTime(value pgtype.Timestamptz) string { return value.Time.UTC().Format(time.RFC3339Nano) }
 
 func (s Service) readTaskAction(ctx context.Context, id uuid.UUID) (*lutrav1.TaskAction, error) {
-	row, err := db.New(s.Worker.DB).ReadTaskAction(ctx, id)
+	row, err := db.New(s.DB).ReadTaskAction(ctx, id)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, connect.NewError(connect.CodeNotFound, errors.New("task action not found"))
 	}
 	if err != nil {
 		return nil, connect.NewError(connect.CodeInternal, err)
 	}
-	upstream, err := db.New(s.Worker.DB).ListActionUpstreams(ctx, db.ListActionUpstreamsParams{RunID: row.RunID, ActionIds: []uuid.UUID{row.ID}})
+	upstream, err := db.New(s.DB).ListActionUpstreams(ctx, db.ListActionUpstreamsParams{RunID: row.RunID, ActionIds: []uuid.UUID{row.ID}})
 	if err != nil {
 		return nil, err
 	}
@@ -361,7 +371,7 @@ func (s Service) GetTaskAction(ctx context.Context, req *connect.Request[lutrav1
 		return nil, invalidTask("invalid task action id")
 	}
 	if active, ok := ctx.Value(taskContextKey{}).(taskContext); ok {
-		caller, lookupErr := db.New(s.Worker.DB).GetTaskActionCaller(ctx, id)
+		caller, lookupErr := db.New(s.DB).GetTaskActionCaller(ctx, id)
 		if lookupErr != nil || caller.RunID != active.runID || caller.CallerActionID == nil || *caller.CallerActionID != active.actionID {
 			return nil, invalidTask("task action is not a child of this task")
 		}
@@ -371,8 +381,14 @@ func (s Service) GetTaskAction(ctx context.Context, req *connect.Request[lutrav1
 		if !ok {
 			return nil, invalidTask("waiting is only available inside a task")
 		}
-		if err := s.Worker.waitAction(ctx, active, id); err != nil {
-			return nil, err
+		if active.graph == nil {
+			return nil, invalidTask("run graph is unavailable")
+		}
+		if _, err := active.graph.Wait(ctx, active.actionID, active.attempt, id); err != nil {
+			node, lookupErr := active.graph.Get(ctx, id)
+			if lookupErr != nil || !node.State.Terminal() {
+				return nil, err
+			}
 		}
 	}
 	action, err := s.readTaskAction(ctx, id)
@@ -391,7 +407,7 @@ func (s Service) ListTaskActions(ctx context.Context, req *connect.Request[lutra
 	if pageSize <= 0 || pageSize > 1000 {
 		pageSize = 100
 	}
-	q := db.New(s.Worker.DB)
+	q := db.New(s.DB)
 	var rows []actionRow
 	if req.Msg.GetPageToken() == "" {
 		listRows, queryErr := q.ListTaskActions(ctx, db.ListTaskActionsParams{RunID: runID, CursorTime: pgtype.Timestamptz{Time: time.Unix(0, 0), Valid: true}, CursorID: uuid.Nil, PageSize: pageSize + 1})
@@ -454,7 +470,7 @@ func (s Service) CancelRun(ctx context.Context, req *connect.Request[lutrav1.Can
 	if err != nil {
 		return nil, invalidTask("invalid run id")
 	}
-	tx, err := s.Worker.DB.Begin(ctx)
+	tx, err := s.DB.Begin(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -468,14 +484,16 @@ func (s Service) CancelRun(ctx context.Context, req *connect.Request[lutrav1.Can
 	if rows, err := q.CancelRunIfActive(ctx, id); err != nil {
 		return nil, connect.NewError(connect.CodeInternal, err)
 	} else if rows > 0 {
-		if err := s.Worker.Logs.AppendStatus(ctx, tx, id); err != nil {
+		if err := s.Logs.AppendStatus(ctx, tx, id); err != nil {
 			return nil, err
 		}
+	}
+	if _, err := q.ClearRunClaim(ctx, id); err != nil {
+		return nil, err
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return nil, err
 	}
-	s.Worker.cancelRun(id)
 	run, err := s.readRun(ctx, id)
 	if err != nil {
 		return nil, err
@@ -496,12 +514,12 @@ func (s Service) WatchRun(ctx context.Context, req *connect.Request[lutrav1.Watc
 }
 
 func (s Service) watchRun(ctx context.Context, id uuid.UUID, taskLogs *lutrav1.StreamCursor, send func(*lutrav1.WatchRunResponse) error) error {
-	sub, err := s.Worker.Logs.Subscribe(ctx, id)
+	sub, err := s.Logs.Subscribe(ctx, id)
 	if err != nil {
 		return err
 	}
 	defer sub.Close()
-	tx, err := s.Worker.DB.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
+	tx, err := s.DB.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
 	if err != nil {
 		return err
 	}
@@ -580,12 +598,12 @@ func (s Service) watchRun(ctx context.Context, id uuid.UUID, taskLogs *lutrav1.S
 	if taskLogs == nil {
 		return nil
 	}
-	logEnd, err := db.New(s.Worker.DB).LogStreamEnd(ctx, db.LogStreamEndParams{RunID: id, Stream: runlog.TaskLogStream})
+	logEnd, err := db.New(s.DB).LogStreamEnd(ctx, db.LogStreamEndParams{RunID: id, Stream: runlog.TaskLogStream})
 	if err != nil {
 		return err
 	}
 	cursors[0].UntilSeq = &logEnd
-	statusEnd, err := db.New(s.Worker.DB).LogStreamEnd(ctx, db.LogStreamEndParams{RunID: id, Stream: runlog.StatusStream})
+	statusEnd, err := db.New(s.DB).LogStreamEnd(ctx, db.LogStreamEndParams{RunID: id, Stream: runlog.StatusStream})
 	if err != nil {
 		return err
 	}

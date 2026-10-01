@@ -71,9 +71,13 @@ CREATE TABLE lutra.runs (
     id uuid PRIMARY KEY,
     namespace_id uuid NOT NULL REFERENCES lutra.namespaces(id),
     root_idempotency_key text,
+    claim_token uuid,
+    lease_until timestamptz,
+    attempts integer NOT NULL DEFAULT 0,
     created_at timestamptz NOT NULL DEFAULT now()
 );
 CREATE UNIQUE INDEX runs_idempotency_idx ON lutra.runs (namespace_id, root_idempotency_key) WHERE root_idempotency_key IS NOT NULL;
+CREATE INDEX runs_claim_idx ON lutra.runs (lease_until, created_at);
 
 CREATE TABLE lutra.task_actions (
     id uuid PRIMARY KEY,
@@ -86,10 +90,8 @@ CREATE TABLE lutra.task_actions (
     status lutra.task_action_status NOT NULL DEFAULT 'queued',
     error text NOT NULL DEFAULT '',
     attempts integer NOT NULL DEFAULT 0,
-    claim_token uuid,
-    lease_until timestamptz,
-    job_id text NOT NULL DEFAULT '',
-    next_attempt_at timestamptz NOT NULL DEFAULT now(),
+    failures integer NOT NULL DEFAULT 0,
+    next_attempt_at timestamptz,
     idempotency_key text,
     created_at timestamptz NOT NULL DEFAULT now(),
     updated_at timestamptz NOT NULL DEFAULT now(),
@@ -98,7 +100,6 @@ CREATE TABLE lutra.task_actions (
 );
 CREATE UNIQUE INDEX task_actions_one_root_idx ON lutra.task_actions (run_id) WHERE caller_action_id IS NULL;
 CREATE UNIQUE INDEX task_actions_idempotency_idx ON lutra.task_actions (run_id, idempotency_key) WHERE idempotency_key IS NOT NULL;
-CREATE INDEX task_actions_claim_idx ON lutra.task_actions (status, next_attempt_at, created_at);
 CREATE INDEX task_actions_run_caller_idx ON lutra.task_actions (run_id, caller_action_id, created_at, id);
 
 ALTER TABLE lutra.runs

@@ -5,6 +5,8 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
+	"os"
 	"path"
 	"regexp"
 	"sort"
@@ -184,7 +186,7 @@ func validateCommand(command *lutrav1.StartupCommand) error {
 }
 
 func (s Service) RegisterEnvironment(ctx context.Context, req *connect.Request[lutrav1.RegisterEnvironmentRequest]) (*connect.Response[lutrav1.RegisterEnvironmentResponse], error) {
-	if s.Worker == nil {
+	if s.DB == nil {
 		return nil, connect.NewError(connect.CodeUnavailable, errors.New("worker unavailable"))
 	}
 	spec, err := normalizeEnvironment(req.Msg.GetSpec())
@@ -199,7 +201,7 @@ func (s Service) RegisterEnvironment(ctx context.Context, req *connect.Request[l
 	if err != nil || namespaceID == uuid.Nil {
 		return nil, invalidTask("invalid namespace ID")
 	}
-	namespace, err := db.New(s.Worker.DB).GetNamespaceByID(ctx, namespaceID)
+	namespace, err := db.New(s.DB).GetNamespaceByID(ctx, namespaceID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, connect.NewError(connect.CodeNotFound, errors.New("namespace not found"))
 	}
@@ -208,23 +210,25 @@ func (s Service) RegisterEnvironment(ctx context.Context, req *connect.Request[l
 	}
 	identifier := &lutrav1.EnvironmentIdentifier{NamespaceId: spec.spec.NamespaceId, Name: spec.spec.Name, Version: version}
 	// Matching versions include the commands, so repeat registrations skip source loading.
-	_, err = db.New(s.Worker.DB).GetEnvironment(ctx, db.GetEnvironmentParams{NamespaceID: namespaceID, Name: identifier.Name, Version: version})
+	_, err = db.New(s.DB).GetEnvironment(ctx, db.GetEnvironmentParams{NamespaceID: namespaceID, Name: identifier.Name, Version: version})
 	if err == nil {
 		return connect.NewResponse(&lutrav1.RegisterEnvironmentResponse{Environment: identifier}), nil
 	}
 	if !errors.Is(err, pgx.ErrNoRows) {
 		return nil, err
 	}
-	executor, err := s.Worker.executor(spec.spec.GetImage().GetName())
-	if err != nil {
-		return nil, err
+	var executor Executor
+	if spec.spec.GetImage().GetName() == localTaskImage {
+		executor = &LocalExecutor{RuntimeVersion: os.Getenv("LUTRA_PYTHON_RUNTIME_VERSION")}
+	} else {
+		return nil, connect.NewError(connect.CodeUnimplemented, fmt.Errorf("%s executor is not configured", spec.spec.GetImage().GetName()))
 	}
-	if _, err := db.New(s.Worker.DB).GetBlobBySHA256(ctx, spec.source); errors.Is(err, pgx.ErrNoRows) {
+	if _, err := db.New(s.DB).GetBlobBySHA256(ctx, spec.source); errors.Is(err, pgx.ErrNoRows) {
 		return nil, invalidTask("environment source blob is not uploaded")
 	} else if err != nil {
 		return nil, err
 	}
-	if _, err := db.New(s.Worker.DB).GetBlobBySHA256(ctx, spec.buildContext); errors.Is(err, pgx.ErrNoRows) {
+	if _, err := db.New(s.DB).GetBlobBySHA256(ctx, spec.buildContext); errors.Is(err, pgx.ErrNoRows) {
 		return nil, invalidTask("image build context blob is not uploaded")
 	} else if err != nil {
 		return nil, err
@@ -233,7 +237,7 @@ func (s Service) RegisterEnvironment(ctx context.Context, req *connect.Request[l
 	if err != nil {
 		return nil, err
 	}
-	tx, err := s.Worker.DB.Begin(ctx)
+	tx, err := s.DB.Begin(ctx)
 	if err != nil {
 		return nil, err
 	}

@@ -40,16 +40,38 @@ func (w *Worker) loadArtifact(ctx context.Context, uri string) ([]byte, error) {
 // ensureImage returns a ready image for the key, building it when no ready or
 // in-flight build exists.
 func (w *Worker) ensureImage(ctx context.Context, imageKey []byte, executor Executor, req *EnvironmentExecution) (*Image, error) {
+	var observed uuid.UUID
 	for {
-		build, owned, err := w.claimImageBuild(ctx, imageKey)
+		var build db.LutraImageBuild
+		var owned bool
+		var err error
+		if observed == uuid.Nil {
+			build, owned, err = w.claimImageBuild(ctx, imageKey)
+		} else {
+			build, err = w.queries.GetImageBuild(ctx, observed)
+		}
 		if err != nil {
 			return nil, err
 		}
+		if build.ID == uuid.Nil {
+			continue
+		}
+		observed = build.ID
 		if build.Status == db.LutraImageBuildStatusReady {
 			return &Image{ArtifactURI: build.ArtifactUri}, nil
 		}
 		if owned {
 			return w.buildImage(ctx, build, executor, req)
+		}
+		if build.Status == db.LutraImageBuildStatusFailed {
+			if build.Error == "build lease expired" {
+				observed = uuid.Nil
+				continue
+			}
+			return nil, errors.New(build.Error)
+		}
+		if !build.LeaseUntil.Time.After(time.Now()) {
+			observed = uuid.Nil
 		}
 		select {
 		case <-ctx.Done():
