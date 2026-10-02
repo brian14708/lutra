@@ -66,8 +66,8 @@ func (e *CacheableError) output() ([]byte, error) {
 }
 
 // Image references a built image artifact. The provider that built it
-// resolves the URI at run time: a blob URI for local builds, a registry
-// digest for container providers.
+// resolves the URI at run time: a blob URI for local builds, or a Docker
+// image ID on the shared daemon.
 type Image struct {
 	ArtifactURI string
 }
@@ -106,22 +106,63 @@ type LocalExecutor struct {
 }
 
 func (e *LocalExecutor) ImageKey(spec *lutrav1.EnvironmentSpec) ([]byte, error) {
-	runtimeVersion := e.RuntimeVersion
-	if runtimeVersion == "" {
-		runtimeVersion = "python3-default"
+	runtime, err := localRuntime(spec.GetImage().GetPythonRequires())
+	if err != nil {
+		return nil, err
 	}
 	mode, err := cbor.CanonicalEncOptions().EncMode()
 	if err != nil {
 		return nil, err
 	}
 	value, err := mode.Marshal(map[string]any{
-		"profile": "lutra.image.local-python.v1", "runtime_version": runtimeVersion, "build_context_uri": spec.GetImage().GetBuildContextUri(), "build_command": spec.GetImage().GetBuildCommand().GetArgs(), "workdir": spec.GetImage().GetWorkdir(),
+		"profile": "lutra.image.local-python.v3", "runtime_version": e.RuntimeVersion, "python": runtime.python, "python_version": runtime.pythonVersion, "uv": runtime.uv, "uv_version": runtime.uvVersion, "python_requires": spec.GetImage().GetPythonRequires(), "build_context_uri": spec.GetImage().GetBuildContextUri(), "build_command": spec.GetImage().GetBuildCommand().GetArgs(), "workdir": spec.GetImage().GetWorkdir(),
 	})
 	if err != nil {
 		return nil, err
 	}
 	hash := sha256.Sum256(value)
 	return hash[:], nil
+}
+
+type localToolchain struct {
+	python, pythonVersion, uv, uvVersion string
+}
+
+func localRuntime(requires string) (localToolchain, error) {
+	uv, err := exec.LookPath("uv")
+	if err != nil {
+		return localToolchain{}, err
+	}
+	uv, err = filepath.EvalSymlinks(uv)
+	if err != nil {
+		return localToolchain{}, err
+	}
+	uvVersion, err := exec.Command(uv, "--version").Output()
+	if err != nil {
+		return localToolchain{}, fmt.Errorf("inspect uv runtime: %w", err)
+	}
+	var python string
+	if requires == "" {
+		python, err = exec.LookPath("python3")
+	} else {
+		output, findErr := exec.Command(uv, "python", "find", "--no-project", "--no-managed-python", "--no-python-downloads", requires).CombinedOutput()
+		if findErr != nil {
+			return localToolchain{}, fmt.Errorf("find Python matching %q: %w: %s", requires, findErr, strings.TrimSpace(string(output)))
+		}
+		python = strings.TrimSpace(string(output))
+	}
+	if err != nil {
+		return localToolchain{}, err
+	}
+	python, err = filepath.EvalSymlinks(python)
+	if err != nil {
+		return localToolchain{}, err
+	}
+	pythonVersion, err := exec.Command(python, "-VV").Output()
+	if err != nil {
+		return localToolchain{}, fmt.Errorf("inspect Python runtime: %w", err)
+	}
+	return localToolchain{python, strings.TrimSpace(string(pythonVersion)), uv, strings.TrimSpace(string(uvVersion))}, nil
 }
 
 func (e *LocalExecutor) Build(ctx context.Context, req *EnvironmentExecution) (*Image, error) {
@@ -138,14 +179,10 @@ func (e *LocalExecutor) Build(ctx context.Context, req *EnvironmentExecution) (*
 	if err := os.MkdirAll(hostWorkdir, 0o700); err != nil {
 		return nil, err
 	}
-	if err := e.unpackSource(ctx, req.Spec.GetImage().GetBuildContextUri(), hostWorkdir); err != nil {
+	if err := e.unpackSource(ctx, req.Spec.GetImage().GetBuildContextUri(), dir); err != nil {
 		return nil, err
 	}
-	python, err := exec.LookPath("python3")
-	if err != nil {
-		return nil, err
-	}
-	python, err = filepath.EvalSymlinks(python)
+	runtime, err := localRuntime(req.Spec.GetImage().GetPythonRequires())
 	if err != nil {
 		return nil, err
 	}
@@ -154,14 +191,19 @@ func (e *LocalExecutor) Build(ctx context.Context, req *EnvironmentExecution) (*
 		return nil, err
 	}
 	args := sandboxArgs(dir, workdir)
-	args = append(args, "--setenv", "UV_PROJECT_ENVIRONMENT", workdir+"/.venv", "--setenv", "UV_PYTHON", python, "--")
-	args = append(args, req.Spec.GetImage().GetBuildCommand().GetArgs()...)
-	command := exec.CommandContext(ctx, bwrap, args...)
-	command.Env = []string{"PATH=" + os.Getenv("PATH")}
-	command.Stderr = req.Stderr
-	command.Stdout = req.Stderr
-	if err := command.Run(); err != nil {
-		return nil, fmt.Errorf("build uv environment: %w", err)
+	args = append(args, "--setenv", "UV_PROJECT_ENVIRONMENT", workdir+"/.venv", "--setenv", "VIRTUAL_ENV", workdir+"/.venv", "--setenv", "UV_PYTHON", runtime.python, "--")
+	buildCommand := append([]string(nil), req.Spec.GetImage().GetBuildCommand().GetArgs()...)
+	if len(buildCommand) > 0 && buildCommand[0] == "uv" {
+		buildCommand[0] = runtime.uv
+	}
+	for _, buildCommand := range [][]string{{runtime.uv, "venv", "--python", runtime.python, ".venv"}, buildCommand} {
+		command := exec.CommandContext(ctx, bwrap, append(append([]string{}, args...), buildCommand...)...)
+		command.Env = []string{"PATH=" + os.Getenv("PATH")}
+		command.Stderr = req.Stderr
+		command.Stdout = req.Stderr
+		if err := command.Run(); err != nil {
+			return nil, fmt.Errorf("build python environment: %w", err)
+		}
 	}
 	archive, err := archiveImage(ctx, hostWorkdir)
 	if err != nil {
@@ -211,7 +253,7 @@ func (e *LocalExecutor) Run(ctx context.Context, image *Image, req *EnvironmentE
 	if err := extractImage(bytes.NewReader(archive), hostWorkdir); err != nil {
 		return nil, err
 	}
-	if err := e.unpackSource(ctx, req.Spec.GetSourceUri(), hostWorkdir); err != nil {
+	if err := e.unpackSource(ctx, req.Spec.GetSourceUri(), dir); err != nil {
 		return nil, err
 	}
 	environments := req.Environments
@@ -230,14 +272,6 @@ func (e *LocalExecutor) Run(ctx context.Context, image *Image, req *EnvironmentE
 	if err != nil {
 		return nil, err
 	}
-	checkArgs := append(sandboxArgs(dir, workdir), "--", "uv", "sync", "--check", "--offline", "--locked", "--no-dev", "--no-install-workspace", "--inexact")
-	check := exec.CommandContext(ctx, bwrap, checkArgs...)
-	check.Env = []string{"PATH=" + os.Getenv("PATH")}
-	check.Stdout = req.Stderr
-	check.Stderr = req.Stderr
-	if err := check.Run(); err != nil {
-		return nil, fmt.Errorf("check uv environment: %w", err)
-	}
 	args := sandboxArgs(dir, workdir)
 	envVars := req.Spec.GetImage().GetEnvVars()
 	keys := make([]string, 0, len(envVars))
@@ -248,7 +282,11 @@ func (e *LocalExecutor) Run(ctx context.Context, image *Image, req *EnvironmentE
 	for _, key := range keys {
 		args = append(args, "--setenv", key, envVars[key])
 	}
-	values := map[string]string{"LUTRA_TASK_NAMESPACE": req.Environment.NamespaceId, "LUTRA_TASK_VERSION": req.Environment.Version, "LUTRA_ENVIRONMENT_NAME": req.Environment.Name, "LUTRA_ENVIRONMENTS_JSON": string(environmentsJSON), "LUTRA_ATTEMPT": fmt.Sprint(req.Attempt), "LUTRA_TASK_RUN_ID": req.RunID, "LUTRA_TASK_ACTION_ID": req.ActionID, "PYTHONPATH": workdir + ":" + workdir + "/src:" + workdir + "/sdk/src"}
+	importPaths := make([]string, 0, len(req.Spec.GetImportRoots()))
+	for _, root := range req.Spec.GetImportRoots() {
+		importPaths = append(importPaths, filepath.Join("/workspace", root))
+	}
+	values := map[string]string{"LUTRA_TASK_NAMESPACE": req.Environment.NamespaceId, "LUTRA_TASK_VERSION": req.Environment.Version, "LUTRA_ENVIRONMENT_NAME": req.Environment.Name, "LUTRA_ENVIRONMENTS_JSON": string(environmentsJSON), "LUTRA_ATTEMPT": fmt.Sprint(req.Attempt), "LUTRA_TASK_RUN_ID": req.RunID, "LUTRA_TASK_ACTION_ID": req.ActionID, "LUTRA_BUNDLE_ROOT": "/workspace", "PYTHONPATH": strings.Join(importPaths, ":")}
 	for key, value := range values {
 		args = append(args, "--setenv", key, value)
 	}
@@ -284,9 +322,12 @@ func (j *localJob) ID() string {
 func (j *localJob) Wait(ctx context.Context) ([]byte, error) {
 	defer j.stop()
 	defer j.cleanup()
-	req := j.req
-	result, callErr := j.process.Client().Execute(ctx, connect.NewRequest(&taskv1.ExecuteRequest{InvocationId: req.ActionID, RunId: req.RunID, ActionId: req.ActionID, Attempt: req.Attempt, ContentType: "application/cbor", Input: req.Input}))
-	closeErr := j.process.Close()
+	return executeProcess(ctx, j.process, j.req)
+}
+
+func executeProcess(ctx context.Context, process *taskstdio.Process, req *EnvironmentExecution) ([]byte, error) {
+	result, callErr := process.Client().Execute(ctx, connect.NewRequest(&taskv1.ExecuteRequest{InvocationId: req.ActionID, RunId: req.RunID, ActionId: req.ActionID, Attempt: req.Attempt, ContentType: "application/cbor", Input: req.Input}))
+	closeErr := process.Close()
 	if callErr != nil {
 		return nil, callErr
 	}
@@ -320,14 +361,18 @@ func (j *localJob) Kill(context.Context) error {
 }
 
 func (e *LocalExecutor) unpackSource(ctx context.Context, uri, dir string) error {
+	return unpackSource(ctx, e.OpenBundle, uri, dir)
+}
+
+func unpackSource(ctx context.Context, openBundle func(context.Context, []byte) (io.ReadCloser, error), uri, dir string) error {
 	digest, mimeType, err := blob.ParseURI(uri)
 	if err != nil || mimeType != archiveMIME || uri != sourceURI(digest) {
 		return errors.New("invalid source bundle URI")
 	}
-	if e.OpenBundle == nil {
+	if openBundle == nil {
 		return errors.New("source blob store unavailable")
 	}
-	input, err := e.OpenBundle(ctx, digest)
+	input, err := openBundle(ctx, digest)
 	if err != nil {
 		return err
 	}

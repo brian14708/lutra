@@ -100,6 +100,7 @@
               process-compose
               postgresql
               curl
+              docker-client
             ];
           };
 

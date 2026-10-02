@@ -68,12 +68,12 @@ func validateInput(input []byte) error {
 
 func validateActionCache(spec *lutrav1.ActionSpec) error {
 	if !spec.GetCache() {
-		if spec.GetTaskVersion() != "" || len(spec.GetDependencyDigest()) != 0 {
+		if spec.GetTaskVersion() != "" {
 			return invalidTask("uncached actions cannot include cache fields")
 		}
 		return nil
 	}
-	if len(spec.GetTaskVersion()) > 200 || (spec.GetTaskVersion() != "" && !semanticVersionPattern.MatchString(spec.GetTaskVersion())) || len(spec.GetDependencyDigest()) != 32 {
+	if len(spec.GetTaskVersion()) > 200 || (spec.GetTaskVersion() != "" && !semanticVersionPattern.MatchString(spec.GetTaskVersion())) {
 		return invalidTask("cached actions require a semantic version or source-derived version and a 32-byte dependency digest")
 	}
 	return nil

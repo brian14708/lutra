@@ -8,6 +8,8 @@ import importlib
 import inspect
 import json
 import os
+import runpy
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from lutra._gen.lutra.v1.lutra_pb import EnvironmentIdentifier
@@ -38,20 +40,39 @@ def _load_environments() -> dict[str, EnvironmentIdentifier]:
     return environments
 
 
-def _bundled_handler(
-    entrypoint: str,
-) -> tuple[Callable[..., Awaitable[tuple[str, bytes]]], RetryMode]:
-    module_name, separator, qualname = entrypoint.partition(":")
-    if not separator or not module_name or not qualname:
-        message = "entrypoint must be module:qualname"
-        raise ValueError(message)
-    module = importlib.import_module(module_name)
-    target: object = module
+def _load_entrypoint(entrypoint: str) -> Task[..., object]:
+    if entrypoint.startswith("file:"):
+        relative, separator, qualname = entrypoint[5:].partition(":")
+        path = Path(relative)
+        if (
+            not separator
+            or not relative
+            or not qualname
+            or path.is_absolute()
+            or ".." in path.parts
+        ):
+            message = "entrypoint file must be a relative bundle path"
+            raise ValueError(message)
+        bundle_root = Path(os.environ.get("LUTRA_BUNDLE_ROOT", "."))
+        target: object = runpy.run_path(str(bundle_root / path), run_name="__lutra_task__")
+    else:
+        module_name, separator, qualname = entrypoint.partition(":")
+        if not separator or not module_name or not qualname:
+            message = "entrypoint must be module:qualname"
+            raise ValueError(message)
+        target = importlib.import_module(module_name)
     for part in qualname.split("."):
-        target = getattr(target, part)
+        target = target[part] if isinstance(target, dict) else getattr(target, part)
     if not isinstance(target, Task):
         message = "entry point is not a Lutra task"
         raise TypeError(message)
+    return target
+
+
+def _bundled_handler(
+    entrypoint: str,
+) -> tuple[Callable[..., Awaitable[tuple[str, bytes]]], RetryMode]:
+    target = _load_entrypoint(entrypoint)
     environments = _load_environments()
 
     async def handler(

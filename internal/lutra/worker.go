@@ -74,8 +74,11 @@ func (w *Worker) readVerified(ctx context.Context, objectID uuid.UUID, digest []
 // executor returns the provider for an image name. Unconfigured providers
 // fail explicitly until their adapters exist.
 func (w *Worker) executor(name string) (Executor, error) {
-	if name == localTaskImage {
+	switch name {
+	case localTaskImage:
 		return &LocalExecutor{StoreArtifact: w.storeArtifact, LoadArtifact: w.loadArtifact, OpenBundle: w.openBundle, RuntimeVersion: os.Getenv("LUTRA_PYTHON_RUNTIME_VERSION")}, nil
+	case "docker":
+		return &DockerExecutor{OpenBundle: w.openBundle}, nil
 	}
 	return nil, connect.NewError(connect.CodeUnimplemented, fmt.Errorf("%s executor is not configured", name))
 }

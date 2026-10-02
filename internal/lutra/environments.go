@@ -16,13 +16,17 @@ import (
 	lutrav1 "github.com/brian14708/lutra/gen/lutra/v1"
 	"github.com/brian14708/lutra/internal/blob"
 	"github.com/brian14708/lutra/internal/db"
+	"github.com/distribution/reference"
 	"github.com/fxamacker/cbor/v2"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"google.golang.org/protobuf/proto"
 )
 
-var environmentVariablePattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z_0-9]*$`)
+var (
+	environmentVariablePattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z_0-9]*$`)
+	dockerWorkdirPattern       = regexp.MustCompile(`^[A-Za-z0-9._/-]+$`)
+)
 
 func validUUID(value string) bool {
 	id, err := uuid.Parse(value)
@@ -38,13 +42,13 @@ type environmentSpec struct {
 	buildContext []byte
 }
 
-// version hashes the canonical declaration, never a resolved image build.
-func (e *environmentSpec) version() (string, error) {
+// version hashes the declaration and the local toolchain selected for its image.
+func (e *environmentSpec) version(imageKey []byte) (string, error) {
 	mode, err := cbor.CanonicalEncOptions().EncMode()
 	if err != nil {
 		return "", err
 	}
-	canonical, err := mode.Marshal(map[string]any{"profile": "lutra.environment.v0", "spec": e.specBytes})
+	canonical, err := mode.Marshal(map[string]any{"profile": "lutra.environment.v1", "spec": e.specBytes, "image_key": imageKey})
 	if err != nil {
 		return "", err
 	}
@@ -71,9 +75,18 @@ func normalizeEnvironment(spec *lutrav1.EnvironmentSpec) (*environmentSpec, erro
 	image := spec.GetImage()
 	var buildContext []byte
 	switch image.GetName() {
-	case localTaskImage:
-		if image.GetReference() != "" {
-			return nil, invalidTask("local-python does not accept an image reference")
+	case localTaskImage, "docker":
+		if image.GetName() == localTaskImage {
+			if image.GetFromImage() != "" {
+				return nil, invalidTask("local-python does not accept a base image")
+			}
+		} else {
+			if len(image.GetFromImage()) > 2048 {
+				return nil, invalidTask("invalid Docker base image")
+			}
+			if _, err := reference.ParseNormalizedNamed(image.GetFromImage()); err != nil {
+				return nil, invalidTask("invalid Docker base image")
+			}
 		}
 		buildContext, mimeType, err = blob.ParseURI(image.GetBuildContextUri())
 		if err != nil || mimeType != archiveMIME || image.GetBuildContextUri() != sourceURI(buildContext) {
@@ -82,17 +95,23 @@ func normalizeEnvironment(spec *lutrav1.EnvironmentSpec) (*environmentSpec, erro
 		if err := validateCommand(image.GetBuildCommand()); err != nil {
 			return nil, err
 		}
+		if len(image.GetPythonRequires()) > 200 || strings.ContainsRune(image.GetPythonRequires(), 0) {
+			return nil, invalidTask("invalid Python requirement")
+		}
 		if image.GetWorkdir() == "" || path.IsAbs(image.GetWorkdir()) || path.Clean(image.GetWorkdir()) != image.GetWorkdir() || image.GetWorkdir() == ".." || strings.HasPrefix(image.GetWorkdir(), "../") || strings.ContainsRune(image.GetWorkdir(), 0) {
 			return nil, invalidTask("invalid image workdir")
 		}
-	case "docker", "e2b":
-		if image.GetReference() == "" {
+		if image.GetName() == "docker" && !dockerWorkdirPattern.MatchString(image.GetWorkdir()) {
+			return nil, invalidTask("invalid Docker workdir")
+		}
+	case "e2b":
+		if image.GetFromImage() == "" {
 			return nil, invalidTask("image reference is required")
 		}
 	default:
 		return nil, invalidTask("invalid task image provider")
 	}
-	if len(image.GetReference()) > 2048 || strings.ContainsRune(image.GetReference(), 0) {
+	if len(image.GetFromImage()) > 2048 || strings.ContainsRune(image.GetFromImage(), 0) {
 		return nil, invalidTask("invalid image reference")
 	}
 	cpu, memory := image.GetResources().GetCpuMillis(), image.GetResources().GetMemoryBytes()
@@ -120,6 +139,15 @@ func normalizeEnvironment(spec *lutrav1.EnvironmentSpec) (*environmentSpec, erro
 	if err := validateEntrypoints(spec.Entrypoints); err != nil {
 		return nil, err
 	}
+	importRoots := append([]string(nil), spec.GetImportRoots()...)
+	if len(importRoots) == 0 || len(importRoots) > 256 {
+		return nil, invalidTask("environment requires between 1 and 256 import roots")
+	}
+	for _, root := range importRoots {
+		if root == "" || path.IsAbs(root) || path.Clean(root) != root || root == ".." || strings.HasPrefix(root, "../") || strings.ContainsAny(root, ":\\\x00") {
+			return nil, invalidTask("invalid environment import root")
+		}
+	}
 	deps := append([]*lutrav1.EnvironmentIdentifier(nil), spec.Dependencies...)
 	names := map[string]bool{spec.Name: true}
 	for _, dep := range deps {
@@ -136,12 +164,13 @@ func normalizeEnvironment(spec *lutrav1.EnvironmentSpec) (*environmentSpec, erro
 		NamespaceId: spec.NamespaceId, Name: spec.Name,
 		SourceUri: sourceURI(digest),
 		Image: &lutrav1.ImageSpec{
-			Name: image.Name, Reference: image.Reference,
+			Name: image.Name, FromImage: image.FromImage,
 			Resources: &lutrav1.Resources{CpuMillis: cpu, MemoryBytes: memory},
-			EnvVars:   variables, BuildContextUri: image.BuildContextUri, BuildCommand: image.BuildCommand, Workdir: image.Workdir,
+			EnvVars:   variables, BuildContextUri: image.BuildContextUri, BuildCommand: image.BuildCommand, Workdir: image.Workdir, PythonRequires: image.PythonRequires,
 		},
 		Dependencies: deps,
 		Entrypoints:  spec.Entrypoints,
+		ImportRoots:  importRoots,
 	}
 	specBytes, err := proto.MarshalOptions{Deterministic: true}.Marshal(normalized)
 	if err != nil {
@@ -200,7 +229,20 @@ func (s Service) RegisterEnvironment(ctx context.Context, req *connect.Request[l
 	if err != nil {
 		return nil, err
 	}
-	version, err := spec.version()
+	var executor Executor
+	switch spec.spec.GetImage().GetName() {
+	case localTaskImage:
+		executor = &LocalExecutor{RuntimeVersion: os.Getenv("LUTRA_PYTHON_RUNTIME_VERSION")}
+	case "docker":
+		executor = &DockerExecutor{}
+	default:
+		return nil, connect.NewError(connect.CodeUnimplemented, fmt.Errorf("%s executor is not configured", spec.spec.GetImage().GetName()))
+	}
+	imageKey, err := executor.ImageKey(spec.spec)
+	if err != nil {
+		return nil, err
+	}
+	version, err := spec.version(imageKey)
 	if err != nil {
 		return nil, err
 	}
@@ -224,12 +266,6 @@ func (s Service) RegisterEnvironment(ctx context.Context, req *connect.Request[l
 	if !errors.Is(err, pgx.ErrNoRows) {
 		return nil, err
 	}
-	var executor Executor
-	if spec.spec.GetImage().GetName() == localTaskImage {
-		executor = &LocalExecutor{RuntimeVersion: os.Getenv("LUTRA_PYTHON_RUNTIME_VERSION")}
-	} else {
-		return nil, connect.NewError(connect.CodeUnimplemented, fmt.Errorf("%s executor is not configured", spec.spec.GetImage().GetName()))
-	}
 	if _, err := db.New(s.DB).GetBlobBySHA256(ctx, spec.source); errors.Is(err, pgx.ErrNoRows) {
 		return nil, invalidTask("environment source blob is not uploaded")
 	} else if err != nil {
@@ -238,10 +274,6 @@ func (s Service) RegisterEnvironment(ctx context.Context, req *connect.Request[l
 	if _, err := db.New(s.DB).GetBlobBySHA256(ctx, spec.buildContext); errors.Is(err, pgx.ErrNoRows) {
 		return nil, invalidTask("image build context blob is not uploaded")
 	} else if err != nil {
-		return nil, err
-	}
-	imageKey, err := executor.ImageKey(spec.spec)
-	if err != nil {
 		return nil, err
 	}
 	tx, err := s.DB.Begin(ctx)

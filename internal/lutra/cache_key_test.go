@@ -13,15 +13,15 @@ import (
 func TestTaskCacheKeyContract(t *testing.T) {
 	environment := &lutrav1.EnvironmentSpec{
 		Name: "work", SourceUri: "blob:source,aaa",
-		Image:       &lutrav1.ImageSpec{Name: "local-python", Reference: "python:3.14"},
+		Image:       &lutrav1.ImageSpec{Name: "local-python", FromImage: "python:3.14", BuildContextUri: "blob:build,aaa"},
 		Entrypoints: []*lutrav1.Entrypoint{{Command: &lutrav1.StartupCommand{Args: []string{"python", "task"}}, Cache: true}},
 	}
 	encoded, err := proto.Marshal(environment)
 	if err != nil {
 		t.Fatal(err)
 	}
-	row := db.LoadRunTasksRow{EnvironmentSpec: encoded, EnvironmentName: "work", EntrypointID: 1, Provider: "local", Version: "registration-a", NamespaceID: uuid.New()}
-	spec := &lutrav1.ActionSpec{Cache: true, InputCbor: []byte{0x82, 0x80, 0xa0}, DependencyDigest: bytes.Repeat([]byte{7}, 32)}
+	row := db.LoadRunTasksRow{EnvironmentSpec: encoded, EnvironmentName: "work", EntrypointID: 1, Provider: "local", Version: "registration-a", NamespaceID: uuid.New(), ImageKey: bytes.Repeat([]byte{1}, 32)}
+	spec := &lutrav1.ActionSpec{Cache: true, InputCbor: []byte{0x82, 0x80, 0xa0}}
 	baseline := cacheKey(row, spec)
 	if len(baseline) != 32 {
 		t.Fatalf("invalid key length: %d", len(baseline))
@@ -32,10 +32,15 @@ func TestTaskCacheKeyContract(t *testing.T) {
 	if !bytes.Equal(baseline, cacheKey(otherNamespace, spec)) {
 		t.Fatal("namespace and registration version changed the key")
 	}
+	otherRuntime := row
+	otherRuntime.ImageKey = bytes.Repeat([]byte{2}, 32)
+	if bytes.Equal(baseline, cacheKey(otherRuntime, spec)) {
+		t.Fatal("runtime image change reused the task result")
+	}
 	changedInput := proto.Clone(spec).(*lutrav1.ActionSpec)
 	changedInput.InputCbor = []byte{0x82, 0x81, 0x01, 0xa0}
 	if bytes.Equal(baseline, cacheKey(row, changedInput)) {
-		t.Fatal("distinct inputs shared a key despite identical dependency digest")
+		t.Fatal("distinct inputs shared a key")
 	}
 	environment.SourceUri = "blob:source,bbb"
 	row.EnvironmentSpec, err = proto.Marshal(environment)
@@ -51,11 +56,28 @@ func TestTaskCacheKeyContract(t *testing.T) {
 	if !bytes.Equal(explicit, cacheKey(row, spec)) {
 		t.Fatal("explicit version did not preserve reuse across source changes")
 	}
+	environment.ImportRoots = []string{"src"}
+	row.EnvironmentSpec, err = proto.Marshal(environment)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Equal(explicit, cacheKey(row, spec)) {
+		t.Fatal("changed import roots reused the task result")
+	}
+	environment.ImportRoots = nil
+	environment.Image.BuildContextUri = "blob:build,bbb"
+	row.EnvironmentSpec, err = proto.Marshal(environment)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Equal(explicit, cacheKey(row, spec)) {
+		t.Fatal("changed build context reused the task result")
+	}
 }
 
 func TestResolvedActionCachePolicy(t *testing.T) {
 	entry := &lutrav1.Entrypoint{Cache: true, MaxAttempts: 1}
-	spec := &lutrav1.ActionSpec{Cache: true, DependencyDigest: bytes.Repeat([]byte{1}, 32)}
+	spec := &lutrav1.ActionSpec{Cache: true}
 	encoded, err := resolvedActionSpec(entry, spec)
 	if err != nil {
 		t.Fatal(err)

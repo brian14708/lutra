@@ -8,10 +8,15 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+from pathlib import Path
 
 import lutra
 
-environment = lutra.TaskEnvironment(name="greetings")
+environment = lutra.TaskEnvironment(
+    name="greetings",
+    image=lutra.TaskImage(name="docker", from_image="docker.io/astral/uv:python3.11-bookworm-slim"),
+    source_includes=(Path("../src/lutra/_gen"),),
+)
 
 
 @environment.task(cache=True, version="0.1.0")

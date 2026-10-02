@@ -41,7 +41,7 @@ func extractBundle(archive io.Reader, destination string) error {
 		if name == "" || filepath.IsAbs(name) || strings.Contains(name, "\\") || filepath.Clean(name) != name || name == ".." || strings.HasPrefix(name, "../") {
 			return fmt.Errorf("unsafe bundle path %q", member.Name)
 		}
-		if name == ".venv" || strings.HasPrefix(name, ".venv/") {
+		if name == ".venv" || strings.HasPrefix(name, ".venv/") || strings.Contains("/"+name+"/", "/.venv/") {
 			return errors.New("source bundle cannot replace the built image")
 		}
 		target := filepath.Join(destination, name)

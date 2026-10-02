@@ -184,23 +184,23 @@ func cacheKey(row db.LoadRunTasksRow, spec *lutrav1.ActionSpec) []byte {
 		})
 	}
 	server := map[string]any{
-		"profile":           "lutra.task-cache.v2",
-		"environment":       environment.GetName(),
-		"entrypoint_id":     row.EntrypointID,
-		"command":           entrypoint.GetCommand().GetArgs(),
-		"task_version":      version,
-		"input_cbor":        spec.GetInputCbor(),
-		"dependency_digest": spec.GetDependencyDigest(),
-		"provider":          row.Provider,
-		"runtime_version":   os.Getenv("LUTRA_PYTHON_RUNTIME_VERSION"),
+		"profile":       "lutra.task-cache.v2",
+		"environment":   environment.GetName(),
+		"import_roots":  environment.GetImportRoots(),
+		"entrypoint_id": row.EntrypointID,
+		"command":       entrypoint.GetCommand().GetArgs(),
+		"task_version":  version,
+		"input_cbor":    spec.GetInputCbor(),
+		"provider":      row.Provider,
+		"image_key":     row.ImageKey,
 		"image": map[string]any{
-			"name": image.GetName(), "reference": image.GetReference(),
+			"name": image.GetName(), "from_image": image.GetFromImage(),
 			"resources": map[string]uint64{
 				"cpu_millis":   uint64(image.GetResources().GetCpuMillis()),
 				"memory_bytes": image.GetResources().GetMemoryBytes(),
 			},
 			"env": image.GetEnvVars(), "build_context_uri": image.GetBuildContextUri(), "build_command": image.GetBuildCommand().GetArgs(),
-			"workdir": image.GetWorkdir(),
+			"workdir": image.GetWorkdir(), "python_requires": image.GetPythonRequires(),
 		},
 		"dependencies": dependencies,
 	}

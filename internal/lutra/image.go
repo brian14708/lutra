@@ -1,6 +1,7 @@
 package lutra
 
 import (
+	"bytes"
 	"context"
 	"errors"
 
@@ -36,6 +37,13 @@ func (w *Worker) ensureImage(ctx context.Context, imageKey []byte, executor Exec
 	var digest [32]byte
 	if len(imageKey) != len(digest) {
 		return nil, errors.New("invalid image key")
+	}
+	currentKey, err := executor.ImageKey(req.Spec)
+	if err != nil {
+		return nil, err
+	}
+	if !bytes.Equal(imageKey, currentKey) {
+		return nil, errors.New("worker runtime differs from registered image runtime")
 	}
 	copy(digest[:], imageKey)
 	result, lease, err := w.Cache.Acquire(ctx, cache.Key{Kind: cache.KindImage, Digest: digest})

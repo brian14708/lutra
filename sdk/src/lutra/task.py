@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import inspect
 import re
 import sys
@@ -14,7 +13,7 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Generic, ParamSpec, TypeVar, cast, overload
 
-from lutra._bundle import build_bundle, project_root
+from lutra._dependency import UvSource, discover_source
 from lutra._gen.lutra.v1.lutra_pb import ActionSpec
 from lutra.value import dumps
 
@@ -89,12 +88,12 @@ def normalize_retry(retry: RetryMode | str, max_attempts: int | None) -> tuple[R
 
 @dataclass(frozen=True)
 class TaskImage:
-    """Declared runtime image."""
+    """Runtime image. Docker builds FROM from_image; the base needs Python and uv."""
 
     name: str = "local-python"
-    reference: str = ""
+    from_image: str = ""
     build_context: Path | None = None
-    build_command: tuple[str, ...] = ("uv", "sync", "--locked", "--no-dev")
+    build_command: tuple[str, ...] | None = None
     workdir: str = "."
 
 
@@ -147,19 +146,63 @@ class Resources:
 
 @dataclass(frozen=True, eq=False)
 class TaskEnvironment:
-    """Own a runtime declaration and its complete task entrypoint set."""
+    """Own a runtime declaration and its complete task entrypoint set.
+
+    Relative source_includes use the declaring file's directory. Entries may
+    name files, directories, or globs. They override ignore rules.
+    """
 
     name: str
     image: TaskImage = field(default_factory=TaskImage)
     resources: Resources = field(default_factory=Resources)
     env_vars: Mapping[str, str] = field(default_factory=dict)
     dependencies: tuple[TaskEnvironment, ...] = ()
+    source_includes: tuple[Path, ...] = ()
+    import_roots: tuple[Path, ...] | None = None
     _tasks: list[Task[..., object]] = field(default_factory=list, init=False, repr=False)
+    _declaring_file: Path | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
-        """Copy mutable declarations supplied by the caller."""
+        """Copy mutable declarations supplied by the caller.
+
+        Raises:
+            TypeError: If source_includes is a bare path or string.
+
+        """
         object.__setattr__(self, "env_vars", MappingProxyType(dict(self.env_vars)))
         object.__setattr__(self, "dependencies", tuple(self.dependencies))
+        if isinstance(self.source_includes, (str, Path)):
+            msg = "source_includes must be a sequence of paths"
+            raise TypeError(msg)
+        object.__setattr__(self, "source_includes", tuple(self.source_includes))
+        frame = inspect.currentframe()
+        caller = frame.f_back.f_back if frame is not None and frame.f_back is not None else None
+        if caller is not None:
+            filename = Path(caller.f_code.co_filename)
+            if filename.is_file():
+                object.__setattr__(self, "_declaring_file", filename.resolve())
+        if self.import_roots is not None:
+            object.__setattr__(self, "import_roots", tuple(self.import_roots))
+
+    def resolved_source_includes(self) -> tuple[Path, ...]:
+        """Resolve include paths against the file that declared this environment.
+
+        Returns:
+            Paths anchored at the declaration file.
+
+        Raises:
+            ValueError: If no declaration file is available for relative paths.
+
+        """
+        if not self.source_includes:
+            return ()
+        if self._declaring_file is None:
+            msg = "source_includes require an environment declared in a file"
+            raise ValueError(msg)
+        return tuple(
+            path if path.is_absolute() else self._declaring_file.parent / path
+            for path in self.source_includes
+        )
 
     @property
     def tasks(self) -> tuple[Task[..., object], ...]:
@@ -167,21 +210,22 @@ class TaskEnvironment:
         return tuple(self._tasks)
 
     @property
-    def source_root(self) -> Path:
-        """The locked project shared by every entrypoint.
+    def dependency_source(self) -> UvSource:
+        """The one locked dependency source shared by all entrypoints.
 
         Raises:
-            ValueError: If no tasks exist or their locked projects differ.
+            ValueError: If entrypoints do not share a locked source.
 
         """
         if not self._tasks:
             msg = "an environment must declare at least one task"
             raise ValueError(msg)
-        roots = {project_root(task.source_file) for task in self._tasks}
-        if len(roots) != 1:
-            msg = "all environment tasks must belong to the same locked project"
+        sources = [discover_source(task.source_file) for task in self._tasks]
+        first = sources[0]
+        if any(source.identity != first.identity for source in sources[1:]):
+            msg = "all environment tasks must share one locked project or script"
             raise ValueError(msg)
-        return roots.pop()
+        return first
 
     @overload
     def task(
@@ -247,13 +291,11 @@ class Invocation(Generic[R_co]):
 
         """
         input_cbor = dumps([list(self.args), self.kwargs])
-        dependency_digest = self.task.dependency_key() if self.task.cache else b""
         return ActionSpec(
             input_cbor=input_cbor,
             max_attempts=max_attempts,
             cache=self.task.cache,
             task_version=self.task.version or "" if self.task.cache else "",
-            dependency_digest=dependency_digest,
         )
 
 
@@ -293,24 +335,23 @@ class Task(Generic[P, R_co]):
             raise ValueError(message)
         self.cache, self.version = cache, version
         self.source_file = Path(inspect.getfile(cast("FunctionType", function))).resolve()
+        source = discover_source(self.source_file)
         module_name = function.__module__
         loaded = sys.modules.get(module_name)
         spec = getattr(loaded, "__spec__", None)
         if module_name == "__main__":
-            module_name = (
-                spec.name
-                if spec is not None and spec.name
-                else ".".join(
-                    self.source_file
-                    .relative_to(project_root(self.source_file))
-                    .with_suffix("")
-                    .parts
-                )
-            )
+            module_name = spec.name if spec is not None and spec.name else self.source_file.stem
         self.function = function
         self.module = module_name
         self.qualname = function.__qualname__
-        self.entrypoint_value = f"{self.module}:{self.qualname}"
+        if source.is_script or function.__module__ == "__main__":
+            relative = self.source_file.relative_to(source.bundle_root).as_posix()
+            if ":" in relative:
+                msg = "task source path cannot contain a colon"
+                raise ValueError(msg)
+            self.entrypoint_value = f"file:{relative}:{self.qualname}"
+        else:
+            self.entrypoint_value = f"{self.module}:{self.qualname}"
         self.entrypoint_id = len(environment.tasks) + 1
         update_wrapper(self, function)
         self.__module__ = module_name
@@ -334,24 +375,3 @@ class Task(Generic[P, R_co]):
 
         """
         return ("./.venv/bin/python", "-m", "lutra.serve", self.entrypoint_value)
-
-    def dependency_key(self) -> bytes:
-        """Hash the locked build inputs independently of task source.
-
-        Returns:
-            The build dependency digest.
-
-        """
-        root = self.environment.source_root
-        context = self.environment.image.build_context
-        if context is not None:
-            return hashlib.sha256(
-                build_bundle((root / context).resolve(), source_only=False)
-            ).digest()
-        metadata = {
-            path.relative_to(root).as_posix(): path.read_bytes()
-            for path in sorted(root.rglob("pyproject.toml"))
-            if not any(part.startswith(".") for part in path.relative_to(root).parts)
-        }
-        metadata["uv.lock"] = (root / "uv.lock").read_bytes()
-        return hashlib.sha256(dumps(metadata)).digest()

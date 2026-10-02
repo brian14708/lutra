@@ -2,15 +2,17 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import TYPE_CHECKING, Generic, TypeVar
 
 import httpx
 import pyqwest
 
 from lutra._blob import upload_blob
-from lutra._bundle import SOURCE_BUNDLE_MIME, build_bundle
+from lutra._bundle import SOURCE_BUNDLE_MIME, build_bundle, resolve_context, select_files
 from lutra._gen.lutra.v1.blob_connect import BlobServiceClient
 from lutra._gen.lutra.v1.blob_pb import GetDownloadRequest
 from lutra._gen.lutra.v1.log_pb import StreamCursor
@@ -39,9 +41,9 @@ from lutra.value import loads
 if TYPE_CHECKING:
     import logging
     from collections.abc import AsyncIterator
-    from pathlib import Path
 
-    from lutra.task import Invocation, TaskEnvironment
+    from lutra._dependency import UvSource
+    from lutra.task import Invocation, TaskEnvironment, TaskImage
 
 R = TypeVar("R")
 
@@ -177,13 +179,104 @@ def _require_action(action: TaskAction | None) -> TaskAction:
     return action
 
 
-def _limited_bundle(root: Path, *, source_only: bool) -> bytes:
-    bundle = build_bundle(root, source_only=source_only)
+def _limited_bundle(
+    root: Path,
+    *,
+    includes: tuple[Path, ...] = (),
+    selected: tuple[Path, ...] | None = None,
+    generated: dict[str, bytes] | None = None,
+) -> bytes:
+    bundle = build_bundle(root, includes=includes, selected=selected, generated=generated)
     if len(bundle) > 64 << 20:
-        kind = "source bundle" if source_only else "image build context"
-        msg = f"{kind} exceeds 64 MiB"
+        msg = "bundle exceeds 64 MiB"
         raise ValueError(msg)
     return bundle
+
+
+@dataclass(frozen=True)
+class _BundleInputs:
+    source: bytes
+    build_context: bytes
+    import_roots: tuple[str, ...]
+    python_requires: str
+    workdir: str
+    build_command: tuple[str, ...]
+
+
+def _image_build_context(source: UvSource, image: TaskImage) -> bytes:
+    root = source.bundle_root
+    generated = source.build_files
+    if image.build_context is None:
+        return _limited_bundle(root, selected=(), generated=generated)
+    context = resolve_context(source.root, image.build_context)
+    selected = tuple(context.relative_to(root) / path for path in select_files(context))
+    return _limited_bundle(root, selected=selected, generated=generated)
+
+
+def _import_roots(source: UvSource, environment: TaskEnvironment) -> tuple[str, ...]:
+    root = source.bundle_root
+    custom = environment.import_roots
+    roots: list[str] = []
+    for path in custom if custom is not None else source.import_roots:
+        resolved = ((source.root if custom is not None else root) / path).resolve()
+        if not resolved.is_relative_to(root) or not resolved.is_dir():
+            msg = f"import root must be a directory inside the source root: {path}"
+            raise ValueError(msg)
+        roots.append(resolved.relative_to(root).as_posix())
+    return tuple(roots)
+
+
+def _default_build_command(source: UvSource, workdir: str) -> tuple[str, ...]:
+    relative_project = os.path.relpath(source.root, source.bundle_root / workdir)
+    if source.script is not None:
+        script = os.path.relpath(source.script, source.bundle_root / workdir)
+        return ("uv", "sync", "--script", script, "--frozen", "--active")
+    command = (
+        "uv",
+        "sync",
+        "--frozen",
+        "--active",
+        "--all-packages",
+        "--no-dev",
+        "--no-install-local",
+    )
+    return command if relative_project == "." else (*command, "--project", relative_project)
+
+
+def _prepare_bundle(environment: TaskEnvironment) -> _BundleInputs:
+    source = environment.dependency_source
+    python_requires = source.check_lock()
+    root = source.bundle_root
+    includes = environment.resolved_source_includes()
+    selected = select_files(root, includes=includes, scopes=source.local_roots)
+    required = (
+        *source.required_files,
+        *(task.source_file.relative_to(root) for task in environment.tasks),
+    )
+    missing = next((path for path in required if path not in selected), None)
+    if missing is not None:
+        msg = f"required task file is excluded from the source bundle: {missing}"
+        raise ValueError(msg)
+    bundle = _limited_bundle(root, selected=selected)
+    image_workdir = source.root / environment.image.workdir
+    if (
+        Path(environment.image.workdir).is_absolute()
+        or ".." in environment.image.workdir.split("/")
+        or not image_workdir.resolve().is_relative_to(source.root)
+    ):
+        msg = "image workdir must be inside the locked project"
+        raise ValueError(msg)
+    workdir = image_workdir.relative_to(root).as_posix()
+    return _BundleInputs(
+        bundle,
+        _image_build_context(source, environment.image),
+        _import_roots(source, environment),
+        python_requires,
+        workdir,
+        _default_build_command(source, workdir)
+        if environment.image.build_command is None
+        else environment.image.build_command,
+    )
 
 
 class RunHandle(Generic[R]):
@@ -353,32 +446,28 @@ class Client:
         visit(environment)
         identifiers: dict[TaskEnvironment, EnvironmentIdentifier] = {}
         for current in ordered:
-            root = current.source_root
-            bundle = _limited_bundle(root, source_only=True)
-            uri = await upload_blob(self.blob, bundle, SOURCE_BUNDLE_MIME)
-            if current.image.build_context is None:
-                build_uri = uri
-            else:
-                build_root = (root / current.image.build_context).resolve()
-                build_bundle_bytes = _limited_bundle(build_root, source_only=False)
-                build_uri = await upload_blob(self.blob, build_bundle_bytes, SOURCE_BUNDLE_MIME)
+            inputs = _prepare_bundle(current)
+            uri = await upload_blob(self.blob, inputs.source, SOURCE_BUNDLE_MIME)
+            build_uri = await upload_blob(self.blob, inputs.build_context, SOURCE_BUNDLE_MIME)
             response = await self.rpc.register_environment(
                 RegisterEnvironmentRequest(
                     spec=EnvironmentSpec(
                         namespace_id=namespace_id,
                         name=current.name,
                         source_uri=uri,
+                        import_roots=list(inputs.import_roots),
                         image=ImageSpec(
                             name=current.image.name,
-                            reference=current.image.reference,
+                            from_image=current.image.from_image,
                             resources=Resources(
                                 cpu_millis=current.resources.cpu_millis,
                                 memory_bytes=current.resources.memory_bytes,
                             ),
                             env_vars=dict(current.env_vars),
                             build_context_uri=build_uri,
-                            build_command=StartupCommand(args=list(current.image.build_command)),
-                            workdir=current.image.workdir,
+                            build_command=StartupCommand(args=list(inputs.build_command)),
+                            workdir=inputs.workdir,
+                            python_requires=inputs.python_requires,
                         ),
                         dependencies=[
                             identifiers[dependency]

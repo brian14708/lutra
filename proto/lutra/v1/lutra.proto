@@ -20,12 +20,15 @@ service LutraService {
 // ImageSpec declares the runtime image and its execution settings.
 message ImageSpec {
   string name = 1;
-  string reference = 2;
+  // Base image used by providers that build from another image.
+  string from_image = 2;
   Resources resources = 3;
   map<string, string> env_vars = 4;
   string build_context_uri = 5;
   StartupCommand build_command = 6;
   string workdir = 7;
+  // Interpreter constraint from the uv lock.
+  string python_requires = 8;
 }
 
 message Resources {
@@ -52,6 +55,8 @@ message EnvironmentSpec {
   repeated EnvironmentIdentifier dependencies = 6;
   // Entrypoint IDs are one-based positions in this list.
   repeated Entrypoint entrypoints = 7;
+  // Relative Python import paths within the source bundle.
+  repeated string import_roots = 8;
 }
 
 message Entrypoint {
@@ -70,8 +75,6 @@ message ActionSpec {
   int32 max_attempts = 2;
   bool cache = 3;
   string task_version = 4;
-  // SHA-256 of locked dependency inputs. The server includes it in the complete cache key.
-  bytes dependency_digest = 5;
 }
 
 message RegisterEnvironmentRequest {
