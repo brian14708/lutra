@@ -5,11 +5,10 @@ from types import SimpleNamespace
 from typing import TYPE_CHECKING, cast
 
 import pytest
+from lutra import RetryMode
 from lutra._gen.lutra.v1.lutra_pb import ActionSpec, EnvironmentIdentifier, TaskAction
 from lutra.runtime import RunContext, run_context, spawn
 from lutra.value import dumps
-
-from lutra import RetryMode
 
 if TYPE_CHECKING:
     from lutra.serve import TaskAPIClient

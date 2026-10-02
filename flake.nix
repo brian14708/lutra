@@ -89,6 +89,7 @@
           devShells.default = pkgs.mkShell {
             shellHook = ''
               export DATABASE_URL="postgres://$USER@127.0.0.1:5432/postgres?sslmode=disable"
+              export LUTRA_URL="http://127.0.0.1:8080/api"
             '';
             packages = with pkgs; [
               nodejs_26
@@ -98,6 +99,7 @@
               just
               process-compose
               postgresql
+              curl
             ];
           };
 

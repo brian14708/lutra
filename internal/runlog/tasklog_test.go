@@ -1,6 +1,7 @@
 package runlog
 
 import (
+	"encoding/hex"
 	"testing"
 	"time"
 
@@ -24,8 +25,14 @@ func TestTaskLogRoundTripCanonical(t *testing.T) {
 	if decoded != event {
 		t.Fatalf("decoded event differs: %#v", decoded)
 	}
-	if string(encoded) != string(mustEncodeTaskLog(t, event)) {
-		t.Fatal("encoding is not deterministic")
+	const canonical = "a664747970656b7461736b2e6c6f672e763166736f757263656673746465727267617474656d707401676d6573736167656568656c6c6f69616374696f6e5f6964782430303030303030302d303030302d303030302d303030302d3030303030303030303030306974696d657374616d7074323032362d30392d33305430303a30303a30305a"
+	if got := hex.EncodeToString(encoded); got != canonical {
+		t.Fatalf("canonical encoding = %s", got)
+	}
+	noncanonical := append([]byte{0xbf}, encoded[1:]...)
+	noncanonical = append(noncanonical, 0xff)
+	if _, err := DecodeTaskLog(noncanonical); err == nil {
+		t.Fatal("noncanonical encoding was accepted")
 	}
 }
 
@@ -33,13 +40,4 @@ func TestTaskLogRejectsUnknownEvent(t *testing.T) {
 	if _, err := DecodeTaskLog([]byte{0xa1, 0x64, 0x74, 0x79, 0x70, 0x65, 0x65, 0x6f, 0x74, 0x68, 0x65, 0x72}); err == nil {
 		t.Fatal("expected unknown event rejection")
 	}
-}
-
-func mustEncodeTaskLog(t *testing.T, event TaskLogEvent) []byte {
-	t.Helper()
-	encoded, err := EncodeTaskLog(event)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return encoded
 }

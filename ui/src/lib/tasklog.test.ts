@@ -3,18 +3,15 @@ import { encode } from "cborg";
 import { decodeTaskLog } from "@/lib/tasklog.ts";
 
 test("decodes a task log envelope", () => {
-  expect(
-    decodeTaskLog(
-      encode({
-        type: "task.log.v1",
-        source: "stderr",
-        message: "hello",
-        timestamp: "2026-09-30T00:00:00Z",
-        action_id: "00000000-0000-0000-0000-000000000001",
-        attempt: 1,
-      }),
-    ),
-  ).toMatchObject({ message: "hello", attempt: 1 });
+  const event = {
+    type: "task.log.v1",
+    source: "stderr",
+    message: "hello",
+    timestamp: "2026-09-30T00:00:00Z",
+    action_id: "00000000-0000-0000-0000-000000000001",
+    attempt: 1,
+  };
+  expect(decodeTaskLog(encode(event))).toEqual(event);
 });
 
 test("rejects unknown task log envelopes", () => {

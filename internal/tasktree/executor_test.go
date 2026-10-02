@@ -11,9 +11,10 @@ import (
 )
 
 type testClock struct {
-	mu     sync.Mutex
-	now    time.Time
-	timers []*testTimer
+	mu           sync.Mutex
+	now          time.Time
+	timers       []*testTimer
+	timerCreated chan struct{}
 }
 
 type testTimer struct {
@@ -23,13 +24,20 @@ type testTimer struct {
 	active bool
 }
 
-func newTestClock() *testClock      { return &testClock{now: time.Unix(100, 0)} }
+func newTestClock() *testClock {
+	return &testClock{now: time.Unix(100, 0), timerCreated: make(chan struct{}, 1)}
+}
 func (c *testClock) Now() time.Time { c.mu.Lock(); defer c.mu.Unlock(); return c.now }
 func (c *testClock) NewTimer(d time.Duration) Timer {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	timer := &testTimer{clock: c, at: c.now.Add(d), ch: make(chan time.Time, 1), active: true}
+	if d <= 0 {
+		timer.active = false
+		timer.ch <- c.now
+	}
 	c.timers = append(c.timers, timer)
+	c.timerCreated <- struct{}{}
 	return timer
 }
 
@@ -43,6 +51,10 @@ func (t *testTimer) Reset(d time.Duration) {
 	}
 	t.at = t.clock.now.Add(d)
 	t.active = true
+	if d <= 0 {
+		t.active = false
+		t.ch <- t.clock.now
+	}
 }
 
 func (t *testTimer) Stop() {
@@ -360,14 +372,26 @@ func id() uuid.UUID                                                   { return u
 func TestImageWaitDoesNotConsumeSlot(t *testing.T) {
 	started := make(chan struct{})
 	release := make(chan struct{})
-	img := imageFunc(func(context.Context, []byte) error { close(started); <-release; return nil })
+	img := imageFunc(func(ctx context.Context, _ []byte) error {
+		close(started)
+		select {
+		case <-release:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	})
 	root := Node{ID: id(), MaxAttempts: 1, ImageKey: []byte{1}}
 	e := New([]Node{root}, Options{Slots: 1, Images: img, Runner: runnerFunc(func(context.Context, Attempt) ([]byte, error) { return nil, nil })})
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 	done := make(chan error, 1)
 	go func() { done <- e.Run(ctx) }()
-	<-started
+	select {
+	case <-started:
+	case <-ctx.Done():
+		t.Fatal("image wait did not start")
+	}
 	if err := e.opts.SlotPool.Acquire(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -459,13 +483,12 @@ func TestStoreFailureStopsRun(t *testing.T) {
 func TestRetryUsesInjectedClock(t *testing.T) {
 	clock := newTestClock()
 	root := Node{ID: id(), MaxAttempts: 2}
-	var mu sync.Mutex
+	firstAttempt := make(chan struct{})
 	calls := 0
 	e := New([]Node{root}, Options{Clock: clock, RetryBackoff: func(int32) time.Duration { return 5 * time.Second }, Runner: runnerFunc(func(context.Context, Attempt) ([]byte, error) {
-		mu.Lock()
-		defer mu.Unlock()
 		calls++
 		if calls == 1 {
+			close(firstAttempt)
 			return nil, errors.New("retry")
 		}
 		return nil, nil
@@ -474,22 +497,16 @@ func TestRetryUsesInjectedClock(t *testing.T) {
 	defer cancel()
 	done := make(chan error, 1)
 	go func() { done <- e.Run(ctx) }()
-	deadline := time.After(time.Second)
-	for {
-		mu.Lock()
-		n := calls
-		mu.Unlock()
-		if n == 1 {
-			break
-		}
-		select {
-		case <-deadline:
-			t.Fatal("first attempt did not run")
-		default:
-			time.Sleep(time.Millisecond)
-		}
+	select {
+	case <-firstAttempt:
+	case <-ctx.Done():
+		t.Fatal("first attempt did not run")
 	}
-	time.Sleep(10 * time.Millisecond)
+	select {
+	case <-clock.timerCreated:
+	case <-ctx.Done():
+		t.Fatal("retry timer was not registered")
+	}
 	clock.advance(5 * time.Second)
 	select {
 	case err := <-done:
@@ -499,8 +516,6 @@ func TestRetryUsesInjectedClock(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("retry did not run after clock advance")
 	}
-	mu.Lock()
-	defer mu.Unlock()
 	if calls != 2 {
 		t.Fatalf("attempts=%d, want 2", calls)
 	}
@@ -522,18 +537,26 @@ func TestCancelCancelsRunner(t *testing.T) {
 		close(canceled)
 		return nil, ctx.Err()
 	})})
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
 	done := make(chan error, 1)
 	go func() { done <- e.Run(ctx) }()
-	<-started
+	select {
+	case <-started:
+	case <-ctx.Done():
+		t.Fatal("runner did not start")
+	}
 	e.Cancel(ctx)
 	select {
 	case <-canceled:
-	case <-time.After(time.Second):
+	case <-ctx.Done():
 		t.Fatal("runner context not canceled")
 	}
-	<-done
-	cancel()
+	select {
+	case <-done:
+	case <-ctx.Done():
+		t.Fatal("run did not stop after cancellation")
+	}
 }
 
 func TestRejectInvalidSnapshots(t *testing.T) {
@@ -589,9 +612,20 @@ func TestWorkerLossLeavesNodesRecoverable(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() { done <- e.Run(ctx) }()
-	<-started
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		cancel()
+		t.Fatal("runner did not start")
+	}
 	cancel()
-	if err := <-done; !errors.Is(err, context.Canceled) {
+	var err error
+	select {
+	case err = <-done:
+	case <-time.After(time.Second):
+		t.Fatal("run did not stop after worker loss")
+	}
+	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("shutdown: %v", err)
 	}
 	node, _ := e.Get(context.Background(), root)
@@ -714,19 +748,10 @@ func TestRestoreRetryDeadline(t *testing.T) {
 	defer cancel()
 	done := make(chan error, 1)
 	go func() { done <- e.Run(ctx) }()
-	for {
-		clock.mu.Lock()
-		registered := len(clock.timers) == 1
-		clock.mu.Unlock()
-		if registered {
-			break
-		}
-		select {
-		case <-ctx.Done():
-			t.Fatal("retry timer not restored")
-		default:
-			time.Sleep(time.Millisecond)
-		}
+	select {
+	case <-clock.timerCreated:
+	case <-ctx.Done():
+		t.Fatal("retry timer not restored")
 	}
 	clock.advance(9 * time.Second)
 	select {

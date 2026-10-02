@@ -1,6 +1,11 @@
 [tool.uv.workspace]
 members = ["sdk"]
 
+[tool.pytest.ini_options]
+addopts = "-ra"
+testpaths = ["sdk/tests"]
+pythonpath = ["sdk/src"]
+
 [dependency-groups]
 dev = [
   "protoc-gen-connectrpc>=0.12.1",
@@ -26,7 +31,7 @@ ignore = [
 extend-safe-fixes = ["TC", "unused-import"]
 
 [tool.ruff.lint.per-file-ignores]
-"sdk/tests/**/*.py" = ["assert", "D", "import-private-name"]
+"sdk/tests/**/*.py" = ["assert", "D", "import-private-name", "magic-value-comparison"]
 "sdk/examples/**/*.py" = ["D", "print", "implicit-namespace-package"]
 
 [tool.ruff.lint.isort]

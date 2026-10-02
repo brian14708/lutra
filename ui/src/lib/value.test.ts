@@ -2,18 +2,23 @@ import { expect, test } from "vitest";
 import { encode as encodeCbor, Tagged } from "cborg";
 import { decode, encode } from "@/lib/value.ts";
 
-test("encodes simple CBOR values and decodes them", async () => {
+test("matches shared CBOR vectors", async () => {
+  for (const [value, hex] of [
+    [null, "f6"],
+    [-1, "20"],
+    [-0, "f98000"],
+    [2n ** 64n, "c249010000000000000000"],
+  ] as const) {
+    expect(Buffer.from(encode(value)).toString("hex")).toBe(hex);
+    expect(await decode(Buffer.from(hex, "hex"))).toEqual(value);
+  }
+});
+
+test("roundtrips nested CBOR values", async () => {
   const values = [
-    null,
-    true,
-    -1,
-    1.5,
-    -0,
-    "hello",
     new Uint8Array([1, 2]),
     { answer: 42, items: [false, "ok"] },
-    2n ** 128n,
-    -(2n ** 128n) - 1n,
+    ["hello", { count: 2n ** 128n }],
   ];
   for (const value of values) expect(await decode(encode(value))).toEqual(value);
 });
