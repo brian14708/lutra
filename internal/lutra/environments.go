@@ -24,7 +24,7 @@ import (
 
 var (
 	environmentVariablePattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z_0-9]*$`)
-	containerWorkdirPattern    = regexp.MustCompile(`^[A-Za-z0-9._/-]+$`)
+	containerPlatformPattern   = regexp.MustCompile(`^linux/[a-z0-9_]+(?:/v[0-9]+)?$`)
 )
 
 func validUUID(value string) bool {
@@ -47,7 +47,7 @@ func (e *environmentSpec) version(imageKey []byte) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	canonical, err := mode.Marshal(map[string]any{"profile": "lutra.environment.v1", "spec": e.specBytes, "image_key": imageKey})
+	canonical, err := mode.Marshal(map[string]any{"profile": "lutra.environment.v2", "spec": e.specBytes, "image_key": imageKey})
 	if err != nil {
 		return "", err
 	}
@@ -75,6 +75,9 @@ func normalizeEnvironment(spec *lutrav1.EnvironmentSpec) (*environmentSpec, erro
 	var buildContext []byte
 	switch image.GetName() {
 	case containerTaskImage:
+		if !containerPlatformPattern.MatchString(imagePlatform(image)) {
+			return nil, invalid("invalid container platform")
+		}
 		if len(image.GetFromImage()) > 2048 {
 			return nil, invalid("invalid container base image")
 		}
@@ -85,17 +88,11 @@ func normalizeEnvironment(spec *lutrav1.EnvironmentSpec) (*environmentSpec, erro
 		if err != nil || mimeType != archiveMIME || image.GetBuildContextUri() != sourceURI(buildContext) {
 			return nil, invalid("invalid image build context")
 		}
-		if err := validateCommand(image.GetBuildCommand()); err != nil {
-			return nil, err
-		}
 		if len(image.GetPythonRequires()) > 200 || strings.ContainsRune(image.GetPythonRequires(), 0) {
 			return nil, invalid("invalid Python requirement")
 		}
-		if image.GetWorkdir() == "" || path.IsAbs(image.GetWorkdir()) || path.Clean(image.GetWorkdir()) != image.GetWorkdir() || image.GetWorkdir() == ".." || strings.HasPrefix(image.GetWorkdir(), "../") || strings.ContainsRune(image.GetWorkdir(), 0) {
-			return nil, invalid("invalid image workdir")
-		}
-		if !containerWorkdirPattern.MatchString(image.GetWorkdir()) {
-			return nil, invalid("invalid container workdir")
+		if spec.GetWorkdir() == "" || path.IsAbs(spec.GetWorkdir()) || path.Clean(spec.GetWorkdir()) != spec.GetWorkdir() || spec.GetWorkdir() == ".." || strings.HasPrefix(spec.GetWorkdir(), "../") || strings.ContainsAny(spec.GetWorkdir(), ":\\\x00") {
+			return nil, invalid("invalid environment workdir")
 		}
 	case "e2b":
 		if image.GetFromImage() == "" {
@@ -132,13 +129,18 @@ func normalizeEnvironment(spec *lutrav1.EnvironmentSpec) (*environmentSpec, erro
 	if err := validateEntrypoints(spec.Entrypoints); err != nil {
 		return nil, err
 	}
-	importRoots := append([]string(nil), spec.GetImportRoots()...)
-	if len(importRoots) == 0 || len(importRoots) > 256 {
-		return nil, invalid("environment requires between 1 and 256 import roots")
+	if spec.PrepareCommand != nil {
+		if err := validateCommand(spec.PrepareCommand); err != nil {
+			return nil, err
+		}
 	}
-	for _, root := range importRoots {
+	pythonPaths := append([]string(nil), spec.GetPythonPaths()...)
+	if len(pythonPaths) > 256 {
+		return nil, invalid("environment requires at most 256 Python paths")
+	}
+	for _, root := range pythonPaths {
 		if root == "" || path.IsAbs(root) || path.Clean(root) != root || root == ".." || strings.HasPrefix(root, "../") || strings.ContainsAny(root, ":\\\x00") {
-			return nil, invalid("invalid environment import root")
+			return nil, invalid("invalid environment Python path")
 		}
 	}
 	deps := append([]*lutrav1.EnvironmentIdentifier(nil), spec.Dependencies...)
@@ -159,11 +161,13 @@ func normalizeEnvironment(spec *lutrav1.EnvironmentSpec) (*environmentSpec, erro
 		Image: &lutrav1.ImageSpec{
 			Name: image.Name, FromImage: image.FromImage,
 			Resources: &lutrav1.Resources{CpuMillis: cpu, MemoryBytes: memory},
-			EnvVars:   variables, BuildContextUri: image.BuildContextUri, BuildCommand: image.BuildCommand, Workdir: image.Workdir, PythonRequires: image.PythonRequires,
+			EnvVars:   variables, BuildContextUri: image.BuildContextUri, PythonRequires: image.PythonRequires, Platform: imagePlatform(image),
 		},
-		Dependencies: deps,
-		Entrypoints:  spec.Entrypoints,
-		ImportRoots:  importRoots,
+		Dependencies:   deps,
+		PrepareCommand: spec.PrepareCommand,
+		Entrypoints:    spec.Entrypoints,
+		PythonPaths:    pythonPaths,
+		Workdir:        spec.Workdir,
 	}
 	specBytes, err := proto.MarshalOptions{Deterministic: true}.Marshal(normalized)
 	if err != nil {
@@ -197,7 +201,7 @@ func validateEntrypoints(entries []*lutrav1.Entrypoint) error {
 	return nil
 }
 
-func validateCommand(command *lutrav1.StartupCommand) error {
+func validateCommand(command *lutrav1.Command) error {
 	if command == nil || len(command.Args) == 0 || len(command.Args) > 128 || command.Args[0] == "" {
 		return invalid("invalid command")
 	}

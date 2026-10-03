@@ -6,7 +6,6 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
-	"encoding/binary"
 	"errors"
 	"regexp"
 	"time"
@@ -15,6 +14,7 @@ import (
 	lutrav1 "github.com/brian14708/lutra/gen/lutra/v1"
 	"github.com/brian14708/lutra/internal/blob"
 	"github.com/brian14708/lutra/internal/db"
+	"github.com/brian14708/lutra/internal/multihash"
 	"github.com/fxamacker/cbor/v2"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -103,16 +103,12 @@ func validateStream(stream string) error {
 }
 
 func batchDigest(entries []*lutrav1.LogEntry) []byte {
-	h := sha256.New()
-	var length [8]byte
+	values := make([][]byte, 0, 2*len(entries))
 	for _, entry := range entries {
-		for _, value := range [][]byte{entry.GetKey(), entry.GetValueCbor()} {
-			binary.BigEndian.PutUint64(length[:], uint64(len(value)))
-			h.Write(length[:])
-			h.Write(value)
-		}
+		values = append(values, entry.GetKey(), entry.GetValueCbor())
 	}
-	return h.Sum(nil)
+	digest := multihash.Sum(values...)
+	return digest[:]
 }
 
 func (s Service) Append(ctx context.Context, req *connect.Request[lutrav1.AppendRequest]) (*connect.Response[lutrav1.AppendResponse], error) {

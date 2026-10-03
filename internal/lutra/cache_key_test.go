@@ -14,7 +14,7 @@ func TestTaskCacheKeyContract(t *testing.T) {
 	environment := &lutrav1.EnvironmentSpec{
 		Name: "work", SourceUri: "blob:source,aaa",
 		Image:       &lutrav1.ImageSpec{Name: "container", FromImage: "python:3.14", BuildContextUri: "blob:build,aaa"},
-		Entrypoints: []*lutrav1.Entrypoint{{Command: &lutrav1.StartupCommand{Args: []string{"python", "task"}}, Cache: true}},
+		Entrypoints: []*lutrav1.Entrypoint{{Command: &lutrav1.Command{Args: []string{"python", "task"}}, Cache: true}},
 	}
 	encoded, err := proto.Marshal(environment)
 	if err != nil {
@@ -59,15 +59,15 @@ func TestTaskCacheKeyContract(t *testing.T) {
 	if !bytes.Equal(explicit, cacheKey(row, spec, "docker")) {
 		t.Fatal("explicit version did not preserve reuse across source changes")
 	}
-	environment.ImportRoots = []string{"src"}
+	environment.PythonPaths = []string{"src"}
 	row.EnvironmentSpec, err = proto.Marshal(environment)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if bytes.Equal(explicit, cacheKey(row, spec, "docker")) {
-		t.Fatal("changed import roots reused the task result")
+		t.Fatal("changed Python paths reused the task result")
 	}
-	environment.ImportRoots = nil
+	environment.PythonPaths = nil
 	environment.Image.BuildContextUri = "blob:build,bbb"
 	row.EnvironmentSpec, err = proto.Marshal(environment)
 	if err != nil {

@@ -1,221 +1,481 @@
-"""Discover locked uv projects and scripts for task bundling."""
+"""Prepare uv-owned runtime selections at submission time."""
 
 from __future__ import annotations
 
+import json
 import os
 import re
+import shlex
+import shutil
 import subprocess  # ruff: ignore[suspicious-subprocess-import]
+import tempfile
 import tomllib
 from dataclasses import dataclass
+from glob import has_magic
 from pathlib import Path
+from typing import TYPE_CHECKING, Any
 
+import tomli_w
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
+
+UV_VERSION = "0.12.11"
+RECIPE = "lutra.uv-native.v1"
 _SCRIPT_BLOCK = re.compile(r"(?ms)^# /// script[ \t]*\n.*?^# ///[ \t]*(?:\n|$)")
-_LOCAL_KINDS = ("editable", "directory", "virtual", "path")
+_LOCAL_KINDS = ("editable", "directory", "virtual")
+
+
+def _metadata(path: Path) -> dict[str, Any]:
+    return tomllib.loads(path.read_text(encoding="utf-8"))
+
+
+def _script_metadata(path: Path) -> dict[str, Any] | None:
+    match = _SCRIPT_BLOCK.search(path.read_text(encoding="utf-8"))
+    if match is None:
+        return None
+    return tomllib.loads(
+        "\n".join(
+            line.removeprefix("#").removeprefix(" ") for line in match.group().splitlines()[1:-1]
+        )
+    )
+
+
+def _safe_path(path: Path) -> Path:
+    if any(parent.is_symlink() for parent in (path, *path.parents)):
+        msg = f"source path must not follow a symlink: {path}"
+        raise ValueError(msg)
+    return path.resolve()
+
+
+def _uv(root: Path, *args: str) -> bytes:
+    executable = shutil.which("uv")
+    if executable is None:
+        msg = f"uv {UV_VERSION} is required to prepare a Python task environment"
+        raise ValueError(msg)
+    try:
+        result = subprocess.run(  # ruff: ignore[subprocess-without-shell-equals-true]
+            [executable, *args], cwd=root, capture_output=True, check=False
+        )
+    except FileNotFoundError as exc:
+        msg = f"uv {UV_VERSION} is required to prepare a Python task environment"
+        raise ValueError(msg) from exc
+    if result.returncode:
+        msg = f"uv {' '.join(args)} failed: {result.stderr.decode(errors='replace').strip()}"
+        raise ValueError(msg)
+    return result.stdout
+
+
+def _owner(source_file: Path) -> tuple[Path, Path]:
+    """Find the nearest project and its owning workspace, without invoking uv.
+
+    Returns:
+        The lock-owning root and task-owning project.
+
+    Raises:
+        ValueError: If the task has no owning project.
+
+    """
+    project = next((p for p in source_file.parents if (p / "pyproject.toml").is_file()), None)
+    if project is None:
+        msg = f"task source must belong to a uv project or PEP 723 script: {source_file}"
+        raise ValueError(msg)
+    for parent in project.parents:
+        manifest = parent / "pyproject.toml"
+        if not manifest.is_file():
+            continue
+        workspace = _metadata(manifest).get("tool", {}).get("uv", {}).get("workspace")
+        if workspace is None:
+            continue
+        members = {
+            p.resolve() for pattern in workspace.get("members", []) for p in parent.glob(pattern)
+        }
+        excluded = {
+            p.resolve() for pattern in workspace.get("exclude", []) for p in parent.glob(pattern)
+        }
+        if project in members - excluded:
+            return parent, project
+        break
+    return project, project
+
+
+def _includes(root: Path, metadata: dict[str, Any]) -> tuple[Path, ...]:
+    entries = metadata.get("tool", {}).get("lutra", {}).get("source-includes", [])
+    if not isinstance(entries, list) or any(
+        not isinstance(entry, str) or not entry or Path(entry).is_absolute() for entry in entries
+    ):
+        msg = "tool.lutra.source-includes must be a list of relative paths"
+        raise ValueError(msg)
+    return tuple(root / entry for entry in entries)
+
+
+def _local_sources(locked: dict[str, Any]) -> list[tuple[str, str]]:
+    """Find packages declared with local sources in a uv lock.
+
+    Returns:
+        Package name and lock-declared location pairs.
+
+    """
+    return [
+        (p["name"], p["source"][kind])
+        for p in locked.get("package", [])
+        for kind in _LOCAL_KINDS
+        if kind in p.get("source", {})
+    ]
 
 
 @dataclass(frozen=True)
 class UvSource:
-    """A uv project or locked PEP 723 script and its local packages."""
+    """One prepared lock owner and uv's selected local source directories."""
 
     root: Path
     bundle_root: Path
     lock: Path
-    local_roots: tuple[Path, ...]
     project_roots: tuple[Path, ...]
+    task_roots: tuple[Path, ...]
+    includes: tuple[Path, ...]
+    python_requires: str
+    build_files: dict[str, bytes]
+    runtime_files: dict[str, bytes]
     script: Path | None = None
+    excluded_roots: tuple[Path, ...] = ()
+    dependency_groups: tuple[str, ...] | None = None
+    extras: tuple[str, ...] | None = None
 
     @property
-    def identity(self) -> tuple[str, Path]:
-        return ("uv", self.lock)
-
-    @property
-    def is_script(self) -> bool:
-        return self.script is not None
-
-    @property
-    def import_roots(self) -> tuple[Path, ...]:
-        roots = {local.relative_to(self.bundle_root) for local in self.local_roots}
-        for local in self.local_roots:
-            if (local / "src").is_dir():
-                roots.add((local / "src").relative_to(self.bundle_root))
-        return tuple(sorted(roots, key=Path.as_posix))
-
-    @property
-    def local_package_names(self) -> tuple[str, ...]:
-        """Local packages whose sources are supplied by the source bundle."""
-        lock = tomllib.loads(self.lock.read_text(encoding="utf-8"))
-        return tuple(
-            sorted({
-                package["name"]
-                for package in lock.get("package", [])
-                if any(kind in package.get("source", {}) for kind in _LOCAL_KINDS)
-            })
-        )
+    def prepare_command(self) -> tuple[str, ...]:
+        if not self.runtime_files:
+            return ("true",)
+        args = [
+            "uv",
+            "sync",
+            "--frozen",
+            "--active",
+            "--no-config",
+            "--script",
+            "/workspace/lutra-runtime.py",
+        ]
+        if self.dependency_groups is not None:
+            args.append("--no-default-groups")
+            args.extend(arg for group in self.dependency_groups for arg in ("--group", group))
+        if self.extras:
+            args.extend(arg for extra in self.extras for arg in ("--extra", extra))
+        return ("sh", "-c", shlex.join(args))
 
     @property
     def required_files(self) -> tuple[Path, ...]:
         files = [self.lock]
         if self.script is not None:
             files.append(self.script)
+        else:
+            files.append(self.root / "pyproject.toml")
         files.extend(local / "pyproject.toml" for local in self.project_roots)
         return tuple(path.relative_to(self.bundle_root) for path in files)
 
     @property
-    def build_files(self) -> dict[str, bytes]:
-        files = {self.lock.relative_to(self.bundle_root).as_posix(): self.lock.read_bytes()}
+    def python_paths(self) -> tuple[str, ...]:
+        """Only non-installable task roots need Python search paths."""
+        roots = set()
         if self.script is not None:
-            match = _SCRIPT_BLOCK.search(self.script.read_text(encoding="utf-8"))
-            if match is None:
-                msg = "PEP 723 metadata block is missing"
-                raise ValueError(msg)
-            files[self.script.relative_to(self.bundle_root).as_posix()] = match.group().encode()
-        for local in self.project_roots:
-            manifest = local / "pyproject.toml"
-            files[manifest.relative_to(self.bundle_root).as_posix()] = manifest.read_bytes()
-        for parent in {*self.root.parents, self.root, *self.local_roots}:
-            if not parent.is_relative_to(self.bundle_root):
-                continue
-            for name in ("uv.toml", ".uv.toml", ".python-version"):
-                config = parent / name
-                if config.is_file():
-                    files[config.relative_to(self.bundle_root).as_posix()] = config.read_bytes()
-        return files
+            roots.add(self.script.parent)
+        for root in self.task_roots:
+            metadata = _metadata(root / "pyproject.toml")
+            uv = metadata.get("tool", {}).get("uv", {})
+            if not uv.get("package", "build-system" in metadata):
+                roots.add(root)
+        return tuple(sorted(path.relative_to(self.bundle_root).as_posix() for path in roots))
 
-    @property
-    def script_includes(self) -> tuple[Path, ...]:
-        """Explicit sources and assets relative to the PEP 723 script.
 
-        Raises:
-            ValueError: If the inline extension is malformed.
-
-        """
-        if self.script is None:
-            return ()
-        match = _SCRIPT_BLOCK.search(self.script.read_text(encoding="utf-8"))
-        if match is None:
-            msg = "PEP 723 metadata block is missing"
-            raise ValueError(msg)
-        metadata = tomllib.loads("\n".join(line[2:] for line in match.group().splitlines()[1:-1]))
-        includes = metadata.get("tool", {}).get("lutra", {}).get("source-includes", [])
-        if not isinstance(includes, list) or any(
-            not isinstance(entry, str) or not entry or Path(entry).is_absolute()
-            for entry in includes
-        ):
-            msg = "PEP 723 tool.lutra.source-includes must be a list of relative paths"
-            raise ValueError(msg)
-        return tuple(self.script.parent / entry for entry in includes)
-
-    def check_lock(self) -> str:
-        args = ["uv", "lock", "--check", "--offline"]
-        if self.script is not None:
-            args.extend(("--script", str(self.script)))
+def _prepare_lock(root: Path, lock: Path, script: Path | None) -> tuple[bytes, str]:
+    script_args = ("--script", str(script)) if script else ()
+    version = _uv(root, "--version").decode().split()[1]
+    if version != UV_VERSION:
+        msg = f"environment preparation requires uv {UV_VERSION}; found {version}"
+        raise ValueError(msg)
+    if not lock.exists():
+        _uv(root, "lock", *script_args)
+    else:
         try:
-            result = subprocess.run(  # ruff: ignore[subprocess-without-shell-equals-true]
-                args, cwd=self.root, capture_output=True, check=False
-            )
-        except FileNotFoundError as exc:
-            msg = "uv is required to prepare a Python task environment"
+            _uv(root, "lock", "--check", "--offline", *script_args)
+        except ValueError as exc:
+            command = f"uv lock --script {script}" if script else f"uv lock --project {root}"
+            msg = f"lock is stale or cannot be checked; run `{command}`: {exc}"
             raise ValueError(msg) from exc
-        if result.returncode:
-            msg = f"uv lock check failed: {result.stderr.decode().strip()}"
+    original_lock = lock.read_bytes()
+    requirement = tomllib.loads(original_lock.decode()).get("requires-python")
+    if not isinstance(requirement, str) or not requirement:
+        msg = "uv lock must declare requires-python"
+        raise ValueError(msg)
+    return original_lock, requirement
+
+
+def _native_lock(locked: dict[str, Any], paths: dict[str, str]) -> bytes:
+    # Keep uv's resolution and markers intact. Only local locations change;
+    # installable source directories use uv's native editable representation.
+    normalized = {os.path.normpath(key): value for key, value in paths.items()}
+
+    def rebase(value: Any) -> Any:  # ruff: ignore[any-type]
+        if isinstance(value, list):
+            return [rebase(item) for item in value]
+        if not isinstance(value, dict):
+            return value
+        result: dict[str, Any] = {}
+        for key, item in value.items():
+            location = (
+                os.path.normpath(item) if key in _LOCAL_KINDS and isinstance(item, str) else None
+            )
+            if location is not None and location in normalized:
+                result["editable" if key == "directory" else key] = normalized[location]
+            else:
+                result[key] = rebase(item)
+        return result
+
+    return tomli_w.dumps(rebase(locked)).encode()
+
+
+def _script_stub(requirement: str) -> bytes:
+    return (
+        "# /// script\n# requires-python = "
+        + json.dumps(requirement)
+        + "\n# dependencies = []\n# ///\n"
+    ).encode()
+
+
+def _default_groups(root: Path, locked: dict[str, Any]) -> tuple[str, ...]:
+    metadata = _metadata(root / "pyproject.toml")
+    configured = metadata.get("tool", {}).get("uv", {}).get("default-groups")
+    if isinstance(configured, list) and all(isinstance(group, str) for group in configured):
+        return tuple(configured)
+    return ("dev",) if "dev" in locked.get("manifest", {}).get("dependency-groups", {}) else ()
+
+
+def _selected_requirements(
+    locked: dict[str, Any],
+    names: list[str],
+    groups: tuple[str, ...],
+    extras: tuple[str, ...] | None,
+) -> list[dict[str, Any]]:
+    manifest = locked.get("manifest", {})
+    available = manifest.get("dependency-groups", {})
+    requirements: list[dict[str, Any]] = [{"name": name} for name in names]
+    if extras:
+        requirements = [{"name": name, "extras": list(extras)} for name in names]
+    for group in groups:
+        entries = available.get(group)
+        if entries is None:
+            entries = next(
+                (
+                    package.get("dev-dependencies", {}).get(group)
+                    for package in locked.get("package", [])
+                    if package.get("name") in names
+                ),
+                None,
+            )
+        if entries is None:
+            msg = f"dependency group {group!r} is not defined in uv.lock"
             raise ValueError(msg)
-        requirement = tomllib.loads(self.lock.read_text(encoding="utf-8")).get("requires-python")
-        if not isinstance(requirement, str) or not requirement:
-            msg = "uv lock must declare requires-python"
-            raise ValueError(msg)
-        return requirement
+        requirements.extend(entries)
+    return requirements
 
 
-def _repository_root(path: Path) -> Path | None:
-    for parent in (path, *path.parents):
-        if (parent / ".jj").exists() or (parent / ".git").exists():
-            return parent
-    runtime_root = os.environ.get("LUTRA_BUNDLE_ROOT")
-    if runtime_root is not None:
-        boundary = Path(runtime_root).resolve()
-        if path.is_relative_to(boundary):
-            return boundary
-    return None
-
-
-def _local_project(root: Path, location: str, repository: Path | None) -> Path:
-    candidate = root / location
-    if any(path.is_symlink() for path in (candidate, *candidate.parents)):
-        msg = f"local uv dependency must not follow a symlink: {location}"
-        raise ValueError(msg)
-    candidate = candidate.resolve()
-    if not candidate.is_dir():
-        msg = f"local uv dependency must be a directory: {location}"
-        raise ValueError(msg)
-    if _repository_root(candidate) != repository or (
-        not candidate.is_relative_to(root)
-        and (repository is None or not candidate.is_relative_to(repository))
-    ):
-        msg = f"local uv dependency leaves repository: {location}"
-        raise ValueError(msg)
-    return candidate
-
-
-def _script_lock(script: Path) -> Path:
-    lock = Path(f"{script}.lock")
-    if lock.is_symlink():
-        msg = f"PEP 723 sidecar lock must not be a symlink: {lock}"
-        raise ValueError(msg)
-    if lock.is_file():
-        return lock
-    args = ["uv", "lock", "--script", str(script)]
-    try:
-        result = subprocess.run(  # ruff: ignore[subprocess-without-shell-equals-true]
-            args, cwd=script.parent, capture_output=True, check=False
+def _selected_projects(root: Path, locked: dict[str, Any], stub: bytes) -> tuple[set[Path], bool]:
+    paths = {location: str(_safe_path(root / location)) for _, location in _local_sources(locked)}
+    with tempfile.TemporaryDirectory() as temporary:
+        script = Path(temporary) / "environment.py"
+        script.write_bytes(stub)
+        script.with_suffix(".py.lock").write_bytes(_native_lock(locked, paths))
+        graph = json.loads(
+            _uv(
+                root, "tree", "--frozen", "--universal", "--format", "json", "--script", str(script)
+            )
         )
-    except FileNotFoundError as exc:
-        msg = "uv is required to create a PEP 723 sidecar lock"
-        raise ValueError(msg) from exc
-    if result.returncode:
-        detail = result.stderr.decode(errors="replace").strip()
-        msg = f"uv script lock failed for {script}: {detail}"
-        raise ValueError(msg)
-    if not lock.is_file():
-        msg = f"uv did not create the PEP 723 sidecar lock: {lock}"
-        raise ValueError(msg)
-    return lock
+    projects = set()
+    installable = False
+    for package in graph["resolution"].values():
+        source = package.get("source", {})
+        for kind in _LOCAL_KINDS:
+            if kind in source:
+                projects.add(_safe_path(Path(source[kind])))
+                installable |= kind != "virtual"
+    return projects, installable
 
 
-def discover_source(source_file: Path) -> UvSource:
-    """Find the locked uv source that owns a task file, creating missing script locks.
+def _sync_inputs(  # ruff: ignore[too-many-arguments]
+    root: Path,
+    bundle_root: Path,
+    locked: dict[str, Any],
+    stub: bytes,
+    *,
+    installable: bool,
+    dependency_groups: tuple[str, ...] | None,
+    extras: tuple[str, ...] | None,
+    selected_groups: tuple[str, ...],
+) -> tuple[dict[str, bytes], dict[str, bytes]]:
+    locations = {location: name for name, location in _local_sources(locked)}
+    # These stable image paths have no relationship to the submitter's directory.
+    image_paths = {location: "local/" + name for location, name in locations.items()}
+    selectors: list[str] = []
+    if dependency_groups is not None:
+        selectors.append("--no-default-groups")
+    selectors.extend(arg for group in selected_groups for arg in ("--group", group))
+    if extras:
+        selectors.extend(arg for extra in extras for arg in ("--extra", extra))
+    build = {
+        "environment.py": stub,
+        "environment.py.lock": _native_lock(locked, image_paths),
+        "sync.sh": (
+            shlex.join([
+                "uv",
+                "sync",
+                "--frozen",
+                "--active",
+                "--no-config",
+                "--script",
+                "/opt/lutra/dependencies/environment.py",
+                *selectors,
+                *(
+                    arg
+                    for name in sorted(set(locations.values()))
+                    for arg in ("--no-install-package", name)
+                ),
+            ])
+            + "\n"
+        ).encode(),
+    }
+    runtime: dict[str, bytes] = {}
+    if installable:
+        runtime_paths = {
+            location: os.path.relpath(_safe_path(root / location), bundle_root)
+            for location in locations
+        }
+        runtime = {
+            "lutra-runtime.py": stub,
+            "lutra-runtime.py.lock": _native_lock(locked, runtime_paths),
+        }
+    return build, runtime
+
+
+def _bundle_layout(
+    root: Path, projects: set[Path], script: Path | None
+) -> tuple[Path, tuple[Path, ...]]:
+    includes = list(_includes(script.parent, _script_metadata(script) or {})) if script else []
+    for project in sorted(projects | ({root} if not script else set())):
+        if not (project / "pyproject.toml").is_file():
+            msg = f"local uv dependency must be a project directory: {project}"
+            raise ValueError(msg)
+        includes.extend(_includes(project, _metadata(project / "pyproject.toml")))
+    # The common ancestor determines archive paths, never the scan scope.
+    anchors = [root, *projects]
+    for include in includes:
+        parts = include.parts
+        first_magic = next((i for i, part in enumerate(parts) if has_magic(part)), len(parts))
+        anchor = _safe_path(Path(*parts[:first_magic]))
+        anchors.append(anchor if anchor.is_dir() else anchor.parent)
+    return Path(os.path.commonpath(anchors)), tuple(includes)
+
+
+def prepare_source(  # ruff: ignore[too-many-locals]
+    task_files: Sequence[Path],
+    *,
+    dependency_groups: tuple[str, ...] | None = None,
+    extras: tuple[str, ...] | None = None,
+) -> UvSource:
+    """Lock, validate and export the single environment owning these task files.
 
     Returns:
-        The locked source and its local package directories.
+        Prepared dependency inputs and the selected runtime source layout.
 
     Raises:
-        ValueError: If a project lock is missing, script locking fails, or a local
-            package crosses a repository boundary.
+        ValueError: If locks, task owners or local sources are invalid.
 
     """
-    source_file = source_file.resolve()
-    if _SCRIPT_BLOCK.search(source_file.read_text(encoding="utf-8")):
-        root = source_file.parent
-        lock = _script_lock(source_file)
-        script = source_file
+    if not task_files:
+        msg = "an environment must declare at least one task"
+        raise ValueError(msg)
+    files = tuple(_safe_path(path) for path in task_files)
+    scripts = [path for path in files if _script_metadata(path) is not None]
+    if len(set(scripts)) > 1:
+        msg = "all environment tasks must share one locked project or script"
+        raise ValueError(msg)
+    script = scripts[0] if scripts else None
+    if script is not None and (dependency_groups is not None or extras):
+        msg = "dependency groups and extras require a uv project"
+        raise ValueError(msg)
+    owners: list[tuple[Path, Path]] = [_owner(path) for path in files] if script is None else []
+    if owners and len({owner for owner, _ in owners}) != 1:
+        msg = "all environment tasks must share one locked project or script"
+        raise ValueError(msg)
+    root = script.parent if script else owners[0][0]
+    lock = _safe_path(Path(f"{script}.lock") if script else root / "uv.lock")
+    original_lock, requirement = _prepare_lock(root, lock, script)
+    locked = tomllib.loads(original_lock.decode())
+    task_roots = {project for _, project in owners}
+    names = sorted(
+        {_metadata(p / "pyproject.toml").get("project", {}).get("name", "") for p in task_roots}
+        - {""}
+    )
+    # Native script sync has exactly these runtime roots, with no workspace or
+    # default development groups. Frozen sync reads requirements from the lock.
+    if script is None:
+        groups = (
+            dependency_groups if dependency_groups is not None else _default_groups(root, locked)
+        )
+        locked["manifest"] = {"requirements": _selected_requirements(locked, names, groups, extras)}
     else:
-        for path in source_file.parents:
-            if (path / "pyproject.toml").is_file() and (path / "uv.lock").is_file():
-                root, lock, script = path, path / "uv.lock", None
-                break
-        else:
-            msg = "task source must have a uv lock or PEP 723 sidecar lock"
-            raise ValueError(msg)
-    data = tomllib.loads(lock.read_text(encoding="utf-8"))
-    local = {root}
-    projects = {root} if script is None else set()
-    repository = _repository_root(root)
-    for package in data.get("package", []):
-        package_source = package.get("source", {})
-        for kind in _LOCAL_KINDS:
-            if kind not in package_source:
-                continue
-            candidate = _local_project(root, package_source[kind], repository)
-            local.add(candidate)
-            projects.add(candidate)
-    bundle_root = repository if repository is not None else root
-    return UvSource(root, bundle_root, lock, tuple(sorted(local)), tuple(sorted(projects)), script)
+        groups = ()
+    stub = _script_stub(requirement)
+    projects, installable = _selected_projects(root, locked, stub)
+    projects.update(task_roots)
+    if script:
+        for path in files:
+            if path != script and not any(path.is_relative_to(p) for p in projects):
+                msg = (
+                    "all environment tasks must share one locked project or script "
+                    "(or its declared local dependencies)"
+                )
+                raise ValueError(msg)
+        task_roots = {
+            max((p for p in projects if path.is_relative_to(p)), key=lambda p: len(p.parts))
+            for path in files
+            if path != script
+        }
+    bundle_root, includes = _bundle_layout(root, projects, script)
+    build_files, runtime_files = _sync_inputs(
+        root,
+        bundle_root,
+        locked,
+        stub,
+        installable=installable,
+        dependency_groups=dependency_groups,
+        extras=extras,
+        selected_groups=groups,
+    )
+    build_files["uv.lock"] = original_lock
+    build_files["selection.json"] = json.dumps(
+        {
+            "recipe": RECIPE,
+            "uv": UV_VERSION,
+            "kind": "script" if script else "project",
+            "packages": names,
+            "dependency_groups": dependency_groups,
+            "extras": extras,
+        },
+        sort_keys=True,
+    ).encode()
+    # Omit unrelated workspace members even when an owning root is scanned.
+    all_local = {_safe_path(root / location) for _, location in _local_sources(locked)}
+    return UvSource(
+        root,
+        bundle_root,
+        lock,
+        tuple(sorted(projects)),
+        tuple(sorted(task_roots)),
+        tuple(includes),
+        requirement,
+        build_files,
+        runtime_files,
+        script,
+        tuple(sorted(all_local - projects - {root})),
+        dependency_groups,
+        extras,
+    )

@@ -13,7 +13,7 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Generic, ParamSpec, TypeVar, cast, overload
 
-from lutra._dependency import UvSource, discover_source
+from lutra._dependency import UvSource, _safe_path, prepare_source
 from lutra._gen.lutra.v1.lutra_pb import ActionSpec
 from lutra.value import dumps
 
@@ -98,9 +98,7 @@ class TaskImage:
 
     name: str = "container"
     from_image: str = "docker.io/library/python:3.12-slim-bookworm"
-    build_context: Path | None = None
-    build_command: tuple[str, ...] | None = None
-    workdir: str = "."
+    platform: str | None = None
 
 
 @dataclass(frozen=True, init=False)
@@ -159,15 +157,27 @@ class TaskEnvironment:
     resources: Resources = field(default_factory=Resources)
     env_vars: Mapping[str, str] = field(default_factory=dict)
     dependencies: tuple[TaskEnvironment, ...] = ()
-    import_roots: tuple[Path, ...] | None = None
+    dependency_groups: tuple[str, ...] | None = None
+    extras: tuple[str, ...] | None = None
     _tasks: list[Task[..., object]] = field(default_factory=list, init=False, repr=False)
 
     def __post_init__(self) -> None:
-        """Copy mutable declarations supplied by the caller."""
+        """Copy mutable declarations supplied by the caller.
+
+        Raises:
+            ValueError: If a dependency selector is invalid.
+
+        """
         object.__setattr__(self, "env_vars", MappingProxyType(dict(self.env_vars)))
         object.__setattr__(self, "dependencies", tuple(self.dependencies))
-        if self.import_roots is not None:
-            object.__setattr__(self, "import_roots", tuple(self.import_roots))
+        for field_name in ("dependency_groups", "extras"):
+            value = getattr(self, field_name)
+            if value is not None:
+                if any(not isinstance(item, str) or not item for item in value):
+                    msg = f"{field_name} must contain non-empty strings"
+                    raise ValueError(msg)
+                normalized = tuple(sorted(set(value)))
+                object.__setattr__(self, field_name, normalized)
 
     @property
     def tasks(self) -> tuple[Task[..., object], ...]:
@@ -176,21 +186,12 @@ class TaskEnvironment:
 
     @property
     def dependency_source(self) -> UvSource:
-        """The one locked dependency source shared by all entrypoints.
-
-        Raises:
-            ValueError: If entrypoints do not share a locked source.
-
-        """
-        if not self._tasks:
-            msg = "an environment must declare at least one task"
-            raise ValueError(msg)
-        sources = [discover_source(task.source_file) for task in self._tasks]
-        first = sources[0]
-        if any(source.identity != first.identity for source in sources[1:]):
-            msg = "all environment tasks must share one locked project or script"
-            raise ValueError(msg)
-        return first
+        """The one locked dependency source shared by all entrypoints."""
+        return prepare_source(
+            tuple(task.source_file for task in self._tasks),
+            dependency_groups=self.dependency_groups,
+            extras=self.extras,
+        )
 
     @overload
     def task(
@@ -299,24 +300,18 @@ class Task(Generic[P, R_co]):
             message = "cached tasks require a semantic version such as 1.2.0"
             raise ValueError(message)
         self.cache, self.version = cache, version
-        self.source_file = Path(inspect.getfile(cast("FunctionType", function))).resolve()
-        source = discover_source(self.source_file)
+        self.source_file = _safe_path(
+            Path(inspect.getfile(cast("FunctionType", function))).absolute()
+        )
         module_name = function.__module__
         loaded = sys.modules.get(module_name)
         spec = getattr(loaded, "__spec__", None)
         if module_name == "__main__":
             module_name = spec.name if spec is not None and spec.name else self.source_file.stem
+        self.file_entrypoint = function.__module__ == "__main__" and spec is None
         self.function = function
         self.module = module_name
         self.qualname = function.__qualname__
-        if source.is_script or function.__module__ == "__main__":
-            relative = self.source_file.relative_to(source.bundle_root).as_posix()
-            if ":" in relative:
-                msg = "task source path cannot contain a colon"
-                raise ValueError(msg)
-            self.entrypoint_value = f"file:{relative}:{self.qualname}"
-        else:
-            self.entrypoint_value = f"{self.module}:{self.qualname}"
         self.entrypoint_id = len(environment.tasks) + 1
         update_wrapper(self, function)
         self.__module__ = module_name
@@ -332,11 +327,22 @@ class Task(Generic[P, R_co]):
         inspect.signature(self.function).bind(*args, **kwargs)
         return Invocation(self, args, kwargs)
 
-    def entrypoint(self) -> tuple[str, ...]:
+    def entrypoint(self, source: UvSource) -> tuple[str, ...]:
         """Return the server registration declaration.
 
         Returns:
             The entrypoint declaration.
 
+        Raises:
+            ValueError: If a file entrypoint contains a colon.
+
         """
-        return ("./.venv/bin/python", "-m", "lutra.serve", self.entrypoint_value)
+        if self.source_file == source.script or self.file_entrypoint:
+            relative = self.source_file.relative_to(source.bundle_root).as_posix()
+            if ":" in relative:
+                msg = "task source path cannot contain a colon"
+                raise ValueError(msg)
+            entrypoint = f"file:{relative}:{self.qualname}"
+        else:
+            entrypoint = f"{self.module}:{self.qualname}"
+        return ("/opt/lutra/venv/bin/python", "-m", "lutra.serve", entrypoint)

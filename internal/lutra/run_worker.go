@@ -178,7 +178,8 @@ func cacheKey(row db.LoadRunTasksRow, spec *lutrav1.ActionSpec, runtime string) 
 	server := map[string]any{
 		"profile":       "lutra.task-cache.v2",
 		"environment":   environment.GetName(),
-		"import_roots":  environment.GetImportRoots(),
+		"python_paths":  environment.GetPythonPaths(),
+		"workdir":       environment.GetWorkdir(),
 		"entrypoint_id": row.EntrypointID,
 		"command":       entrypoint.GetCommand().GetArgs(),
 		"task_version":  version,
@@ -192,8 +193,8 @@ func cacheKey(row db.LoadRunTasksRow, spec *lutrav1.ActionSpec, runtime string) 
 				"cpu_millis":   uint64(image.GetResources().GetCpuMillis()),
 				"memory_bytes": image.GetResources().GetMemoryBytes(),
 			},
-			"env": image.GetEnvVars(), "build_context_uri": image.GetBuildContextUri(), "build_command": image.GetBuildCommand().GetArgs(),
-			"workdir": image.GetWorkdir(), "python_requires": image.GetPythonRequires(),
+			"env": image.GetEnvVars(), "build_context_uri": image.GetBuildContextUri(),
+			"platform": image.GetPlatform(), "python_requires": image.GetPythonRequires(),
 		},
 		"dependencies": dependencies,
 	}

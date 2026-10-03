@@ -2,23 +2,22 @@
 
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from pathlib import Path
 from typing import TYPE_CHECKING, Generic, Literal, TypeVar
 
 import httpx
 import pyqwest
 
 from lutra._blob import upload_blob
-from lutra._bundle import SOURCE_BUNDLE_MIME, build_bundle, resolve_context, select_files
+from lutra._bundle import SOURCE_BUNDLE_MIME, bundle_bytes
 from lutra._gen.lutra.v1.blob_connect import BlobServiceClient
 from lutra._gen.lutra.v1.blob_pb import GetDownloadRequest
 from lutra._gen.lutra.v1.log_pb import StreamCursor
 from lutra._gen.lutra.v1.lutra_connect import LutraServiceClient
 from lutra._gen.lutra.v1.lutra_pb import (
     CancelRunRequest,
+    Command,
     CreateRunRequest,
     Entrypoint,
     EnvironmentIdentifier,
@@ -28,7 +27,6 @@ from lutra._gen.lutra.v1.lutra_pb import (
     RegisterEnvironmentRequest,
     Resources,
     Run,
-    StartupCommand,
     TaskAction,
     TaskActionStatus,
     WatchRunRequest,
@@ -43,9 +41,8 @@ if TYPE_CHECKING:
     import logging
     from collections.abc import AsyncIterator
 
-    from lutra._dependency import UvSource
     from lutra._live import LiveDisplay
-    from lutra.task import Invocation, TaskEnvironment, TaskImage
+    from lutra.task import Invocation, TaskEnvironment
 
 R = TypeVar("R")
 _ID_SUFFIX_LENGTH = 8
@@ -274,100 +271,31 @@ def _require_action(action: TaskAction | None) -> TaskAction:
     return action
 
 
-def _limited_bundle(
-    root: Path,
-    *,
-    includes: tuple[Path, ...] = (),
-    selected: tuple[Path, ...] | None = None,
-    generated: dict[str, bytes] | None = None,
-) -> bytes:
-    bundle = build_bundle(root, includes=includes, selected=selected, generated=generated)
-    if len(bundle) > 64 << 20:
-        msg = "bundle exceeds 64 MiB"
-        raise ValueError(msg)
-    return bundle
-
-
 @dataclass(frozen=True)
 class _BundleInputs:
     source: bytes
     build_context: bytes
-    import_roots: tuple[str, ...]
+    python_paths: tuple[str, ...]
     python_requires: str
     workdir: str
-    build_command: tuple[str, ...]
-
-
-def _image_build_context(source: UvSource, image: TaskImage) -> bytes:
-    root = source.bundle_root
-    generated = source.build_files
-    if image.build_context is None:
-        return _limited_bundle(root, selected=(), generated=generated)
-    context = resolve_context(source.root, image.build_context)
-    selected = tuple(context.relative_to(root) / path for path in select_files(context))
-    return _limited_bundle(root, selected=selected, generated=generated)
-
-
-def _import_roots(source: UvSource, environment: TaskEnvironment) -> tuple[str, ...]:
-    root = source.bundle_root
-    custom = environment.import_roots
-    roots: list[str] = []
-    for path in custom if custom is not None else source.import_roots:
-        resolved = ((source.root if custom is not None else root) / path).resolve()
-        if not resolved.is_relative_to(root) or not resolved.is_dir():
-            msg = f"import root must be a directory inside the source root: {path}"
-            raise ValueError(msg)
-        roots.append(resolved.relative_to(root).as_posix())
-    return tuple(roots)
-
-
-def _default_build_command(source: UvSource, workdir: str) -> tuple[str, ...]:
-    relative_project = os.path.relpath(source.root, source.bundle_root / workdir)
-    if source.script is not None:
-        script = os.path.relpath(source.script, source.bundle_root / workdir)
-        skip_local = tuple(
-            argument
-            for name in source.local_package_names
-            for argument in ("--no-install-package", name)
-        )
-        return ("uv", "sync", "--script", script, "--frozen", "--active", *skip_local)
-    command = (
-        "uv",
-        "sync",
-        "--frozen",
-        "--active",
-        "--all-packages",
-        "--no-dev",
-        "--no-install-local",
-    )
-    return command if relative_project == "." else (*command, "--project", relative_project)
+    entrypoints: tuple[tuple[str, ...], ...]
+    prepare_command: tuple[str, ...]
 
 
 def _prepare_bundle(environment: TaskEnvironment) -> _BundleInputs:
     source = environment.dependency_source
-    python_requires = source.check_lock()
     root = source.bundle_root
     bundle = build_source_bundle(
         source, tuple(task.source_file.relative_to(root) for task in environment.tasks)
     )
-    image_workdir = source.root / environment.image.workdir
-    if (
-        Path(environment.image.workdir).is_absolute()
-        or ".." in environment.image.workdir.split("/")
-        or not image_workdir.resolve().is_relative_to(source.root)
-    ):
-        msg = "image workdir must be inside the locked project"
-        raise ValueError(msg)
-    workdir = image_workdir.relative_to(root).as_posix()
     return _BundleInputs(
         bundle,
-        _image_build_context(source, environment.image),
-        _import_roots(source, environment),
-        python_requires,
-        workdir,
-        _default_build_command(source, workdir)
-        if environment.image.build_command is None
-        else environment.image.build_command,
+        bundle_bytes(source.build_files),
+        source.python_paths,
+        source.python_requires,
+        source.root.relative_to(root).as_posix(),
+        tuple(task.entrypoint(source) for task in environment.tasks),
+        source.prepare_command,
     )
 
 
@@ -613,7 +541,9 @@ class Client:
                         namespace_id=namespace_id,
                         name=current.name,
                         source_uri=uri,
-                        import_roots=list(inputs.import_roots),
+                        python_paths=list(inputs.python_paths),
+                        workdir=inputs.workdir,
+                        prepare_command=Command(args=list(inputs.prepare_command)),
                         image=ImageSpec(
                             name=current.image.name,
                             from_image=current.image.from_image,
@@ -623,8 +553,7 @@ class Client:
                             ),
                             env_vars=dict(current.env_vars),
                             build_context_uri=build_uri,
-                            build_command=StartupCommand(args=list(inputs.build_command)),
-                            workdir=inputs.workdir,
+                            platform=current.image.platform or "",
                             python_requires=inputs.python_requires,
                         ),
                         dependencies=[
@@ -633,13 +562,13 @@ class Client:
                         ],
                         entrypoints=[
                             Entrypoint(
-                                command=StartupCommand(args=list(task.entrypoint())),
+                                command=Command(args=list(inputs.entrypoints[index])),
                                 name=task.qualname,
                                 max_attempts=task.max_attempts,
                                 cache=task.cache,
                                 task_version=task.version or "" if task.cache else "",
                             )
-                            for task in current.tasks
+                            for index, task in enumerate(current.tasks)
                         ],
                     )
                 )

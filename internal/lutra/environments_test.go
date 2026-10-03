@@ -8,23 +8,22 @@ import (
 	"github.com/google/uuid"
 )
 
-func TestEnvironmentImportRootsAreValidated(t *testing.T) {
+func TestEnvironmentPythonPathsAreValidated(t *testing.T) {
 	uri := sourceURI(bytes.Repeat([]byte{1}, 32))
 	spec := &lutrav1.EnvironmentSpec{
-		NamespaceId: uuid.NewString(), Name: "tasks", SourceUri: uri,
+		NamespaceId: uuid.NewString(), Name: "tasks", SourceUri: uri, Workdir: ".",
 		Image: &lutrav1.ImageSpec{
-			Name: "container", FromImage: "python:3.12-slim", BuildContextUri: uri, Workdir: ".",
-			BuildCommand: &lutrav1.StartupCommand{Args: []string{"uv", "pip", "sync"}},
+			Name: "container", FromImage: "python:3.12-slim", BuildContextUri: uri,
 		},
-		Entrypoints: []*lutrav1.Entrypoint{{Command: &lutrav1.StartupCommand{Args: []string{"python", "-m", "lutra.serve"}}, MaxAttempts: 1}},
-		ImportRoots: []string{".", "packages/worker/src"},
+		Entrypoints: []*lutrav1.Entrypoint{{Command: &lutrav1.Command{Args: []string{"python", "-m", "lutra.serve"}}, MaxAttempts: 1}},
+		PythonPaths: []string{".", "packages/worker/src"},
 	}
 	normalized, err := normalizeEnvironment(spec)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(normalized.spec.ImportRoots) != 2 || normalized.spec.ImportRoots[1] != "packages/worker/src" {
-		t.Fatalf("normalized import roots = %v", normalized.spec.ImportRoots)
+	if len(normalized.spec.PythonPaths) != 2 || normalized.spec.PythonPaths[1] != "packages/worker/src" {
+		t.Fatalf("normalized Python paths = %v", normalized.spec.PythonPaths)
 	}
 	spec.Image.Name = "local-python"
 	if _, err := normalizeEnvironment(spec); err == nil {
@@ -40,9 +39,9 @@ func TestEnvironmentImportRootsAreValidated(t *testing.T) {
 		t.Fatal("runtime image change did not change the environment version")
 	}
 	for _, root := range []string{"../outside", "/absolute", "a:b", "a\\b", "a/../b"} {
-		spec.ImportRoots = []string{root}
+		spec.PythonPaths = []string{root}
 		if _, err := normalizeEnvironment(spec); err == nil {
-			t.Fatalf("unsafe import root %q accepted", root)
+			t.Fatalf("unsafe Python path %q accepted", root)
 		}
 	}
 }

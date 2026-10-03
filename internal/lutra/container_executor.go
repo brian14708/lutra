@@ -3,7 +3,6 @@ package lutra
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -15,14 +14,15 @@ import (
 	"path"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
 
 	lutrav1 "github.com/brian14708/lutra/gen/lutra/v1"
+	"github.com/brian14708/lutra/internal/multihash"
 	"github.com/brian14708/lutra/internal/taskstdio"
-	"github.com/fxamacker/cbor/v2"
 	"github.com/google/uuid"
 )
 
@@ -52,35 +52,47 @@ func containerRuntime() (string, error) {
 
 func (e *ContainerExecutor) ImageKey(spec *lutrav1.EnvironmentSpec) ([]byte, error) {
 	image := spec.GetImage()
-	mode, err := cbor.CanonicalEncOptions().EncMode()
+	recipe, err := dockerfile(image)
 	if err != nil {
 		return nil, err
 	}
-	value, err := mode.Marshal(map[string]any{
-		"profile": "lutra.image.container-python.v3", "from_image": image.GetFromImage(), "uv_image": uvBuildImage,
-		"build_context_uri": image.GetBuildContextUri(), "build_command": image.GetBuildCommand().GetArgs(),
-		"workdir": image.GetWorkdir(), "python_requires": image.GetPythonRequires(),
-	})
-	if err != nil {
-		return nil, err
-	}
-	hash := sha256.Sum256(value)
+	// The recipe includes the base image, uv toolchain, and Python requirement.
+	hash := multihash.Sum([]byte(recipe), []byte(image.GetBuildContextUri()), []byte(imagePlatform(image)))
 	return hash[:], nil
 }
 
 func containerWorkdir(workdir string) string { return path.Join("/workspace", workdir) }
 
+func imagePlatform(image *lutrav1.ImageSpec) string {
+	if image.GetPlatform() != "" {
+		return image.GetPlatform()
+	}
+	return "linux/" + runtime.GOARCH
+}
+
+const containerBootstrap = `#!/bin/sh
+set -eu
+if [ "$1" = sh ] && [ "$2" = -c ]; then
+    sh -c "$3"
+    shift 3
+else
+    "$1"
+    shift
+fi
+[ "$#" -gt 0 ] && [ "$1" = "--" ] && shift
+exec "$@"
+`
+
 func dockerfile(image *lutrav1.ImageSpec) (string, error) {
-	venv, err := json.Marshal([]string{"uv", "venv", "--python", image.GetPythonRequires(), ".venv"})
+	venv, err := json.Marshal([]string{"uv", "venv", "--python", image.GetPythonRequires(), "/opt/lutra/venv"})
 	if err != nil {
 		return "", err
 	}
-	build, err := json.Marshal(image.GetBuildCommand().GetArgs())
+	bootstrap, err := json.Marshal([]string{"/bin/sh", "-c", "printf '%s' '" + containerBootstrap + "' > /opt/lutra/bootstrap && chmod 755 /opt/lutra/bootstrap"})
 	if err != nil {
 		return "", err
 	}
-	workdir := containerWorkdir(image.GetWorkdir())
-	return fmt.Sprintf("FROM %s AS lutra_uv\nFROM %s\nCOPY --from=lutra_uv /uv /usr/local/bin/uv\nUSER 0:0\nWORKDIR %s\nENV PATH=/usr/local/bin:$PATH\nENV UV_PROJECT_ENVIRONMENT=%s\nENV VIRTUAL_ENV=%s\nCOPY . /workspace/\nRUN %s\nRUN %s\n", uvBuildImage, image.GetFromImage(), workdir, workdir+"/.venv", workdir+"/.venv", venv, build), nil
+	return fmt.Sprintf("FROM %s AS lutra_uv\nFROM %s\nCOPY --from=lutra_uv /uv /usr/local/bin/uv\nUSER 0:0\nWORKDIR /opt/lutra\nENV PATH=/opt/lutra/venv/bin:/usr/local/bin:$PATH\nENV VIRTUAL_ENV=/opt/lutra/venv\nENV UV_PYTHON_INSTALL_DIR=/opt/lutra/python\nENV UV_CACHE_DIR=/opt/lutra/cache\nENV UV_LINK_MODE=copy\nCOPY . /opt/lutra/dependencies/\nRUN %s\nRUN [\"sh\", \"/opt/lutra/dependencies/sync.sh\"]\nRUN %s\nWORKDIR /workspace\n", uvBuildImage, image.GetFromImage(), venv, bootstrap), nil
 }
 
 func (e *ContainerExecutor) Build(ctx context.Context, req *EnvironmentExecution) (*Image, error) {
@@ -114,7 +126,7 @@ func (e *ContainerExecutor) Build(ctx context.Context, req *EnvironmentExecution
 		logWriter = io.Discard
 	}
 	var pullOutput bytes.Buffer
-	pullCommand := exec.CommandContext(ctx, e.Runtime, "pull", image.GetFromImage())
+	pullCommand := exec.CommandContext(ctx, e.Runtime, "pull", "--platform", imagePlatform(image), image.GetFromImage())
 	pullLog := req.PullOutput
 	if pullLog == nil {
 		pullLog = logWriter
@@ -126,7 +138,7 @@ func (e *ContainerExecutor) Build(ctx context.Context, req *EnvironmentExecution
 			return nil, fmt.Errorf("pull container base image: %w: %s", pullErr, strings.TrimSpace(pullOutput.String()))
 		}
 	}
-	command := exec.CommandContext(ctx, e.Runtime, "build", "--tag", tag, "--file", "-", contextDir)
+	command := exec.CommandContext(ctx, e.Runtime, "build", "--platform", imagePlatform(image), "--tag", tag, "--file", "-", contextDir)
 	command.Stdin = strings.NewReader(file)
 	command.Stdout, command.Stderr = logWriter, logWriter
 	if err := command.Run(); err != nil {
@@ -144,9 +156,9 @@ func containerTaskEnv(req *EnvironmentExecution) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	workdir := containerWorkdir(req.Spec.GetImage().GetWorkdir())
-	importPaths := make([]string, 0, len(req.Spec.GetImportRoots()))
-	for _, root := range req.Spec.GetImportRoots() {
+	workdir := containerWorkdir(req.Spec.GetWorkdir())
+	importPaths := make([]string, 0, len(req.Spec.GetPythonPaths()))
+	for _, root := range req.Spec.GetPythonPaths() {
 		importPaths = append(importPaths, path.Join("/workspace", root))
 	}
 	values := map[string]string{
@@ -201,7 +213,8 @@ func (e *ContainerExecutor) Run(ctx context.Context, image *Image, req *Environm
 	}
 	imageSpec := req.Spec.GetImage()
 	startup := req.Spec.GetEntrypoints()[req.EntrypointID-1].GetCommand().GetArgs()
-	workdir := containerWorkdir(imageSpec.GetWorkdir())
+	prepare := req.Spec.GetPrepareCommand().GetArgs()
+	workdir := containerWorkdir(req.Spec.GetWorkdir())
 	containerName := "lutra-" + uuid.NewString()
 	remove := func() {
 		cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -210,10 +223,16 @@ func (e *ContainerExecutor) Run(ctx context.Context, image *Image, req *Environm
 			slog.Error("remove task container", "container", containerName, "error", err)
 		}
 	}
-	args := []string{"create", "--rm", "--interactive", "--name", containerName, "--user", "0:0", "--cpus", strconv.FormatFloat(float64(imageSpec.GetResources().GetCpuMillis())/1000, 'f', 3, 64), "--memory", strconv.FormatUint(imageSpec.GetResources().GetMemoryBytes(), 10), "--memory-swap", strconv.FormatUint(imageSpec.GetResources().GetMemoryBytes(), 10), "--workdir", workdir, "--entrypoint", startup[0], "--label", "lutra.run=" + req.RunID, "--label", "lutra.action=" + req.ActionID}
+	args := []string{"create", "--rm", "--interactive", "--name", containerName, "--user", "0:0", "--cpus", strconv.FormatFloat(float64(imageSpec.GetResources().GetCpuMillis())/1000, 'f', 3, 64), "--memory", strconv.FormatUint(imageSpec.GetResources().GetMemoryBytes(), 10), "--memory-swap", strconv.FormatUint(imageSpec.GetResources().GetMemoryBytes(), 10), "--workdir", workdir, "--entrypoint", "/opt/lutra/bootstrap", "--platform", imagePlatform(imageSpec), "--label", "lutra.run=" + req.RunID, "--label", "lutra.action=" + req.ActionID}
+	// Cache uv downloads and isolated backend requirements within a namespace
+	// and dependency image. Containers and their virtualenvs remain fresh.
+	cacheKey := multihash.Sum([]byte(req.Environment.NamespaceId), []byte(tag))
+	args = append(args, "--volume", "lutra-uv-"+hex.EncodeToString(cacheKey[:])+":/opt/lutra/cache")
 	args = append(args, env...)
 	args = append(args, tag)
-	args = append(args, startup[1:]...)
+	args = append(args, prepare...)
+	args = append(args, "--")
+	args = append(args, startup...)
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}

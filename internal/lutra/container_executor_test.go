@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
@@ -17,8 +18,10 @@ import (
 	"time"
 
 	lutrav1 "github.com/brian14708/lutra/gen/lutra/v1"
+	"github.com/fxamacker/cbor/v2"
 	"github.com/google/uuid"
 	"github.com/klauspost/compress/zstd"
+	"google.golang.org/protobuf/proto"
 )
 
 func containerTestBundle(t *testing.T, files map[string]string) ([]byte, string) {
@@ -141,7 +144,7 @@ func TestCanceledContainerCreateReturnsAndCleansUp(t *testing.T) {
 		Environment: &lutrav1.EnvironmentIdentifier{NamespaceId: "test", Name: "test", Version: "test"},
 		Spec: &lutrav1.EnvironmentSpec{
 			SourceUri: uri, Image: &lutrav1.ImageSpec{Resources: &lutrav1.Resources{CpuMillis: 500, MemoryBytes: 256 << 20}},
-			Entrypoints: []*lutrav1.Entrypoint{{Command: &lutrav1.StartupCommand{Args: []string{"python", "task.py"}}}},
+			Entrypoints: []*lutrav1.Entrypoint{{Command: &lutrav1.Command{Args: []string{"python", "task.py"}}}},
 		},
 		EntrypointID: 1,
 	}
@@ -190,10 +193,10 @@ func TestCanceledContainerCreateReturnsAndCleansUp(t *testing.T) {
 func TestContainerImageKeyAndRegistration(t *testing.T) {
 	uri := sourceURI(bytes.Repeat([]byte{1}, 32))
 	spec := &lutrav1.EnvironmentSpec{
-		NamespaceId: uuid.NewString(), Name: "container", SourceUri: uri,
-		Image:       &lutrav1.ImageSpec{Name: "container", FromImage: "python:3.12-slim", BuildContextUri: uri, Workdir: ".", PythonRequires: ">=3.11", BuildCommand: &lutrav1.StartupCommand{Args: []string{"uv", "--version"}}},
-		Entrypoints: []*lutrav1.Entrypoint{{Command: &lutrav1.StartupCommand{Args: []string{"./.venv/bin/python", "task.py"}}, MaxAttempts: 1}},
-		ImportRoots: []string{"."},
+		NamespaceId: uuid.NewString(), Name: "container", SourceUri: uri, Workdir: ".",
+		Image:       &lutrav1.ImageSpec{Name: "container", FromImage: "python:3.12-slim", BuildContextUri: uri, PythonRequires: ">=3.11"},
+		Entrypoints: []*lutrav1.Entrypoint{{Command: &lutrav1.Command{Args: []string{"/opt/lutra/venv/bin/python", "task.py"}}, MaxAttempts: 1}},
+		PythonPaths: []string{"."},
 	}
 	if _, err := normalizeEnvironment(spec); err != nil {
 		t.Fatal(err)
@@ -222,9 +225,9 @@ func TestContainerImageKeyAndRegistration(t *testing.T) {
 		t.Fatal("Dockerfile injection in base image was accepted")
 	}
 	spec.Image.FromImage = "python:3.12-slim"
-	spec.Image.Workdir = "${HOME}"
+	spec.Workdir = "../outside"
 	if _, err := normalizeEnvironment(spec); err == nil {
-		t.Fatal("Dockerfile variable in workdir was accepted")
+		t.Fatal("workdir traversal was accepted")
 	}
 }
 
@@ -235,8 +238,8 @@ func TestContainerExecutorBuildAndRun(t *testing.T) {
 	}
 	for _, runtime := range []string{"docker", "podman"} {
 		t.Run(runtime, func(t *testing.T) {
-			if _, err := exec.LookPath(runtime); err != nil {
-				t.Skipf("%s CLI unavailable", runtime)
+			if err := exec.Command(runtime, "info").Run(); err != nil {
+				t.Skipf("%s unavailable: %v", runtime, err)
 			}
 			testContainerBuildAndRun(t, runtime, base)
 		})
@@ -244,7 +247,7 @@ func TestContainerExecutorBuildAndRun(t *testing.T) {
 }
 
 func testContainerBuildAndRun(t *testing.T, runtime, base string) {
-	build, buildURI := containerTestBundle(t, map[string]string{"task.py": "raise RuntimeError('source was not copied')\n"})
+	build, buildURI := containerTestBundle(t, map[string]string{"sync.sh": "uv sync --frozen --active --no-config --script /opt/lutra/dependencies/environment.py\n", "environment.py": "# /// script\n# requires-python = \">=3.11\"\n# dependencies = []\n# ///\n", "environment.py.lock": "version = 1\nrevision = 3\nrequires-python = \">=3.11\"\n[manifest]\nrequirements = []\n"})
 	source, taskURI := containerTestBundle(t, map[string]string{"task.py": `import json, sys
 task_id = None
 for line in sys.stdin:
@@ -271,8 +274,8 @@ for line in sys.stdin:
 		Environment: &lutrav1.EnvironmentIdentifier{NamespaceId: "test", Name: "container", Version: "test"},
 		Spec: &lutrav1.EnvironmentSpec{
 			SourceUri:   taskURI,
-			Image:       &lutrav1.ImageSpec{Name: "container", FromImage: base, BuildContextUri: buildURI, Workdir: ".", PythonRequires: ">=3.11", BuildCommand: &lutrav1.StartupCommand{Args: []string{"uv", "--version"}}, Resources: &lutrav1.Resources{CpuMillis: 500, MemoryBytes: 256 << 20}},
-			Entrypoints: []*lutrav1.Entrypoint{{Command: &lutrav1.StartupCommand{Args: []string{"./.venv/bin/python", "-u", "task.py"}}}},
+			Image:       &lutrav1.ImageSpec{Name: "container", FromImage: base, BuildContextUri: buildURI, PythonRequires: ">=3.11", Resources: &lutrav1.Resources{CpuMillis: 500, MemoryBytes: 256 << 20}},
+			Entrypoints: []*lutrav1.Entrypoint{{Command: &lutrav1.Command{Args: []string{"/opt/lutra/venv/bin/python", "-u", "task.py"}}}},
 		},
 		EntrypointID: 1, RunID: "test-run", ActionID: "test-action", Attempt: 1,
 		TaskAPIHandler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -326,6 +329,28 @@ for line in sys.stdin:
 	if err != nil || cached == nil || cached.ArtifactURI != image.ArtifactURI {
 		t.Fatalf("reuse cached image: %v, image = %v", err, cached)
 	}
+	failedSource, failedURI := containerTestBundle(t, map[string]string{"lutra-runtime.py": "# /// script\n# requires-python = \">=3.11\"\n# dependencies = []\n# ///\n", "lutra-runtime.py.lock": `version = 1
+revision = 3
+requires-python = ">=3.11"
+[manifest]
+requirements = [{name="missing"}]
+[[package]]
+name = "missing"
+version = "0.1"
+source = {editable = "missing"}
+`})
+	bundles[failedURI] = failedSource
+	request.Spec.SourceUri = failedURI
+	failedJob, err := executor.Run(t.Context(), image, request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := failedJob.Wait(t.Context()); err == nil {
+		t.Fatal("editable setup failure was not propagated")
+	}
+	if err := exec.Command(runtime, "container", "inspect", failedJob.ID()).Run(); err == nil {
+		t.Fatal("container with failed setup was not removed")
+	}
 	hangingSource, hangingURI := containerTestBundle(t, map[string]string{"task.py": "import sys\nfor line in sys.stdin: pass\n"})
 	bundles[hangingURI] = hangingSource
 	request.Spec.SourceUri = hangingURI
@@ -343,5 +368,168 @@ for line in sys.stdin:
 	}
 	if output, err := exec.Command(runtime, "container", "inspect", hangingJob.ID()).CombinedOutput(); err == nil {
 		t.Fatalf("canceled container was not removed: %v: %s", err, output)
+	}
+}
+
+// This exercises SDK preparation and the real task host, including the example's
+// ordinary local dependency on the SDK. Both submissions share one dependency image.
+func TestContainerSourceOverlay(t *testing.T) {
+	base := os.Getenv("LUTRA_TEST_CONTAINER_BASE")
+	if base == "" {
+		t.Skip("set LUTRA_TEST_CONTAINER_BASE to run container integration tests")
+	}
+	for _, runtime := range []string{"docker", "podman"} {
+		t.Run(runtime, func(t *testing.T) {
+			if err := exec.Command(runtime, "info").Run(); err != nil {
+				t.Skipf("%s unavailable: %v", runtime, err)
+			}
+			root, err := filepath.Abs("../..")
+			if err != nil {
+				t.Fatal(err)
+			}
+			temporary := t.TempDir()
+			prepare := `import json, runpy, shutil, sys
+from pathlib import Path
+from lutra.client import _prepare_bundle
+root, target = map(Path, sys.argv[1:])
+shutil.copytree(root / "sdk", target / "sdk", ignore=shutil.ignore_patterns("*.lock", "__pycache__"))
+script = target / "sdk/examples/hello.py"
+cache_write = '    Path("/opt/lutra/cache/lutra-cache-test").touch()'
+cache_check = '    assert Path("/opt/lutra/cache/lutra-cache-test").is_file()'
+script.write_text(script.read_text().replace('    return f"Hello, {name}!"', '    from pathlib import Path\n' + cache_write + '\n    return f"Hello, {name}!"'))
+for revision in ("first", "second"):
+    if revision == "second":
+        script.write_text(script.read_text().replace("Hello, {name}!", "Updated, {name}!").replace(cache_write, cache_check))
+    environment = runpy.run_path(str(script))["environment"]
+    inputs = _prepare_bundle(environment)
+    (target / (revision + ".source")).write_bytes(inputs.source)
+    (target / (revision + ".build")).write_bytes(inputs.build_context)
+    (target / (revision + ".json")).write_text(json.dumps({"workdir": inputs.workdir, "python_paths": inputs.python_paths, "python_requires": inputs.python_requires, "command": inputs.entrypoints[0]}))
+`
+			command := exec.CommandContext(t.Context(), filepath.Join(root, ".venv/bin/python"), "-c", prepare, root, temporary)
+			if output, err := command.CombinedOutput(); err != nil {
+				t.Fatalf("prepare: %v: %s", err, output)
+			}
+			bundles := map[string][]byte{}
+			load := func(name string) string {
+				contents, err := os.ReadFile(filepath.Join(temporary, name))
+				if err != nil {
+					t.Fatal(err)
+				}
+				digest := sha256.Sum256(contents)
+				uri := sourceURI(digest[:])
+				bundles[uri] = contents
+				return uri
+			}
+			buildURI := load("first.build")
+			if load("second.build") != buildURI {
+				t.Fatal("source edit changed dependency image inputs")
+			}
+			metadata, err := os.ReadFile(filepath.Join(temporary, "first.json"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			var inputs struct {
+				Workdir        string   `json:"workdir"`
+				PythonPaths    []string `json:"python_paths"`
+				PythonRequires string   `json:"python_requires"`
+				Command        []string `json:"command"`
+			}
+			if err := json.Unmarshal(metadata, &inputs); err != nil {
+				t.Fatal(err)
+			}
+			executor := &ContainerExecutor{Runtime: runtime, OpenBundle: func(_ context.Context, digest []byte) (io.ReadCloser, error) {
+				return io.NopCloser(bytes.NewReader(bundles[sourceURI(digest)])), nil
+			}}
+			input, err := cbor.Marshal([]any{[]any{"Lutra"}, map[string]any{}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			var logs bytes.Buffer
+			req := &EnvironmentExecution{
+				Environment: &lutrav1.EnvironmentIdentifier{NamespaceId: uuid.NewString(), Name: "greetings", Version: strings.Repeat("1", 64)},
+				Spec: &lutrav1.EnvironmentSpec{
+					SourceUri: load("first.source"), Workdir: inputs.Workdir, PythonPaths: inputs.PythonPaths,
+					Image:       &lutrav1.ImageSpec{Name: "container", FromImage: base, BuildContextUri: buildURI, PythonRequires: inputs.PythonRequires, Resources: &lutrav1.Resources{CpuMillis: 1000, MemoryBytes: 512 << 20}},
+					Entrypoints: []*lutrav1.Entrypoint{{Command: &lutrav1.Command{Args: inputs.Command}}},
+				},
+				Input:        input,
+				EntrypointID: 1, RunID: uuid.NewString(), ActionID: uuid.NewString(), Attempt: 1, Stderr: &logs,
+			}
+			image, err := executor.Build(t.Context(), req)
+			if err != nil {
+				t.Fatalf("build: %v: %s", err, logs.String())
+			}
+			for index, want := range []string{"Hello, Lutra!", "Updated, Lutra!"} {
+				if index == 1 {
+					req.Spec.SourceUri = load("second.source")
+					open := executor.OpenBundle
+					executor.OpenBundle = func(context.Context, []byte) (io.ReadCloser, error) {
+						return nil, errors.New("source edit rebuilt dependency image")
+					}
+					cached, err := executor.Build(t.Context(), req)
+					executor.OpenBundle = open
+					if err != nil || cached.ArtifactURI != image.ArtifactURI {
+						t.Fatalf("reuse image: %v", err)
+					}
+				}
+				job, err := executor.Run(t.Context(), image, req)
+				if err != nil {
+					t.Fatal(err)
+				}
+				output, err := job.Wait(t.Context())
+				if err != nil {
+					t.Fatalf("run: %v: %s", err, logs.String())
+				}
+				if strings.Contains(logs.String(), "experimental") {
+					t.Fatalf("unexpected experimental install: %s", logs.String())
+				}
+
+				var result string
+				if err := cbor.Unmarshal(output, &result); err != nil || result != want {
+					t.Fatalf("result = %q, want %q: %v", result, want, err)
+				}
+			}
+		})
+	}
+}
+
+func TestImageKeySeparatesBuildAndRuntimeInputs(t *testing.T) {
+	uri := sourceURI(bytes.Repeat([]byte{3}, 32))
+	spec := &lutrav1.EnvironmentSpec{SourceUri: uri, Workdir: ".", Image: &lutrav1.ImageSpec{
+		FromImage: "python:3.12-slim", BuildContextUri: uri, PythonRequires: ">=3.11", Platform: "linux/amd64",
+	}}
+	executor := &ContainerExecutor{}
+	original, err := executor.ImageKey(spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	spec.Workdir = "nested directory"
+	spec.PythonPaths = []string{"scripts"}
+	spec.Image.EnvVars = map[string]string{"SETTING": "changed"}
+	spec.Image.Resources = &lutrav1.Resources{CpuMillis: 500}
+	unchanged, err := executor.ImageKey(spec)
+	if err != nil || !bytes.Equal(original, unchanged) {
+		t.Fatal("runtime inputs changed image identity")
+	}
+	for _, mutate := range []func(*lutrav1.ImageSpec){
+		func(image *lutrav1.ImageSpec) { image.BuildContextUri = sourceURI(bytes.Repeat([]byte{4}, 32)) },
+		func(image *lutrav1.ImageSpec) { image.Platform = "linux/arm64" },
+		func(image *lutrav1.ImageSpec) { image.FromImage = "python:3.13-slim" },
+		func(image *lutrav1.ImageSpec) { image.PythonRequires = ">=3.13" },
+	} {
+		copy := proto.Clone(spec).(*lutrav1.EnvironmentSpec)
+		mutate(copy.Image)
+		changed, err := executor.ImageKey(copy)
+		if err != nil || bytes.Equal(original, changed) {
+			t.Fatal("build input did not change image identity")
+		}
+	}
+	file, err := dockerfile(spec.Image)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(file, uvBuildImage) || !strings.Contains(file, "/opt/lutra/venv") || strings.Contains(file, "pylock") {
+		t.Fatalf("unexpected dependency recipe: %s", file)
 	}
 }

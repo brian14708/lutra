@@ -25,10 +25,10 @@ message ImageSpec {
   Resources resources = 3;
   map<string, string> env_vars = 4;
   string build_context_uri = 5;
-  StartupCommand build_command = 6;
-  string workdir = 7;
   // Interpreter constraint from the uv lock.
   string python_requires = 8;
+  // Linux container target (for example linux/arm64).
+  string platform = 9;
 }
 
 message Resources {
@@ -38,7 +38,6 @@ message Resources {
 
 message EnvironmentIdentifier {
   string namespace_id = 1;
-  reserved 2;
   string name = 3;
   string version = 4;
 }
@@ -48,26 +47,27 @@ message EnvironmentIdentifier {
 // applying the content-addressed source bundle on top of the built image.
 message EnvironmentSpec {
   string namespace_id = 1;
-  reserved 2;
   string name = 3;
   string source_uri = 4;
   ImageSpec image = 5;
   repeated EnvironmentIdentifier dependencies = 6;
+  Command prepare_command = 8;
   // Entrypoint IDs are one-based positions in this list.
   repeated Entrypoint entrypoints = 7;
-  // Relative Python import paths within the source bundle.
-  repeated string import_roots = 8;
+  // Runtime paths, relative to the source bundle; never image build inputs.
+  string workdir = 9;
+  repeated string python_paths = 10;
 }
 
 message Entrypoint {
-  StartupCommand command = 1;
+  Command command = 1;
   string name = 2;
   int32 max_attempts = 3;
   bool cache = 4;
   string task_version = 5;
 }
 
-message StartupCommand {
+message Command {
   repeated string args = 1;
 }
 
@@ -180,6 +180,5 @@ message TaskAction {
   int32 attempts = 9;
   string created_at = 10;
   string updated_at = 11;
-  reserved 12;
   uint32 entrypoint_id = 13;
 }

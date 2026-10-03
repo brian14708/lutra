@@ -110,7 +110,8 @@ def _ignored(path: Path, rules: Mapping[Path, GitIgnoreSpec], *, directory: bool
 
 def _excluded(path: Path) -> bool:
     return any(
-        part in _EXCLUDED or part.startswith((".venv", ".env.")) for part in path.parts
+        part in _EXCLUDED or part.startswith((".venv", ".env.")) or part.endswith(".egg-info")
+        for part in path.parts
     ) or path.suffix in {".pyc", ".pyo", ".egg", ".whl", ".log"}
 
 
@@ -119,7 +120,7 @@ def _selected_file(
 ) -> bool:
     if _excluded(relative):
         return False
-    if _ignored(relative, rules) and not _included_by_override(relative, overrides):
+    if _ignored(root / relative, rules) and not _included_by_override(relative, overrides):
         return False
     source = root / relative
     if source.is_symlink() or not source.is_file():
@@ -144,6 +145,7 @@ class _FileSelector:
     overrides: Sequence[Path]
     rules: dict[Path, GitIgnoreSpec] = field(default_factory=dict)
     blocked: set[Path] = field(default_factory=set)
+    excludes: Sequence[Path] = ()
 
     def scan(self, current: Path, names: list[str], files: list[str]) -> list[Path]:
         """Select files in one directory while tracking parent ignore rules.
@@ -161,15 +163,15 @@ class _FileSelector:
         )
         spec = _ignore_spec(current) if not is_blocked else None
         if spec is not None:
-            self.rules[relative_dir] = spec
+            self.rules[current] = spec
         names[:] = sorted(
             name
             for name in names
-            if name not in _EXCLUDED and not name.startswith((".venv", ".env."))
+            if not _excluded(Path(name)) and current / name not in self.excludes
         )
         for name in names:
             relative = relative_dir / name
-            if is_blocked or _ignored(relative, self.rules, directory=True):
+            if is_blocked or _ignored(self.root / relative, self.rules, directory=True):
                 self.blocked.add(relative)
             if (current / name).is_symlink() and relative not in self.blocked:
                 msg = f"bundle directory is a symlink: {relative}"
@@ -190,15 +192,15 @@ def _scan_scope(selector: _FileSelector, scope: Path) -> list[Path]:
         msg = f"bundle scope must be inside {root}: {scope}"
         raise ValueError(msg)
     for parent in reversed((scope, *scope.parents)):
-        if parent == scope or not parent.is_relative_to(root):
+        if parent == scope:
             continue
         spec = _ignore_spec(parent)
         if spec is not None:
-            selector.rules[parent.relative_to(root)] = spec
+            selector.rules[parent] = spec
     parts = scope.relative_to(root).parts
     for depth in range(1, len(parts) + 1):
         relative = Path(*parts[:depth])
-        if _ignored(relative, selector.rules, directory=True):
+        if _ignored(root / relative, selector.rules, directory=True):
             selector.blocked.add(relative)
             break
     selected: list[Path] = []
@@ -208,7 +210,11 @@ def _scan_scope(selector: _FileSelector, scope: Path) -> list[Path]:
 
 
 def select_files(
-    root: Path, *, includes: Sequence[Path] = (), scopes: Sequence[Path] | None = None
+    root: Path,
+    *,
+    includes: Sequence[Path] = (),
+    scopes: Sequence[Path] | None = None,
+    excludes: Sequence[Path] = (),
 ) -> tuple[Path, ...]:
     """Select regular files using nested .gitignore rules.
 
@@ -226,19 +232,21 @@ def select_files(
         msg = "bundle context must be a directory"
         raise ValueError(msg)
     overrides = _expand_includes(root, includes)
-    selector = _FileSelector(root, overrides)
+    selector = _FileSelector(root, overrides, excludes=excludes)
     selected: list[Path] = []
     directories = (
         (root,)
         if scopes is None
         else tuple(
             sorted(
-                {path.resolve() for path in scopes},
+                {root / _safe_relative(root, path) if path != root else root for path in scopes},
                 key=lambda path: (len(path.parts), path.as_posix()),
             )
         )
     )
     for scope in directories:
+        if scope != root:
+            _safe_relative(root, scope)
         if any(scope != parent and scope.is_relative_to(parent) for parent in directories):
             continue
         selected.extend(_scan_scope(selector, scope))
@@ -263,33 +271,6 @@ def select_files(
     return tuple(selected)
 
 
-def resolve_context(root: Path, path: Path) -> Path:
-    """Resolve a build context inside the locked source root.
-
-    Returns:
-        The resolved context directory.
-
-    Raises:
-        ValueError: If the path is absolute or leaves the locked root.
-
-    """
-    root = root.resolve()
-    if path.is_absolute() or ".." in path.parts:
-        msg = "image build context must be relative and inside the locked source root"
-        raise ValueError(msg)
-    current = root
-    for part in path.parts:
-        current /= part
-        if current.is_symlink():
-            msg = "image build context must not follow a symlink"
-            raise ValueError(msg)
-    context = (root / path).resolve()
-    if not context.is_relative_to(root) or not context.is_dir():
-        msg = "image build context must be a directory inside the locked source root"
-        raise ValueError(msg)
-    return context
-
-
 def _archive(root: Path) -> bytes:
     from lutra.archive import create_archive  # ruff: ignore[import-outside-top-level]
 
@@ -299,52 +280,11 @@ def _archive(root: Path) -> bytes:
         return path.read_bytes()
 
 
-def build_bundle(
-    root: Path,
-    *,
-    includes: Sequence[Path] = (),
-    selected: Sequence[Path] | None = None,
-    generated: Mapping[str, bytes] | None = None,
-) -> bytes:
-    """Archive selected files without depending on a package manager.
-
-    Returns:
-        Deterministic compressed archive bytes.
-
-    Raises:
-        ValueError: If a generated file conflicts with a selected file.
-
-    """
-    root = root.resolve()
-    files = selected if selected is not None else select_files(root, includes=includes)
-    with tempfile.TemporaryDirectory() as temporary:
-        staged = Path(temporary) / "bundle"
-        staged.mkdir()
-        for relative in files:
-            source = root / relative
-            target = staged / relative
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_bytes(source.read_bytes())
-            target.chmod(source.stat().st_mode & 0o777)
-        for name, contents in sorted((generated or {}).items()):
-            relative = _generated_path(name)
-            target = staged / relative
-            if target.is_file() and target.read_bytes() == contents:
-                continue
-            if target.exists():
-                msg = f"generated bundle path conflicts with build context: {relative}"
-                raise ValueError(msg)
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_bytes(contents)
-        return _archive(staged)
-
-
 def _generated_path(name: str) -> Path:
-    relative = Path(name)
-    if relative.is_absolute() or relative.as_posix() != name or ".." in relative.parts:
-        msg = f"unsafe generated bundle path: {name}"
-        raise ValueError(msg)
-    return relative
+    from lutra.archive import _safe_name  # ruff: ignore[import-outside-top-level]
+
+    _safe_name(name)
+    return Path(name)
 
 
 def bundle_bytes(files: Mapping[str, bytes]) -> bytes:
@@ -353,13 +293,32 @@ def bundle_bytes(files: Mapping[str, bytes]) -> bytes:
     Returns:
         Deterministic compressed archive bytes.
 
+    Raises:
+        ValueError: If paths conflict, are unsafe, or exceed archive limits.
+
     """
+    if len(files) > _MAX_FILES:
+        msg = "bundle has too many files"
+        raise ValueError(msg)
+    if (
+        any(len(value) > _MAX_FILE_SIZE for value in files.values())
+        or sum(map(len, files.values())) > _MAX_UNPACKED
+    ):
+        msg = "bundle exceeds extracted size limit"
+        raise ValueError(msg)
     with tempfile.TemporaryDirectory() as temporary:
         staged = Path(temporary) / "bundle"
         staged.mkdir()
         for name, contents in sorted(files.items()):
             relative = _generated_path(name)
             target = staged / relative
+            if any(parent.is_file() for parent in target.parents) or target.is_dir():
+                msg = f"conflicting bundle paths: {name}"
+                raise ValueError(msg)
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes(contents)
-        return _archive(staged)
+        bundle = _archive(staged)
+        if len(bundle) > 64 << 20:
+            msg = "bundle exceeds 64 MiB"
+            raise ValueError(msg)
+        return bundle

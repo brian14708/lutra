@@ -11,6 +11,7 @@ dependencies = [
     "httpx>=0.28,<1",
     "pathspec>=1.1,<2",
     "zstandard>=0.25,<1",
+    "tomli-w>=1.2,<2",
 ]
 
 [project.optional-dependencies]
@@ -48,3 +49,6 @@ project-excludes = ["src/lutra/_gen"]
 python-version = "3.11"
 search-path = ["src"]
 preset = "strict"
+
+[tool.lutra]
+source-includes = ["src/lutra/_gen"]
