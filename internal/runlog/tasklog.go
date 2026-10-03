@@ -19,6 +19,9 @@ type TaskLogEvent struct {
 	Timestamp string `cbor:"timestamp"`
 	ActionID  string `cbor:"action_id"`
 	Attempt   int32  `cbor:"attempt"`
+	Phase     string `cbor:"phase"`
+	Runtime   string `cbor:"runtime,omitempty"`
+	Image     string `cbor:"image,omitempty"`
 }
 
 func EncodeTaskLog(event TaskLogEvent) ([]byte, error) {
@@ -53,6 +56,18 @@ func DecodeTaskLog(value []byte) (TaskLogEvent, error) {
 func validateTaskLog(event TaskLogEvent) error {
 	if event.Type != "task.log.v1" || event.Source != "stderr" {
 		return errors.New("invalid task log event")
+	}
+	switch event.Phase {
+	case "task":
+		if event.Runtime != "" || event.Image != "" {
+			return errors.New("task output has image metadata")
+		}
+	case "pull", "build":
+		if (event.Runtime != "docker" && event.Runtime != "podman") || event.Image == "" {
+			return errors.New("invalid image log metadata")
+		}
+	default:
+		return errors.New("invalid task log phase")
 	}
 	if _, err := uuid.Parse(event.ActionID); err != nil {
 		return errors.New("invalid task log action id")

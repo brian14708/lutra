@@ -15,7 +15,6 @@ import (
 	"github.com/brian14708/lutra/internal/blob"
 	"github.com/brian14708/lutra/internal/db"
 	"github.com/brian14708/lutra/internal/runlog"
-	"github.com/brian14708/lutra/internal/tasktree"
 	"github.com/fxamacker/cbor/v2"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -29,18 +28,7 @@ var (
 	semanticVersionPattern = regexp.MustCompile(`^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)(\.(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*)?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$`)
 )
 
-const localTaskImage = "local-python"
-
-type taskContextKey struct{}
-
-type taskContext struct {
-	runID       uuid.UUID
-	actionID    uuid.UUID
-	token       uuid.UUID
-	attempt     int32
-	coordinator *tasktree.Coordinator
-	add         func(context.Context, uuid.UUID) error
-}
+const containerTaskImage = "container"
 
 func sourceURI(digest []byte) string {
 	return blob.URI(archiveMIME, digest)
@@ -171,7 +159,7 @@ func (s Service) CreateRun(ctx context.Context, req *connect.Request[lutrav1.Cre
 }
 
 func (s Service) CreateTaskAction(ctx context.Context, req *connect.Request[lutrav1.CreateTaskActionRequest]) (*connect.Response[lutrav1.CreateTaskActionResponse], error) {
-	active, ok := ctx.Value(taskContextKey{}).(taskContext)
+	active, ok := taskContextFromContext(ctx)
 	if !ok {
 		return nil, connect.NewError(connect.CodePermissionDenied, errors.New("task actions are only available inside a task"))
 	}
@@ -202,7 +190,7 @@ func (s Service) CreateTaskAction(ctx context.Context, req *connect.Request[lutr
 	if err != nil {
 		return nil, err
 	}
-	locked, err := q.LockRun(ctx, active.runID)
+	locked, err := q.LockRun(ctx, active.RunID)
 	if err != nil || locked.RootActionID == nil {
 		return nil, invalidTask("run is not active")
 	}
@@ -213,8 +201,8 @@ func (s Service) CreateTaskAction(ctx context.Context, req *connect.Request[lutr
 	if err != nil || terminal(string(rootStatus)) {
 		return nil, invalidTask("run is not active")
 	}
-	caller, err := q.GetActiveCaller(ctx, active.actionID)
-	if err != nil || caller.RunID != active.runID || caller.ClaimToken == nil || *caller.ClaimToken != active.token || caller.Attempts != active.attempt {
+	caller, err := q.GetActiveCaller(ctx, active.ActionID)
+	if err != nil || caller.RunID != active.RunID || caller.ClaimToken == nil || *caller.ClaimToken != active.ClaimToken || caller.Attempts != active.Attempt {
 		return nil, invalidTask("caller action is not active")
 	}
 	var callerSpec lutrav1.EnvironmentSpec
@@ -233,10 +221,10 @@ func (s Service) CreateTaskAction(ctx context.Context, req *connect.Request[lutr
 		return nil, connect.NewError(connect.CodePermissionDenied, errors.New("child environment is not a declared dependency"))
 	}
 	key := pgtype.Text{String: req.Msg.GetIdempotencyKey(), Valid: true}
-	existing, lookupErr := q.GetTaskActionByIdempotency(ctx, db.GetTaskActionByIdempotencyParams{RunID: active.runID, CallerActionID: &active.actionID, IdempotencyKey: key})
+	existing, lookupErr := q.GetTaskActionByIdempotency(ctx, db.GetTaskActionByIdempotencyParams{RunID: active.RunID, CallerActionID: &active.ActionID, IdempotencyKey: key})
 	var actionID uuid.UUID
 	if lookupErr == nil {
-		if existing.CallerActionID == nil || *existing.CallerActionID != active.actionID || existing.EnvironmentID != environment.ID || existing.EntrypointID != int64(req.Msg.GetEntrypointId()) || !bytes.Equal(existing.ActionSpec, storedSpec) {
+		if existing.CallerActionID == nil || *existing.CallerActionID != active.ActionID || existing.EnvironmentID != environment.ID || existing.EntrypointID != int64(req.Msg.GetEntrypointId()) || !bytes.Equal(existing.ActionSpec, storedSpec) {
 			return nil, invalidTask("idempotency key already belongs to a different action")
 		}
 		actionID = existing.ID
@@ -247,10 +235,10 @@ func (s Service) CreateTaskAction(ctx context.Context, req *connect.Request[lutr
 		if err != nil {
 			return nil, err
 		}
-		actionID, err = q.InsertTaskAction(ctx, db.InsertTaskActionParams{ID: actionID, RunID: active.runID, CallerActionID: &active.actionID, EnvironmentID: environment.ID, EntrypointID: int64(req.Msg.GetEntrypointId()), ActionSpec: storedSpec, IdempotencyKey: key})
+		actionID, err = q.InsertTaskAction(ctx, db.InsertTaskActionParams{ID: actionID, RunID: active.RunID, CallerActionID: &active.ActionID, EnvironmentID: environment.ID, EntrypointID: int64(req.Msg.GetEntrypointId()), ActionSpec: storedSpec, IdempotencyKey: key})
 		if errors.Is(err, pgx.ErrNoRows) {
-			existing, lookupErr = q.GetTaskActionByIdempotency(ctx, db.GetTaskActionByIdempotencyParams{RunID: active.runID, CallerActionID: &active.actionID, IdempotencyKey: key})
-			if lookupErr != nil || existing.CallerActionID == nil || *existing.CallerActionID != active.actionID || existing.EnvironmentID != environment.ID || existing.EntrypointID != int64(req.Msg.GetEntrypointId()) || !bytes.Equal(existing.ActionSpec, storedSpec) {
+			existing, lookupErr = q.GetTaskActionByIdempotency(ctx, db.GetTaskActionByIdempotencyParams{RunID: active.RunID, CallerActionID: &active.ActionID, IdempotencyKey: key})
+			if lookupErr != nil || existing.CallerActionID == nil || *existing.CallerActionID != active.ActionID || existing.EnvironmentID != environment.ID || existing.EntrypointID != int64(req.Msg.GetEntrypointId()) || !bytes.Equal(existing.ActionSpec, storedSpec) {
 				return nil, invalidTask("idempotency key already belongs to a different action")
 			}
 			actionID = existing.ID
@@ -378,21 +366,21 @@ func (s Service) GetTaskAction(ctx context.Context, req *connect.Request[lutrav1
 	if err != nil {
 		return nil, invalidTask("invalid task action id")
 	}
-	if active, ok := ctx.Value(taskContextKey{}).(taskContext); ok {
+	if active, ok := TaskIdentityFromContext(ctx); ok {
 		caller, lookupErr := db.New(s.DB).GetTaskActionCaller(ctx, id)
-		if lookupErr != nil || caller.RunID != active.runID || caller.CallerActionID == nil || *caller.CallerActionID != active.actionID {
+		if lookupErr != nil || caller.RunID != active.RunID || caller.CallerActionID == nil || *caller.CallerActionID != active.ActionID {
 			return nil, invalidTask("task action is not a child of this task")
 		}
 	}
 	if req.Msg.GetWait() {
-		active, ok := ctx.Value(taskContextKey{}).(taskContext)
+		active, ok := taskContextFromContext(ctx)
 		if !ok {
 			return nil, invalidTask("waiting is only available inside a task")
 		}
 		if active.coordinator == nil {
 			return nil, invalidTask("run coordinator is unavailable")
 		}
-		if _, err := active.coordinator.Wait(ctx, active.actionID, active.attempt, id); err != nil {
+		if _, err := active.coordinator.Wait(ctx, active.ActionID, active.Attempt, id); err != nil {
 			node, lookupErr := active.coordinator.Get(ctx, id)
 			if lookupErr != nil || !node.State.Terminal() {
 				return nil, err
@@ -481,9 +469,14 @@ func (s Service) CancelRun(ctx context.Context, req *connect.Request[lutrav1.Can
 	} else if err != nil {
 		return nil, err
 	}
-	if rows, err := q.CancelRunIfActive(ctx, id); err != nil {
+	if actions, err := q.CancelRunIfActive(ctx, id); err != nil {
 		return nil, connect.NewError(connect.CodeInternal, err)
-	} else if rows > 0 {
+	} else if len(actions) > 0 {
+		for _, action := range actions {
+			if err := s.Logs.AppendActionStatus(ctx, tx, action, false); err != nil {
+				return nil, err
+			}
+		}
 		if err := s.Logs.AppendStatus(ctx, tx, id); err != nil {
 			return nil, err
 		}
@@ -559,7 +552,7 @@ func (s Service) watchRun(ctx context.Context, id uuid.UUID, taskLogs *lutrav1.S
 			if bytes.Equal(record.Key, []byte("status")) {
 				return nil
 			}
-			event, err := runlog.DecodeActionStatus(record.ValueCbor)
+			event, err := s.Logs.DecodeActionStatus(ctx, record.ValueCbor)
 			if err != nil {
 				return connect.NewError(connect.CodeDataLoss, err)
 			}
@@ -578,7 +571,7 @@ func (s Service) watchRun(ctx context.Context, id uuid.UUID, taskLogs *lutrav1.S
 			if record.Seq <= end {
 				return nil
 			}
-			event, err := runlog.DecodeStatus(record.GetValueCbor())
+			event, err := s.Logs.DecodeStatus(ctx, record.GetValueCbor())
 			if err != nil {
 				return connect.NewError(connect.CodeDataLoss, err)
 			}

@@ -7,12 +7,11 @@ from unittest.mock import AsyncMock
 
 import cbor2
 import pytest
+from lutra import CacheableError, RetryMode, _blob, current_context
 from lutra._gen.lutra.task.v1.task_pb import ExecuteRequest, ExecuteResponse
 from lutra.serve import TaskAPIClient, _host, normalize_result
 from lutra.serve._host import _Host, _TaskService
 from lutra.value import BlobRef
-
-from lutra import CacheableError, RetryMode, _blob, current_context
 
 if TYPE_CHECKING:
     from connectrpc.request import RequestContext

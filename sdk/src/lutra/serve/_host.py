@@ -448,7 +448,6 @@ async def serve(handler: Callable[..., Any], *, retry: RetryMode = RetryMode.NON
     """
     original_stdout = sys.stdout
     _redirect_user_stdout()
-    print("task host started")  # ruff: ignore[print]
     service = _TaskService(handler, retry)
     host = _Host(TaskServiceASGIApplication(service, read_max_bytes=_MAX_LINE, compressions=()))
     service.api_client = TaskAPIClient(host)

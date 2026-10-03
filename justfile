@@ -20,7 +20,7 @@ lint:
     go tool buf lint
     go tool golangci-lint run
     uv run ruff check
-    uv run --all-packages --directory sdk pyrefly check
+    uv run --all-packages --all-extras --directory sdk pyrefly check
     pnpm --filter @lutra/console lint
 
 test:
@@ -29,5 +29,5 @@ test:
     pnpm --filter @lutra/console test
 
 init:
-    uv sync
+    uv sync --all-packages --all-extras
     pnpm install

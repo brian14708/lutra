@@ -1,3 +1,10 @@
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["lutra[tui]"]
+#
+# [tool.uv.sources]
+# lutra = { path = "..", editable = true }
+# ///
 """Run a greeting graph with nested retries against a local Lutra server.
 
 Start a Lutra server, then run ``uv run examples/hello.py`` from the SDK directory.
@@ -6,16 +13,13 @@ Start a Lutra server, then run ``uv run examples/hello.py`` from the SDK directo
 from __future__ import annotations
 
 import asyncio
-import logging
 import os
-from pathlib import Path
 
 import lutra
 
 environment = lutra.TaskEnvironment(
     name="greetings",
-    image=lutra.TaskImage(name="docker", from_image="docker.io/astral/uv:python3.11-bookworm-slim"),
-    source_includes=(Path("../src/lutra/_gen"),),
+    image=lutra.TaskImage(from_image="docker.io/library/python:3.12-slim-bookworm"),
 )
 
 
@@ -69,9 +73,7 @@ async def hello(names: list[str]) -> str:
 
 async def main() -> None:
     client = lutra.Client(os.environ.get("LUTRA_URL", "http://127.0.0.1:8080/api"))
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    logger = logging.getLogger("lutra")
-    await client.run(hello(["Lutra", "Python"]), logger=logger)
+    await client.run(hello(["Lutra", "Python"]), display="live")
 
 
 if __name__ == "__main__":

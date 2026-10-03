@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import re
 import subprocess  # ruff: ignore[suspicious-subprocess-import]
 import tomllib
@@ -20,6 +21,7 @@ class UvSource:
     bundle_root: Path
     lock: Path
     local_roots: tuple[Path, ...]
+    project_roots: tuple[Path, ...]
     script: Path | None = None
 
     @property
@@ -39,12 +41,23 @@ class UvSource:
         return tuple(sorted(roots, key=Path.as_posix))
 
     @property
+    def local_package_names(self) -> tuple[str, ...]:
+        """Local packages whose sources are supplied by the source bundle."""
+        lock = tomllib.loads(self.lock.read_text(encoding="utf-8"))
+        return tuple(
+            sorted({
+                package["name"]
+                for package in lock.get("package", [])
+                if any(kind in package.get("source", {}) for kind in _LOCAL_KINDS)
+            })
+        )
+
+    @property
     def required_files(self) -> tuple[Path, ...]:
         files = [self.lock]
         if self.script is not None:
             files.append(self.script)
-        else:
-            files.extend(local / "pyproject.toml" for local in self.local_roots)
+        files.extend(local / "pyproject.toml" for local in self.project_roots)
         return tuple(path.relative_to(self.bundle_root) for path in files)
 
     @property
@@ -56,11 +69,9 @@ class UvSource:
                 msg = "PEP 723 metadata block is missing"
                 raise ValueError(msg)
             files[self.script.relative_to(self.bundle_root).as_posix()] = match.group().encode()
-        else:
-            for local in self.local_roots:
-                manifest = local / "pyproject.toml"
-                if manifest.is_file():
-                    files[manifest.relative_to(self.bundle_root).as_posix()] = manifest.read_bytes()
+        for local in self.project_roots:
+            manifest = local / "pyproject.toml"
+            files[manifest.relative_to(self.bundle_root).as_posix()] = manifest.read_bytes()
         for parent in {*self.root.parents, self.root, *self.local_roots}:
             if not parent.is_relative_to(self.bundle_root):
                 continue
@@ -69,6 +80,30 @@ class UvSource:
                 if config.is_file():
                     files[config.relative_to(self.bundle_root).as_posix()] = config.read_bytes()
         return files
+
+    @property
+    def script_includes(self) -> tuple[Path, ...]:
+        """Explicit sources and assets relative to the PEP 723 script.
+
+        Raises:
+            ValueError: If the inline extension is malformed.
+
+        """
+        if self.script is None:
+            return ()
+        match = _SCRIPT_BLOCK.search(self.script.read_text(encoding="utf-8"))
+        if match is None:
+            msg = "PEP 723 metadata block is missing"
+            raise ValueError(msg)
+        metadata = tomllib.loads("\n".join(line[2:] for line in match.group().splitlines()[1:-1]))
+        includes = metadata.get("tool", {}).get("lutra", {}).get("source-includes", [])
+        if not isinstance(includes, list) or any(
+            not isinstance(entry, str) or not entry or Path(entry).is_absolute()
+            for entry in includes
+        ):
+            msg = "PEP 723 tool.lutra.source-includes must be a list of relative paths"
+            raise ValueError(msg)
+        return tuple(self.script.parent / entry for entry in includes)
 
     def check_lock(self) -> str:
         args = ["uv", "lock", "--check", "--offline"]
@@ -95,26 +130,72 @@ def _repository_root(path: Path) -> Path | None:
     for parent in (path, *path.parents):
         if (parent / ".jj").exists() or (parent / ".git").exists():
             return parent
+    runtime_root = os.environ.get("LUTRA_BUNDLE_ROOT")
+    if runtime_root is not None:
+        boundary = Path(runtime_root).resolve()
+        if path.is_relative_to(boundary):
+            return boundary
     return None
 
 
+def _local_project(root: Path, location: str, repository: Path | None) -> Path:
+    candidate = root / location
+    if any(path.is_symlink() for path in (candidate, *candidate.parents)):
+        msg = f"local uv dependency must not follow a symlink: {location}"
+        raise ValueError(msg)
+    candidate = candidate.resolve()
+    if not candidate.is_dir():
+        msg = f"local uv dependency must be a directory: {location}"
+        raise ValueError(msg)
+    if _repository_root(candidate) != repository or (
+        not candidate.is_relative_to(root)
+        and (repository is None or not candidate.is_relative_to(repository))
+    ):
+        msg = f"local uv dependency leaves repository: {location}"
+        raise ValueError(msg)
+    return candidate
+
+
+def _script_lock(script: Path) -> Path:
+    lock = Path(f"{script}.lock")
+    if lock.is_symlink():
+        msg = f"PEP 723 sidecar lock must not be a symlink: {lock}"
+        raise ValueError(msg)
+    if lock.is_file():
+        return lock
+    args = ["uv", "lock", "--script", str(script)]
+    try:
+        result = subprocess.run(  # ruff: ignore[subprocess-without-shell-equals-true]
+            args, cwd=script.parent, capture_output=True, check=False
+        )
+    except FileNotFoundError as exc:
+        msg = "uv is required to create a PEP 723 sidecar lock"
+        raise ValueError(msg) from exc
+    if result.returncode:
+        detail = result.stderr.decode(errors="replace").strip()
+        msg = f"uv script lock failed for {script}: {detail}"
+        raise ValueError(msg)
+    if not lock.is_file():
+        msg = f"uv did not create the PEP 723 sidecar lock: {lock}"
+        raise ValueError(msg)
+    return lock
+
+
 def discover_source(source_file: Path) -> UvSource:
-    """Find the locked uv source that owns a task file.
+    """Find the locked uv source that owns a task file, creating missing script locks.
 
     Returns:
         The locked source and its local package directories.
 
     Raises:
-        ValueError: If no lock exists or a local package crosses a repository boundary.
+        ValueError: If a project lock is missing, script locking fails, or a local
+            package crosses a repository boundary.
 
     """
     source_file = source_file.resolve()
     if _SCRIPT_BLOCK.search(source_file.read_text(encoding="utf-8")):
         root = source_file.parent
-        lock = Path(f"{source_file}.lock")
-        if not lock.is_file():
-            msg = f"PEP 723 task script requires a sidecar lock: {lock}"
-            raise ValueError(msg)
+        lock = _script_lock(source_file)
         script = source_file
     else:
         for path in source_file.parents:
@@ -126,23 +207,15 @@ def discover_source(source_file: Path) -> UvSource:
             raise ValueError(msg)
     data = tomllib.loads(lock.read_text(encoding="utf-8"))
     local = {root}
+    projects = {root} if script is None else set()
     repository = _repository_root(root)
     for package in data.get("package", []):
         package_source = package.get("source", {})
         for kind in _LOCAL_KINDS:
             if kind not in package_source:
                 continue
-            candidate = (root / package_source[kind]).resolve()
-            if not candidate.is_dir():
-                msg = f"local uv dependency must be a directory: {package_source[kind]}"
-                raise ValueError(msg)
-            if not candidate.is_relative_to(root) and (
-                repository is None
-                or not candidate.is_relative_to(repository)
-                or _repository_root(candidate) != repository
-            ):
-                msg = f"local uv dependency leaves repository: {package_source[kind]}"
-                raise ValueError(msg)
+            candidate = _local_project(root, package_source[kind], repository)
             local.add(candidate)
+            projects.add(candidate)
     bundle_root = repository if repository is not None else root
-    return UvSource(root, bundle_root, lock, tuple(sorted(local)), script)
+    return UvSource(root, bundle_root, lock, tuple(sorted(local)), tuple(sorted(projects)), script)

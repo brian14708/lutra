@@ -63,7 +63,7 @@ CREATE TABLE lutra.cache_entries (
 );
 CREATE UNIQUE INDEX cache_active_idx ON lutra.cache_entries (key) WHERE status IN ('building', 'ready');
 
-CREATE TYPE lutra.task_action_status AS ENUM ('queued', 'running', 'waiting', 'succeeded', 'failed', 'canceled');
+CREATE TYPE lutra.task_action_status AS ENUM ('queued', 'building', 'running', 'waiting', 'succeeded', 'failed', 'canceled');
 
 
 CREATE TABLE lutra.runs (
@@ -75,7 +75,6 @@ CREATE TABLE lutra.runs (
     created_at timestamptz NOT NULL DEFAULT now()
 );
 CREATE UNIQUE INDEX runs_idempotency_idx ON lutra.runs (namespace_id, root_idempotency_key) WHERE root_idempotency_key IS NOT NULL;
-CREATE INDEX runs_claim_idx ON lutra.runs (lease_until, created_at);
 
 CREATE TABLE lutra.task_actions (
     id uuid PRIMARY KEY,
@@ -99,6 +98,8 @@ CREATE TABLE lutra.task_actions (
 CREATE UNIQUE INDEX task_actions_one_root_idx ON lutra.task_actions (run_id) WHERE caller_action_id IS NULL;
 CREATE UNIQUE INDEX task_actions_idempotency_idx ON lutra.task_actions (run_id, caller_action_id, idempotency_key) WHERE idempotency_key IS NOT NULL;
 CREATE INDEX task_actions_run_order_idx ON lutra.task_actions (run_id, created_at, id);
+CREATE INDEX task_actions_active_idx ON lutra.task_actions (run_id)
+    WHERE status NOT IN ('succeeded', 'failed', 'canceled');
 
 ALTER TABLE lutra.runs
     ADD COLUMN root_action_id uuid,

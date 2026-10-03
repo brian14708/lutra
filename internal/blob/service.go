@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"io"
 	"mime"
 	"net/http"
 	"net/url"
@@ -25,8 +26,9 @@ import (
 )
 
 const (
-	partSize    = 8 << 20
-	urlLifetime = 15 * time.Minute
+	partSize            = 8 << 20
+	urlLifetime         = 15 * time.Minute
+	downloadURLLifetime = 24 * time.Hour
 )
 
 func uploadMetadata(values map[string]string) (map[string]string, []byte, error) {
@@ -310,10 +312,21 @@ func (s Service) CompleteUpload(ctx context.Context, req *connect.Request[lutrav
 		if statErr != nil {
 			return nil, connect.NewError(connect.CodeUnavailable, statErr)
 		}
-		// A full SHA-256 verification pass is a future option for multipart blobs.
-		// S3 multipart SHA-256 checksums are composite, not the object content digest.
 		if object.Size != session.Size {
 			return nil, connect.NewError(connect.CodeInvalidArgument, errors.New("blob size mismatch"))
+		}
+		reader, _, _, err := s.Store.GetObject(ctx, s.Bucket, key, minio.GetObjectOptions{})
+		if err != nil {
+			return nil, connect.NewError(connect.CodeUnavailable, err)
+		}
+		hash := sha256.New()
+		size, readErr := io.Copy(hash, io.LimitReader(reader, session.Size+1))
+		closeErr := reader.Close()
+		if err := errors.Join(readErr, closeErr); err != nil {
+			return nil, connect.NewError(connect.CodeUnavailable, err)
+		}
+		if size != session.Size || !bytes.Equal(hash.Sum(nil), session.Sha256) {
+			return nil, connect.NewError(connect.CodeInvalidArgument, errors.New("blob content digest mismatch"))
 		}
 	}
 	rows, err := queries.InsertBlobIfAbsent(ctx, db.InsertBlobIfAbsentParams{Sha256: session.Sha256, ObjectKey: session.ObjectKey})
@@ -425,7 +438,7 @@ func (s Service) GetDownload(ctx context.Context, req *connect.Request[lutrav1.G
 	if err != nil {
 		return nil, connect.NewError(connect.CodeUnavailable, err)
 	}
-	signed, err := s.Signer.PresignedGetObject(ctx, s.Bucket, key, urlLifetime, nil)
+	signed, err := s.Signer.PresignedGetObject(ctx, s.Bucket, key, downloadURLLifetime, nil)
 	if err != nil {
 		return nil, connect.NewError(connect.CodeUnavailable, err)
 	}

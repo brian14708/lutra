@@ -138,7 +138,7 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	if *embeddedWorker {
-		worker := &lutra.RunWorker{DB: db, Logs: logs, Store: blobStore, Bucket: storeConfig.Bucket, TaskAPIHandler: rpcMux}
+		worker := &lutra.RunWorker{DB: db, Logs: logs, Blobs: blobService, TaskAPIHandler: rpcMux}
 		worker.Start(ctx)
 		defer func() { stop(); worker.Wait() }()
 	}

@@ -6,7 +6,7 @@ import os
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Generic, TypeVar
+from typing import TYPE_CHECKING, Generic, Literal, TypeVar
 
 import httpx
 import pyqwest
@@ -35,6 +35,7 @@ from lutra._gen.lutra.v1.lutra_pb import (
 )
 from lutra._gen.lutra.v1.settings_connect import SettingsServiceClient
 from lutra._gen.lutra.v1.settings_pb import ListNamespacesRequest
+from lutra._source_bundle import build_source_bundle
 from lutra.task import CacheableError, normalize_retry
 from lutra.value import loads
 
@@ -43,101 +44,195 @@ if TYPE_CHECKING:
     from collections.abc import AsyncIterator
 
     from lutra._dependency import UvSource
+    from lutra._live import LiveDisplay
     from lutra.task import Invocation, TaskEnvironment, TaskImage
 
 R = TypeVar("R")
+_ID_SUFFIX_LENGTH = 8
 
 
-def _log_message(
-    logger: logging.Logger, run_id: str, source: str, message: str, timestamp: str = ""
+def _id_suffix(value: str) -> str:  # ruff: ignore[reimplemented-operator]
+    return value[-_ID_SUFFIX_LENGTH:]
+
+
+def _preview(value: object, limit: int = 160) -> str:
+    rendered = repr(value)
+    return rendered if len(rendered) <= limit else rendered[: limit - 1] + "…"
+
+
+def _size(value: bytes) -> str:
+    return (
+        f"{len(value) / 1024:.1f} KiB"
+        if len(value) < 1 << 20
+        else f"{len(value) / (1 << 20):.1f} MiB"
+    )
+
+
+def _task_display_status(event: TaskActionStatus) -> str:
+    return "cached" if event.status == "succeeded" and event.cache_hit else event.status
+
+
+def _log_message(  # ruff: ignore[too-many-arguments]
+    logger: logging.Logger,
+    run_id: str,
+    source: str,
+    message: str,
+    timestamp: str = "",
+    *,
+    warning: bool = False,
+    **fields: object,
 ) -> None:
     instant = datetime.fromisoformat(timestamp) if timestamp else datetime.now(UTC)
     for line in message.splitlines() or [""]:
-        log = logger.warning if source == "error" else logger.info
+        log = logger.warning if warning or source == "error" else logger.info
         log(
-            "%-12s  %s",
+            "%-8s %s",
             source,
             line,
             extra={
                 "run_id": run_id,
                 "event_source": source,
                 "event_time": instant.isoformat(timespec="milliseconds"),
+                **fields,
             },
         )
 
 
 class _RunLogger:
-    def __init__(self, logger: logging.Logger, run_id: str) -> None:
-        self.logger, self.run_id, self.last_error = logger, run_id, ""
-        self.started = False
+    def __init__(
+        self,
+        logger: logging.Logger,
+        run_id: str,
+        task_name: str = "",
+        entrypoint_names: dict[int, str] | None = None,
+    ) -> None:
+        self.logger, self.run_id, self.task_name = logger, run_id, task_name
+        self.entrypoint_names = entrypoint_names or {}
+        self.run_status = ""
+        self.root_action_id = ""
+        self.last_error = ""
+        self.actions: dict[str, tuple[str, int, bool, str]] = {}
+        self.action_names: dict[str, str] = {}
+        self.phases: set[tuple[str, str]] = set()
 
     def event(self, event: Run | LogEvent | TaskActionStatus) -> None:
         if isinstance(event, TaskActionStatus):
-            if event.cache_hit:
-                _log_message(
-                    self.logger,
-                    self.run_id,
-                    "cache",
-                    f"hit entrypoint={event.entrypoint_id} action={event.action_id}",
-                    event.updated_at,
-                )
-            _log_message(
-                self.logger,
-                self.run_id,
-                "task",
-                f"entrypoint={event.entrypoint_id} {event.status} action={event.action_id} "
-                f"parent={event.caller_action_id} attempt={event.attempt}",
-                event.updated_at,
+            self._action(event)
+        elif isinstance(event, LogEvent):
+            self._output(event)
+        else:
+            self._run(event)
+
+    def _action(self, event: TaskActionStatus) -> None:
+        name = (
+            self.task_name
+            if self.task_name and event.action_id == self.root_action_id
+            else self.entrypoint_names.get(
+                event.entrypoint_id, f"entrypoint #{event.entrypoint_id}"
             )
-            if event.error and event.status in {"queued", "failed", "canceled"}:
-                _log_message(
-                    self.logger,
-                    self.run_id,
-                    "error",
-                    f"entrypoint={event.entrypoint_id} action={event.action_id} "
-                    f"attempt={event.attempt} | {event.error}",
-                    event.updated_at,
-                )
+        )
+        self.action_names[event.action_id] = name
+        previous = self.actions.get(event.action_id)
+        current = (event.status, event.attempt, event.cache_hit, event.error)
+        if previous == current:
             return
-        if isinstance(event, LogEvent):
-            if not isinstance(event.event, dict):
-                message = "invalid task log event"
-                raise TypeError(message)
-            action = event.event.get("action_id", event.key.decode())
-            attempt = event.event.get("attempt", "?")
-            source = event.event.get("source", "task")
-            timestamp = datetime.fromtimestamp(event.created_unix_nanos / 1e9, UTC).isoformat(
-                timespec="milliseconds"
+        self.actions[event.action_id] = current
+        attempt = (
+            f" · attempt {event.attempt}/{event.max_attempts}"
+            if event.attempt and event.max_attempts > 1
+            else ""
+        )
+        origin = (
+            f" · from {_id_suffix(event.caller_action_id)}"
+            if previous is None and event.caller_action_id
+            else ""
+        )
+        error = (
+            f" · {event.error}"
+            if event.error and event.status in {"queued", "failed", "canceled"}
+            else ""
+        )
+        _log_message(
+            self.logger,
+            self.run_id,
+            "task",
+            f"{name} [{_id_suffix(event.action_id)}] "
+            f"{_task_display_status(event)}{attempt}{origin}{error}",
+            event.updated_at,
+            warning=event.status in {"failed", "canceled"},
+            action_id=event.action_id,
+            parent_action_id=event.caller_action_id,
+            entrypoint_id=event.entrypoint_id,
+        )
+
+    def _output(self, event: LogEvent) -> None:
+        if not isinstance(event.event, dict):
+            message = "invalid task log event"
+            raise TypeError(message)
+        action = str(event.event.get("action_id", event.key.decode(errors="replace")))
+        attempt = event.event.get("attempt", "?")
+        attempt_label = f" · attempt {attempt}" if attempt != 1 else ""
+        phase = str(event.event.get("phase", "task"))
+        source = phase if phase in {"pull", "build"} else "output"
+        label = self.action_names.get(
+            action, self.task_name if action == self.root_action_id else "task"
+        )
+        phase_key = (action, phase)
+        image = ""
+        if phase in {"pull", "build"} and phase_key not in self.phases:
+            runtime = event.event.get("runtime", "")
+            image_name = event.event.get("image", "")
+            image = f" · {runtime} {image_name}" if runtime or image_name else ""
+        self.phases.add(phase_key)
+        timestamp = datetime.fromtimestamp(event.created_unix_nanos / 1e9, UTC).isoformat(
+            timespec="milliseconds"
+        )
+        _log_message(
+            self.logger,
+            self.run_id,
+            source,
+            f"{label} [{_id_suffix(action)}]{attempt_label}{image} | {event.message}",
+            timestamp,
+            action_id=action,
+            phase=phase,
+        )
+
+    def _run(self, event: Run) -> None:
+        if not self.run_status:
+            environment = event.environment.name if event.environment is not None else ""
+            target = (
+                f"{environment}.{self.task_name}"
+                if environment and self.task_name
+                else environment or self.task_name or f"entrypoint #{event.entrypoint_id}"
             )
             _log_message(
                 self.logger,
                 self.run_id,
-                str(source),
-                f"action={action} attempt={attempt} | {event.message}",
-                timestamp,
+                "run",
+                f"{self.run_id} · {target}",
+                entrypoint_id=event.entrypoint_id,
             )
+        self.root_action_id = event.root_action_id or self.root_action_id
+        if event.status == self.run_status and event.error == self.last_error:
             return
-        if not self.started and event.environment is not None:
-            _log_message(
-                self.logger,
-                self.run_id,
-                "deployment",
-                f"entrypoint={event.entrypoint_id} "
-                f"namespace_id={event.environment.namespace_id} "
-                f"version={event.environment.version}",
-            )
-        if not self.started and event.root_action_id:
-            _log_message(self.logger, self.run_id, "root", f"action={event.root_action_id}")
-        self.started = True
+        self.run_status = event.status
         status = event.status
         if event.created_at and event.updated_at:
             duration = datetime.fromisoformat(event.updated_at) - datetime.fromisoformat(
                 event.created_at
             )
-            status += f" elapsed={duration.total_seconds():.3f}s"
-        _log_message(self.logger, self.run_id, "status", status, event.updated_at)
-        if event.error and event.error != self.last_error:
-            _log_message(self.logger, self.run_id, "error", event.error, event.updated_at)
+            status += f" · {duration.total_seconds():.1f}s"
+        if event.error:
+            status += f" · {event.error}"
+        _log_message(
+            self.logger,
+            self.run_id,
+            "run",
+            status,
+            event.updated_at,
+            warning=event.status in {"failed", "canceled"},
+            action_id=self.root_action_id,
+        )
         self.last_error = event.error
 
 
@@ -230,7 +325,12 @@ def _default_build_command(source: UvSource, workdir: str) -> tuple[str, ...]:
     relative_project = os.path.relpath(source.root, source.bundle_root / workdir)
     if source.script is not None:
         script = os.path.relpath(source.script, source.bundle_root / workdir)
-        return ("uv", "sync", "--script", script, "--frozen", "--active")
+        skip_local = tuple(
+            argument
+            for name in source.local_package_names
+            for argument in ("--no-install-package", name)
+        )
+        return ("uv", "sync", "--script", script, "--frozen", "--active", *skip_local)
     command = (
         "uv",
         "sync",
@@ -247,17 +347,9 @@ def _prepare_bundle(environment: TaskEnvironment) -> _BundleInputs:
     source = environment.dependency_source
     python_requires = source.check_lock()
     root = source.bundle_root
-    includes = environment.resolved_source_includes()
-    selected = select_files(root, includes=includes, scopes=source.local_roots)
-    required = (
-        *source.required_files,
-        *(task.source_file.relative_to(root) for task in environment.tasks),
+    bundle = build_source_bundle(
+        source, tuple(task.source_file.relative_to(root) for task in environment.tasks)
     )
-    missing = next((path for path in required if path not in selected), None)
-    if missing is not None:
-        msg = f"required task file is excluded from the source bundle: {missing}"
-        raise ValueError(msg)
-    bundle = _limited_bundle(root, selected=selected)
     image_workdir = source.root / environment.image.workdir
     if (
         Path(environment.image.workdir).is_absolute()
@@ -279,13 +371,42 @@ def _prepare_bundle(environment: TaskEnvironment) -> _BundleInputs:
     )
 
 
+def _entrypoint_names(environment: TaskEnvironment) -> dict[int, str]:
+    candidates: dict[int, set[str]] = {}
+    visited: set[TaskEnvironment] = set()
+
+    def visit(current: TaskEnvironment) -> None:
+        if current in visited:
+            return
+        visited.add(current)
+        for task in current.tasks:
+            candidates.setdefault(task.entrypoint_id, set()).add(task.qualname)
+        for dependency in current.dependencies:
+            visit(dependency)
+
+    visit(environment)
+    return {
+        entrypoint_id: next(iter(names))
+        for entrypoint_id, names in candidates.items()
+        if len(names) == 1
+    }
+
+
 class RunHandle(Generic[R]):
     """Handle the lifecycle and result of a submitted task run."""
 
-    def __init__(self, client: Client, run_id: str) -> None:
+    def __init__(
+        self,
+        client: Client,
+        run_id: str,
+        task_name: str = "",
+        entrypoint_names: dict[int, str] | None = None,
+    ) -> None:
         """Create a handle associated with a client and server run ID."""
         self.client = client
         self.id = run_id
+        self.task_name = task_name
+        self.entrypoint_names = entrypoint_names or {}
 
     async def status(self) -> str:
         """Return the current server status for this run.
@@ -306,22 +427,47 @@ class RunHandle(Generic[R]):
         async for response in self.client.rpc.watch_run(WatchRunRequest(id=self.id)):
             yield _require_run(response.run)
 
-    async def result(self, *, logger: logging.Logger | None = None) -> R:
+    async def result(
+        self, *, logger: logging.Logger | None = None, display: Literal["live"] | None = None
+    ) -> R:
         """Wait for completion and return the decoded task result.
 
-        With a logger, display lifecycle events and drain task logs before returning.
+        Pass a logger for event lines, or ``display="live"`` for a terminal display.
 
         Returns:
             The decoded task result.
 
         Raises:
-            CacheableError: If the task returns a deterministic typed failure.
-            RuntimeError: If the run fails, is canceled, or ends prematurely.
+            ValueError: If both output options are requested.
 
         """
+        if logger is not None and display is not None:
+            msg = "logger and display cannot be used together"
+            raise ValueError(msg)
+        if display not in {None, "live"}:
+            msg = f"unsupported display: {display!r}"
+            raise ValueError(msg)
+        if display == "live":
+            from lutra._live import LiveDisplay  # ruff: ignore[import-outside-top-level]
+
+            with LiveDisplay(self.id, self.task_name, self.entrypoint_names) as view:
+                try:
+                    return await self._result(view)
+                except Exception as exc:
+                    view.fail(str(exc))
+                    raise
+        writer = (
+            _RunLogger(logger, self.id, self.task_name, self.entrypoint_names)
+            if logger is not None
+            else None
+        )
+        return await self._result(writer)
+
+    async def _result(  # ruff: ignore[complex-structure]
+        self, writer: _RunLogger | LiveDisplay | None
+    ) -> R:
         terminal: Run | None = None
-        writer = _RunLogger(logger, self.id) if logger is not None else None
-        events = self.watch() if logger is None else self.events()
+        events = self.watch() if writer is None else self.events()
         async for event in events:
             if writer is not None:
                 writer.event(event)
@@ -343,8 +489,10 @@ class RunHandle(Generic[R]):
                     raise CacheableError(failure[1], failure[2])
             raise RuntimeError(terminal.error or f"run {terminal.status}")
         result = await loads(terminal.output_cbor, self.client.resolve_blob)
-        if logger is not None:
-            _log_message(logger, self.id, "result", repr(result))
+        if isinstance(writer, _RunLogger):
+            _log_message(writer.logger, self.id, "result", _preview(result))
+        elif writer is not None:
+            writer.finish(result)
         return result  # type: ignore[return-value]
 
     async def cancel(self) -> None:
@@ -419,7 +567,9 @@ class Client:
                 raise ValueError(msg)
         return self._namespace_id
 
-    async def _prepare(self, environment: TaskEnvironment) -> EnvironmentIdentifier:
+    async def _prepare(
+        self, environment: TaskEnvironment, logger: logging.Logger | None = None
+    ) -> EnvironmentIdentifier:
         namespace_id = await self._resolve_namespace_id()
         ordered: list[TaskEnvironment] = []
         visiting: set[TaskEnvironment] = set()
@@ -447,6 +597,14 @@ class Client:
         identifiers: dict[TaskEnvironment, EnvironmentIdentifier] = {}
         for current in ordered:
             inputs = _prepare_bundle(current)
+            if logger is not None:
+                _log_message(
+                    logger,
+                    "",
+                    "prepare",
+                    f"{current.name} · source {_size(inputs.source)}, "
+                    f"build context {_size(inputs.build_context)}",
+                )
             uri = await upload_blob(self.blob, inputs.source, SOURCE_BUNDLE_MIME)
             build_uri = await upload_blob(self.blob, inputs.build_context, SOURCE_BUNDLE_MIME)
             response = await self.rpc.register_environment(
@@ -476,6 +634,7 @@ class Client:
                         entrypoints=[
                             Entrypoint(
                                 command=StartupCommand(args=list(task.entrypoint())),
+                                name=task.qualname,
                                 max_attempts=task.max_attempts,
                                 cache=task.cache,
                                 task_version=task.version or "" if task.cache else "",
@@ -489,6 +648,13 @@ class Client:
                 msg = "server returned no registered environment"
                 raise RuntimeError(msg)
             identifiers[current] = response.environment
+            if logger is not None:
+                _log_message(
+                    logger,
+                    "",
+                    "registered",
+                    f"{current.name} · version {_id_suffix(response.environment.version)}",
+                )
         return identifiers[environment]
 
     async def submit(
@@ -497,6 +663,7 @@ class Client:
         *,
         idempotency_key: str = "",
         max_attempts: int | None = None,
+        logger: logging.Logger | None = None,
     ) -> RunHandle[R]:
         """Submit an invocation and return a handle for its run.
 
@@ -508,7 +675,7 @@ class Client:
             invocation.task.retry,
             invocation.task.max_attempts if max_attempts is None else max_attempts,
         )
-        environment = await self._prepare(invocation.task.environment)
+        environment = await self._prepare(invocation.task.environment, logger)
         result = await self.rpc.create_run(
             CreateRunRequest(
                 environment=environment,
@@ -517,7 +684,12 @@ class Client:
                 idempotency_key=idempotency_key,
             )
         )
-        return RunHandle(self, _require_run(result.run).id)
+        return RunHandle(
+            self,
+            _require_run(result.run).id,
+            invocation.task.qualname,
+            _entrypoint_names(invocation.task.environment),
+        )
 
     async def run(
         self,
@@ -526,27 +698,56 @@ class Client:
         idempotency_key: str = "",
         max_attempts: int | None = None,
         logger: logging.Logger | None = None,
+        display: Literal["live"] | None = None,
     ) -> R:
         """Submit an invocation and wait for its decoded result.
 
-        Pass a Python logger to display run events, task logs, and the result.
+        Pass a Python logger for event lines, or ``display="live"`` for a terminal display.
 
         Returns:
             The decoded task result.
 
+        Raises:
+            ValueError: If both output options are requested.
+
         """
+        if logger is not None and display is not None:
+            msg = "logger and display cannot be used together"
+            raise ValueError(msg)
+        if display not in {None, "live"}:
+            msg = f"unsupported display: {display!r}"
+            raise ValueError(msg)
+        arguments = []
+        if logger is not None or display == "live":
+            if invocation.args:
+                arguments.append(f"args={_preview(invocation.args)}")
+            if invocation.kwargs:
+                arguments.append(f"kwargs={_preview(invocation.kwargs)}")
+        target = " ".join([
+            f"{invocation.task.environment.name}.{invocation.task.qualname}",
+            *arguments,
+        ])
         if logger is not None:
-            _log_message(
-                logger, "", "submit", f"{invocation.task.module}.{invocation.task.qualname}"
-            )
-            _log_message(
-                logger, "", "input", f"args={invocation.args!r} kwargs={invocation.kwargs!r}"
-            )
+            _log_message(logger, "", "submit", target)
+        if display == "live":
+            from lutra._live import LiveDisplay  # ruff: ignore[import-outside-top-level]
+
+            with LiveDisplay(
+                "", invocation.task.qualname, _entrypoint_names(invocation.task.environment)
+            ) as view:
+                view.prepare(target)
+                try:
+                    handle = await self.submit(
+                        invocation, idempotency_key=idempotency_key, max_attempts=max_attempts
+                    )
+                    view.run_id = handle.id
+                    return await handle._result(view)  # ruff: ignore[private-member-access]
+                except Exception as exc:
+                    view.fail(str(exc))
+                    raise
         handle = await self.submit(
-            invocation, idempotency_key=idempotency_key, max_attempts=max_attempts
+            invocation, idempotency_key=idempotency_key, max_attempts=max_attempts, logger=logger
         )
-        if logger is not None:
-            _log_message(logger, handle.id, "run", handle.id)
         return await handle.result(logger=logger)
 
     async def resolve_blob(self, uri: str) -> bytes:

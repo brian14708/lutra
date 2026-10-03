@@ -88,10 +88,16 @@ def normalize_retry(retry: RetryMode | str, max_attempts: int | None) -> tuple[R
 
 @dataclass(frozen=True)
 class TaskImage:
-    """Runtime image. Docker builds FROM from_image; the base needs Python and uv."""
+    """Container image. Lutra adds uv and installs Python when needed.
 
-    name: str = "local-python"
-    from_image: str = ""
+    Custom bases need Linux and the system libraries required by Python and
+    task dependencies. Use a standard distribution image such as Debian or
+    Ubuntu; minimal images such as scratch are unsupported. Pin the base by
+    digest when builds must use identical base contents.
+    """
+
+    name: str = "container"
+    from_image: str = "docker.io/library/python:3.12-slim-bookworm"
     build_context: Path | None = None
     build_command: tuple[str, ...] | None = None
     workdir: str = "."
@@ -146,63 +152,22 @@ class Resources:
 
 @dataclass(frozen=True, eq=False)
 class TaskEnvironment:
-    """Own a runtime declaration and its complete task entrypoint set.
-
-    Relative source_includes use the declaring file's directory. Entries may
-    name files, directories, or globs. They override ignore rules.
-    """
+    """Own a runtime declaration and its complete task entrypoint set."""
 
     name: str
     image: TaskImage = field(default_factory=TaskImage)
     resources: Resources = field(default_factory=Resources)
     env_vars: Mapping[str, str] = field(default_factory=dict)
     dependencies: tuple[TaskEnvironment, ...] = ()
-    source_includes: tuple[Path, ...] = ()
     import_roots: tuple[Path, ...] | None = None
     _tasks: list[Task[..., object]] = field(default_factory=list, init=False, repr=False)
-    _declaring_file: Path | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
-        """Copy mutable declarations supplied by the caller.
-
-        Raises:
-            TypeError: If source_includes is a bare path or string.
-
-        """
+        """Copy mutable declarations supplied by the caller."""
         object.__setattr__(self, "env_vars", MappingProxyType(dict(self.env_vars)))
         object.__setattr__(self, "dependencies", tuple(self.dependencies))
-        if isinstance(self.source_includes, (str, Path)):
-            msg = "source_includes must be a sequence of paths"
-            raise TypeError(msg)
-        object.__setattr__(self, "source_includes", tuple(self.source_includes))
-        frame = inspect.currentframe()
-        caller = frame.f_back.f_back if frame is not None and frame.f_back is not None else None
-        if caller is not None:
-            filename = Path(caller.f_code.co_filename)
-            if filename.is_file():
-                object.__setattr__(self, "_declaring_file", filename.resolve())
         if self.import_roots is not None:
             object.__setattr__(self, "import_roots", tuple(self.import_roots))
-
-    def resolved_source_includes(self) -> tuple[Path, ...]:
-        """Resolve include paths against the file that declared this environment.
-
-        Returns:
-            Paths anchored at the declaration file.
-
-        Raises:
-            ValueError: If no declaration file is available for relative paths.
-
-        """
-        if not self.source_includes:
-            return ()
-        if self._declaring_file is None:
-            msg = "source_includes require an environment declared in a file"
-            raise ValueError(msg)
-        return tuple(
-            path if path.is_absolute() else self._declaring_file.parent / path
-            for path in self.source_includes
-        )
 
     @property
     def tasks(self) -> tuple[Task[..., object], ...]:

@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
@@ -13,6 +14,7 @@ import (
 	"time"
 
 	lutrav1 "github.com/brian14708/lutra/gen/lutra/v1"
+	lutrav1connect "github.com/brian14708/lutra/gen/lutra/v1/lutrav1connect"
 	"github.com/brian14708/lutra/internal/cache"
 	"github.com/brian14708/lutra/internal/db"
 	"github.com/brian14708/lutra/internal/runlog"
@@ -22,7 +24,6 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
-	"github.com/minio/minio-go/v7"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -31,8 +32,7 @@ type RunWorker struct {
 	Capacity, MaxRuns             int
 	ProcessTarget, ProcessCeiling int
 	Logs                          runlog.Service
-	Store                         *minio.Core
-	Bucket                        string
+	Blobs                         lutrav1connect.BlobServiceClient
 	TaskAPIHandler                http.Handler
 	slots                         tasktree.Slots
 	processes                     *tasktree.ProcessPool
@@ -68,7 +68,7 @@ func (w *RunWorker) Start(ctx context.Context) {
 	}
 	w.processes = tasktree.NewProcessPool(w.ProcessTarget, w.ProcessCeiling)
 	w.Cache = cache.New(w.DB)
-	w.adapter = &Worker{DB: w.DB, Logs: w.Logs, Store: w.Store, Bucket: w.Bucket, TaskAPIHandler: w.TaskAPIHandler, queries: db.New(w.DB), Cache: w.Cache}
+	w.adapter = &Worker{Logs: w.Logs, Blobs: w.Blobs, TaskAPIHandler: w.TaskAPIHandler}
 	w.wg.Add(1)
 	go func() { defer w.wg.Done(); w.loop(ctx) }()
 	w.wg.Add(1)
@@ -139,7 +139,7 @@ func (w *RunWorker) loop(ctx context.Context) {
 	}
 }
 
-func taskNode(row db.LoadRunTasksRow) (tasktree.Node, error) {
+func taskNode(row db.LoadRunTasksRow, runtime string) (tasktree.Node, error) {
 	var spec lutrav1.ActionSpec
 	if err := proto.Unmarshal(row.ActionSpec, &spec); err != nil {
 		return tasktree.Node{}, err
@@ -155,7 +155,7 @@ func taskNode(row db.LoadRunTasksRow) (tasktree.Node, error) {
 	}
 	key := []byte(nil)
 	if spec.GetCache() {
-		key = cacheKey(row, &spec)
+		key = cacheKey(row, &spec, runtime)
 		if len(key) == 0 {
 			return tasktree.Node{}, errors.New("invalid cached task environment")
 		}
@@ -163,7 +163,7 @@ func taskNode(row db.LoadRunTasksRow) (tasktree.Node, error) {
 	return tasktree.Node{ID: row.ID, ParentID: row.CallerActionID, Attempt: row.Attempts, Failures: row.Failures, MaxAttempts: max(spec.MaxAttempts, 1), State: state, ImageKey: row.ImageKey, CacheKey: key, Output: row.OutputCbor, Error: row.Error, NextAttemptAt: row.NextAttemptAt.Time}, nil
 }
 
-func cacheKey(row db.LoadRunTasksRow, spec *lutrav1.ActionSpec) []byte {
+func cacheKey(row db.LoadRunTasksRow, spec *lutrav1.ActionSpec, runtime string) []byte {
 	var environment lutrav1.EnvironmentSpec
 	if err := proto.Unmarshal(row.EnvironmentSpec, &environment); err != nil {
 		return nil
@@ -192,6 +192,7 @@ func cacheKey(row db.LoadRunTasksRow, spec *lutrav1.ActionSpec) []byte {
 		"task_version":  version,
 		"input_cbor":    spec.GetInputCbor(),
 		"provider":      row.Provider,
+		"runtime":       runtime,
 		"image_key":     row.ImageKey,
 		"image": map[string]any{
 			"name": image.GetName(), "from_image": image.GetFromImage(),
@@ -271,10 +272,15 @@ func (w *RunWorker) drive(parent context.Context, runID, token uuid.UUID) {
 	if err = tx.Commit(ctx); err != nil {
 		return
 	}
-	d := &runDriver{worker: w, runID: runID, token: token, rows: make(map[uuid.UUID]db.LoadRunTasksRow), images: make(map[string]*imageWait)}
+	runtime, err := containerRuntime()
+	if err != nil {
+		slog.Error("select container runtime", "error", err)
+		return
+	}
+	d := &runDriver{worker: w, ctx: ctx, runtime: runtime, runID: runID, token: token, rows: make(map[uuid.UUID]db.LoadRunTasksRow), images: make(map[string]*imageWait)}
 	snapshot := make([]tasktree.Node, 0, len(rows))
 	for _, row := range rows {
-		node, nodeErr := taskNode(row)
+		node, nodeErr := taskNode(row, runtime)
 		if nodeErr != nil {
 			slog.Error("restore task tree", "error", nodeErr)
 			return
@@ -314,6 +320,8 @@ type imageWait struct {
 }
 type runDriver struct {
 	worker       *RunWorker
+	ctx          context.Context
+	runtime      string
 	runID, token uuid.UUID
 	coordinator  *tasktree.Coordinator
 	mu           sync.Mutex
@@ -348,7 +356,32 @@ func (d *runDriver) Ensure(ctx context.Context, key []byte) error {
 				wait.err = err
 				return
 			}
-			wait.image, wait.err = d.worker.adapter.ensureImage(d.worker.ctx, key, provider, task)
+			runtime, err := containerRuntime()
+			if err != nil {
+				wait.err = err
+				return
+			}
+			for _, phase := range []string{"pull", "build"} {
+				reader, writer := io.Pipe()
+				image := task.Spec.GetImage().GetFromImage()
+				if phase == "build" {
+					image = fmt.Sprintf("lutra:sha-%x", key)
+				}
+				logDone := d.worker.adapter.collectTaskLogs(runlog.TaskLogEvent{
+					ActionID: row.ID.String(), Attempt: max(row.Attempts, 1),
+					Phase: phase, Runtime: runtime, Image: image,
+				}, d.runID, reader)
+				defer func() {
+					_ = writer.Close()
+					<-logDone
+				}()
+				if phase == "pull" {
+					task.PullOutput = writer
+				} else {
+					task.Stderr = writer
+				}
+			}
+			wait.image, wait.err = d.worker.adapter.ensureImage(d.ctx, key, provider, task)
 		}()
 	}
 	d.mu.Unlock()
@@ -372,7 +405,7 @@ func (d *runDriver) Run(ctx context.Context, attempt tasktree.Attempt) ([]byte, 
 	if err != nil {
 		return nil, err
 	}
-	identity := taskContext{runID: d.runID, actionID: attempt.NodeID, token: d.token, attempt: attempt.Number, coordinator: d.coordinator}
+	identity := taskContext{TaskIdentity: TaskIdentity{RunID: d.runID, ActionID: attempt.NodeID, ClaimToken: d.token, Attempt: attempt.Number}, coordinator: d.coordinator}
 	identity.add = func(ctx context.Context, child uuid.UUID) error {
 		if _, err := d.coordinator.Get(ctx, child); err == nil {
 			return nil
@@ -385,7 +418,7 @@ func (d *runDriver) Run(ctx context.Context, attempt tasktree.Attempt) ([]byte, 
 			if row.ID != child {
 				continue
 			}
-			node, err := taskNode(row)
+			node, err := taskNode(row, d.runtime)
 			if err != nil {
 				return err
 			}

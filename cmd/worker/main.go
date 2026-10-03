@@ -52,9 +52,10 @@ func main() {
 		logger.Error("blob signer configuration failed", "error", err)
 		os.Exit(1)
 	}
-	path, handler = lutrav1connect.NewBlobServiceHandler(blob.Service{DB: db, Store: store, Signer: signer, Bucket: config.Bucket})
+	blobService := blob.Service{DB: db, Store: store, Signer: signer, Bucket: config.Bucket}
+	path, handler = lutrav1connect.NewBlobServiceHandler(blobService)
 	mux.Handle(path, handler)
-	worker := &lutra.RunWorker{DB: db, Capacity: capacity, MaxRuns: maxRuns, Logs: logs, Store: store, Bucket: config.Bucket, TaskAPIHandler: mux}
+	worker := &lutra.RunWorker{DB: db, Capacity: capacity, MaxRuns: maxRuns, Logs: logs, Blobs: blobService, TaskAPIHandler: mux}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	worker.Start(ctx)

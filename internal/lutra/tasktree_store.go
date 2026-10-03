@@ -22,6 +22,8 @@ type taskStore struct {
 
 func taskStatus(s tasktree.State) db.LutraTaskActionStatus {
 	switch s {
+	case tasktree.Building:
+		return db.LutraTaskActionStatusBuilding
 	case tasktree.Running:
 		return db.LutraTaskActionStatusRunning
 	case tasktree.Waiting:

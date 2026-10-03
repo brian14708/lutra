@@ -6,7 +6,6 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"os"
 	"path"
 	"regexp"
 	"sort"
@@ -25,7 +24,7 @@ import (
 
 var (
 	environmentVariablePattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z_0-9]*$`)
-	dockerWorkdirPattern       = regexp.MustCompile(`^[A-Za-z0-9._/-]+$`)
+	containerWorkdirPattern    = regexp.MustCompile(`^[A-Za-z0-9._/-]+$`)
 )
 
 func validUUID(value string) bool {
@@ -75,18 +74,12 @@ func normalizeEnvironment(spec *lutrav1.EnvironmentSpec) (*environmentSpec, erro
 	image := spec.GetImage()
 	var buildContext []byte
 	switch image.GetName() {
-	case localTaskImage, "docker":
-		if image.GetName() == localTaskImage {
-			if image.GetFromImage() != "" {
-				return nil, invalidTask("local-python does not accept a base image")
-			}
-		} else {
-			if len(image.GetFromImage()) > 2048 {
-				return nil, invalidTask("invalid Docker base image")
-			}
-			if _, err := reference.ParseNormalizedNamed(image.GetFromImage()); err != nil {
-				return nil, invalidTask("invalid Docker base image")
-			}
+	case containerTaskImage:
+		if len(image.GetFromImage()) > 2048 {
+			return nil, invalidTask("invalid container base image")
+		}
+		if _, err := reference.ParseNormalizedNamed(image.GetFromImage()); err != nil {
+			return nil, invalidTask("invalid container base image")
 		}
 		buildContext, mimeType, err = blob.ParseURI(image.GetBuildContextUri())
 		if err != nil || mimeType != archiveMIME || image.GetBuildContextUri() != sourceURI(buildContext) {
@@ -101,8 +94,8 @@ func normalizeEnvironment(spec *lutrav1.EnvironmentSpec) (*environmentSpec, erro
 		if image.GetWorkdir() == "" || path.IsAbs(image.GetWorkdir()) || path.Clean(image.GetWorkdir()) != image.GetWorkdir() || image.GetWorkdir() == ".." || strings.HasPrefix(image.GetWorkdir(), "../") || strings.ContainsRune(image.GetWorkdir(), 0) {
 			return nil, invalidTask("invalid image workdir")
 		}
-		if image.GetName() == "docker" && !dockerWorkdirPattern.MatchString(image.GetWorkdir()) {
-			return nil, invalidTask("invalid Docker workdir")
+		if !containerWorkdirPattern.MatchString(image.GetWorkdir()) {
+			return nil, invalidTask("invalid container workdir")
 		}
 	case "e2b":
 		if image.GetFromImage() == "" {
@@ -231,10 +224,8 @@ func (s Service) RegisterEnvironment(ctx context.Context, req *connect.Request[l
 	}
 	var executor Executor
 	switch spec.spec.GetImage().GetName() {
-	case localTaskImage:
-		executor = &LocalExecutor{RuntimeVersion: os.Getenv("LUTRA_PYTHON_RUNTIME_VERSION")}
-	case "docker":
-		executor = &DockerExecutor{}
+	case containerTaskImage:
+		executor = &ContainerExecutor{}
 	default:
 		return nil, connect.NewError(connect.CodeUnimplemented, fmt.Errorf("%s executor is not configured", spec.spec.GetImage().GetName()))
 	}

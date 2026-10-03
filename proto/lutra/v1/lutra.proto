@@ -61,6 +61,7 @@ message EnvironmentSpec {
 
 message Entrypoint {
   StartupCommand command = 1;
+  string name = 2;
   int32 max_attempts = 3;
   bool cache = 4;
   string task_version = 5;

@@ -16,6 +16,7 @@ type State string
 const (
 	Pending  State = "pending"
 	Ready    State = "ready"
+	Building State = "building"
 	Running  State = "running"
 	Waiting  State = "waiting"
 	Done     State = "done"
@@ -365,6 +366,16 @@ func (e *Coordinator) Run(ctx context.Context) error {
 		e.cancel()
 		return errors.New("task tree has no root")
 	}
+	// Recovery can observe a parent completion before descendant cleanup.
+	for id, node := range e.nodes {
+		if node.State.Terminal() {
+			if err := e.closeLocked(e.ctx, id, "ancestor completed"); err != nil {
+				e.mu.Unlock()
+				e.cancel()
+				return err
+			}
+		}
+	}
 	e.mu.Unlock()
 	var retryTimer Timer
 	defer func() {
@@ -445,6 +456,14 @@ func (e *Coordinator) dispatchLocked() {
 		if current.State != Pending || e.opts.Clock.Now().Before(current.NextAttemptAt) {
 			continue
 		}
+		if e.terminalAncestorLocked(id) {
+			continue
+		}
+		e.waitStableLocked(id)
+		current = e.nodes[id]
+		if current.State != Pending || e.ctx.Err() != nil {
+			continue
+		}
 		next := clone(*current)
 		next.State = Ready
 		next.WaitingOn = ""
@@ -453,20 +472,57 @@ func (e *Coordinator) dispatchLocked() {
 		}
 		e.wg.Add(1)
 		e.queued++
-		var releaseAdmission sync.Once
-		release := func() {
-			releaseAdmission.Do(func() {
-				e.mu.Lock()
-				e.queued--
-				e.notifyLocked()
-				e.mu.Unlock()
-			})
-		}
+		release := e.admissionRelease()
 		go func(id uuid.UUID) {
 			defer e.wg.Done()
 			defer release()
 			e.execute(id, release)
 		}(id)
+	}
+}
+
+func (e *Coordinator) terminalAncestorLocked(id uuid.UUID) bool {
+	for node := e.nodes[id]; node.ParentID != nil; {
+		e.waitStableLocked(*node.ParentID)
+		node = e.nodes[*node.ParentID]
+		if node.State.Terminal() {
+			return true
+		}
+	}
+	return false
+}
+
+func (e *Coordinator) admissionRelease() func() {
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			e.mu.Lock()
+			e.queued--
+			e.notifyLocked()
+			e.mu.Unlock()
+		})
+	}
+}
+
+func (e *Coordinator) acquireAdmission(ctx context.Context) (func(), error) {
+	for {
+		e.mu.Lock()
+		if err := ctx.Err(); err != nil {
+			e.mu.Unlock()
+			return nil, err
+		}
+		if e.queued < e.opts.ReadyQueue {
+			e.queued++
+			e.mu.Unlock()
+			return e.admissionRelease(), nil
+		}
+		changed := e.changed
+		e.mu.Unlock()
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-changed:
+		}
 	}
 }
 
@@ -482,6 +538,8 @@ func (e *Coordinator) execute(id uuid.UUID, releaseAdmission func()) {
 	}
 	if len(n.CacheKey) > 0 && e.opts.Cache != nil {
 		e.mu.Unlock()
+		// A cache owner may need a child in this queue to produce its result.
+		releaseAdmission()
 		output, taskErr, lease, acquireErr := e.opts.Cache.Acquire(e.ctx, n.CacheKey)
 		if lease != nil {
 			cacheLease = lease
@@ -491,6 +549,12 @@ func (e *Coordinator) execute(id uuid.UUID, releaseAdmission func()) {
 					_ = cacheLease.Release(context.WithoutCancel(e.ctx))
 				}
 			}()
+			if acquireErr == nil {
+				releaseAdmission, acquireErr = e.acquireAdmission(workCtx)
+				if acquireErr == nil {
+					defer releaseAdmission()
+				}
+			}
 		}
 		e.mu.Lock()
 		e.waitStableLocked(id)
@@ -525,7 +589,7 @@ func (e *Coordinator) execute(id uuid.UUID, releaseAdmission func()) {
 		}
 	}
 	if len(n.ImageKey) > 0 && e.opts.Images != nil {
-		n.State = Waiting
+		n.State = Building
 		n.WaitingOn = WaitingForImage
 		if e.commitLocked(workCtx, n) != nil {
 			e.mu.Unlock()
@@ -584,6 +648,21 @@ func (e *Coordinator) execute(id uuid.UUID, releaseAdmission func()) {
 	taskCtx, cancel := context.WithCancel(workCtx)
 	a := &active{ctx: taskCtx, cancel: cancel, held: true}
 	e.mu.Lock()
+	e.waitStableLocked(id)
+	n = clone(*e.nodes[id])
+	if n.State != Ready || e.ctx.Err() != nil {
+		e.mu.Unlock()
+		cancel()
+		e.opts.SlotPool.Release()
+		return
+	}
+	if e.terminalAncestorLocked(id) {
+		_ = e.closeLocked(e.ctx, id, "ancestor completed")
+		e.mu.Unlock()
+		cancel()
+		e.opts.SlotPool.Release()
+		return
+	}
 	e.waitStableLocked(id)
 	n = clone(*e.nodes[id])
 	if n.State != Ready || e.ctx.Err() != nil {

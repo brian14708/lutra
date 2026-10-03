@@ -13,7 +13,7 @@ import (
 func TestTaskCacheKeyContract(t *testing.T) {
 	environment := &lutrav1.EnvironmentSpec{
 		Name: "work", SourceUri: "blob:source,aaa",
-		Image:       &lutrav1.ImageSpec{Name: "local-python", FromImage: "python:3.14", BuildContextUri: "blob:build,aaa"},
+		Image:       &lutrav1.ImageSpec{Name: "container", FromImage: "python:3.14", BuildContextUri: "blob:build,aaa"},
 		Entrypoints: []*lutrav1.Entrypoint{{Command: &lutrav1.StartupCommand{Args: []string{"python", "task"}}, Cache: true}},
 	}
 	encoded, err := proto.Marshal(environment)
@@ -22,24 +22,27 @@ func TestTaskCacheKeyContract(t *testing.T) {
 	}
 	row := db.LoadRunTasksRow{EnvironmentSpec: encoded, EnvironmentName: "work", EntrypointID: 1, Provider: "local", Version: "registration-a", NamespaceID: uuid.New(), ImageKey: bytes.Repeat([]byte{1}, 32)}
 	spec := &lutrav1.ActionSpec{Cache: true, InputCbor: []byte{0x82, 0x80, 0xa0}}
-	baseline := cacheKey(row, spec)
+	baseline := cacheKey(row, spec, "docker")
 	if len(baseline) != 32 {
 		t.Fatalf("invalid key length: %d", len(baseline))
 	}
 	otherNamespace := row
 	otherNamespace.NamespaceID = uuid.New()
 	otherNamespace.Version = "registration-b"
-	if !bytes.Equal(baseline, cacheKey(otherNamespace, spec)) {
+	if !bytes.Equal(baseline, cacheKey(otherNamespace, spec, "docker")) {
 		t.Fatal("namespace and registration version changed the key")
 	}
 	otherRuntime := row
 	otherRuntime.ImageKey = bytes.Repeat([]byte{2}, 32)
-	if bytes.Equal(baseline, cacheKey(otherRuntime, spec)) {
+	if bytes.Equal(baseline, cacheKey(otherRuntime, spec, "docker")) {
 		t.Fatal("runtime image change reused the task result")
+	}
+	if bytes.Equal(baseline, cacheKey(row, spec, "podman")) {
+		t.Fatal("Docker and Podman shared a task result")
 	}
 	changedInput := proto.Clone(spec).(*lutrav1.ActionSpec)
 	changedInput.InputCbor = []byte{0x82, 0x81, 0x01, 0xa0}
-	if bytes.Equal(baseline, cacheKey(row, changedInput)) {
+	if bytes.Equal(baseline, cacheKey(row, changedInput, "docker")) {
 		t.Fatal("distinct inputs shared a key")
 	}
 	environment.SourceUri = "blob:source,bbb"
@@ -47,13 +50,13 @@ func TestTaskCacheKeyContract(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if bytes.Equal(baseline, cacheKey(row, spec)) {
+	if bytes.Equal(baseline, cacheKey(row, spec, "docker")) {
 		t.Fatal("source change did not invalidate source-derived version")
 	}
 	spec.TaskVersion = "1.2.3"
-	explicit := cacheKey(row, spec)
+	explicit := cacheKey(row, spec, "docker")
 	row.EnvironmentSpec = encoded
-	if !bytes.Equal(explicit, cacheKey(row, spec)) {
+	if !bytes.Equal(explicit, cacheKey(row, spec, "docker")) {
 		t.Fatal("explicit version did not preserve reuse across source changes")
 	}
 	environment.ImportRoots = []string{"src"}
@@ -61,7 +64,7 @@ func TestTaskCacheKeyContract(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if bytes.Equal(explicit, cacheKey(row, spec)) {
+	if bytes.Equal(explicit, cacheKey(row, spec, "docker")) {
 		t.Fatal("changed import roots reused the task result")
 	}
 	environment.ImportRoots = nil
@@ -70,7 +73,7 @@ func TestTaskCacheKeyContract(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if bytes.Equal(explicit, cacheKey(row, spec)) {
+	if bytes.Equal(explicit, cacheKey(row, spec, "docker")) {
 		t.Fatal("changed build context reused the task result")
 	}
 }

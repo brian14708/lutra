@@ -392,6 +392,10 @@ func TestImageWaitDoesNotConsumeSlot(t *testing.T) {
 	case <-ctx.Done():
 		t.Fatal("image wait did not start")
 	}
+	node, err := e.Get(ctx, root.ID)
+	if err != nil || node.State != Building {
+		t.Fatalf("state during image build = %q, error = %v", node.State, err)
+	}
 	if err := e.opts.SlotPool.Acquire(ctx); err != nil {
 		t.Fatal(err)
 	}

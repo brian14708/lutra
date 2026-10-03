@@ -1,6 +1,6 @@
-import { decode as decodeCbor } from "cborg";
+import { decode } from "@/lib/value";
 
-export type TaskLogEvent = {
+type TaskLogFields = {
   type: "task.log.v1";
   source: "stderr";
   message: string;
@@ -9,12 +9,18 @@ export type TaskLogEvent = {
   attempt: number;
 };
 
+export type TaskLogEvent = TaskLogFields &
+  ({ phase: "task" } | { phase: "pull" | "build"; runtime: "docker" | "podman"; image: string });
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-export function decodeTaskLog(bytes: Uint8Array): TaskLogEvent {
-  const value: unknown = decodeCbor(bytes);
+export async function decodeTaskLog(
+  bytes: Uint8Array,
+  resolver?: (uri: string) => Promise<Uint8Array>,
+): Promise<TaskLogEvent> {
+  const value = await decode(bytes, resolver);
   if (
     !isRecord(value) ||
     value.type !== "task.log.v1" ||
@@ -31,7 +37,7 @@ export function decodeTaskLog(bytes: Uint8Array): TaskLogEvent {
   ) {
     throw new Error("invalid task log event");
   }
-  return {
+  const fields: TaskLogFields = {
     type: "task.log.v1",
     source: "stderr",
     message: value.message,
@@ -39,4 +45,16 @@ export function decodeTaskLog(bytes: Uint8Array): TaskLogEvent {
     action_id: value.action_id,
     attempt: value.attempt,
   };
+  if (value.phase === "task" && value.runtime === undefined && value.image === undefined) {
+    return { ...fields, phase: "task" };
+  }
+  if (
+    (value.phase === "pull" || value.phase === "build") &&
+    (value.runtime === "docker" || value.runtime === "podman") &&
+    typeof value.image === "string" &&
+    value.image.length > 0
+  ) {
+    return { ...fields, phase: value.phase, runtime: value.runtime, image: value.image };
+  }
+  throw new Error("invalid task log metadata");
 }

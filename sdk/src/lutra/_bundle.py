@@ -90,12 +90,10 @@ def _expand_includes(root: Path, includes: Sequence[Path]) -> tuple[Path, ...]:
 
 
 def _ignore_spec(directory: Path) -> GitIgnoreSpec | None:
-    lines: list[str] = []
-    for name in (".gitignore", ".lutraignore"):
-        ignore = directory / name
-        if ignore.is_file():
-            lines.extend(ignore.read_text(encoding="utf-8").splitlines())
-    return GitIgnoreSpec.from_lines(lines) if lines else None
+    ignore = directory / ".gitignore"
+    if ignore.is_file():
+        return GitIgnoreSpec.from_lines(ignore.read_text(encoding="utf-8").splitlines())
+    return None
 
 
 def _ignored(path: Path, rules: Mapping[Path, GitIgnoreSpec], *, directory: bool = False) -> bool:
@@ -212,9 +210,9 @@ def _scan_scope(selector: _FileSelector, scope: Path) -> list[Path]:
 def select_files(
     root: Path, *, includes: Sequence[Path] = (), scopes: Sequence[Path] | None = None
 ) -> tuple[Path, ...]:
-    """Select regular files using nested .gitignore and .lutraignore rules.
+    """Select regular files using nested .gitignore rules.
 
-    Explicit includes override both ignore files, but not safety exclusions.
+    Explicit includes override ignore files, but not safety exclusions.
 
     Returns:
         Sorted paths relative to root.
@@ -331,6 +329,8 @@ def build_bundle(
         for name, contents in sorted((generated or {}).items()):
             relative = _generated_path(name)
             target = staged / relative
+            if target.is_file() and target.read_bytes() == contents:
+                continue
             if target.exists():
                 msg = f"generated bundle path conflicts with build context: {relative}"
                 raise ValueError(msg)

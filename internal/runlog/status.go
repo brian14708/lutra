@@ -23,8 +23,12 @@ type StatusEvent struct {
 	UpdatedAt  string `cbor:"updated_at"`
 }
 
-func DecodeStatus(value []byte) (StatusEvent, error) {
+func (s Service) DecodeStatus(ctx context.Context, value []byte) (StatusEvent, error) {
 	var event StatusEvent
+	value, err := s.resolveValue(ctx, value)
+	if err != nil {
+		return event, err
+	}
 	if err := cbor.Unmarshal(value, &event); err != nil {
 		return event, err
 	}
@@ -32,7 +36,7 @@ func DecodeStatus(value []byte) (StatusEvent, error) {
 		return event, errors.New("unknown run status event type or version")
 	}
 	switch event.Status {
-	case "queued", "running", "waiting", "succeeded", "failed", "canceled":
+	case "queued", "building", "running", "waiting", "succeeded", "failed", "canceled":
 	default:
 		return event, errors.New("invalid run status event")
 	}

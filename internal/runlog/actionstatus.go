@@ -26,8 +26,12 @@ type actionStatusEvent struct {
 	CacheHit       bool   `cbor:"cache_hit"`
 }
 
-func DecodeActionStatus(value []byte) (*lutrav1.TaskActionStatus, error) {
+func (s Service) DecodeActionStatus(ctx context.Context, value []byte) (*lutrav1.TaskActionStatus, error) {
 	var event actionStatusEvent
+	value, err := s.resolveValue(ctx, value)
+	if err != nil {
+		return nil, err
+	}
 	if err := cbor.Unmarshal(value, &event); err != nil {
 		return nil, err
 	}
@@ -46,7 +50,7 @@ func DecodeActionStatus(value []byte) (*lutrav1.TaskActionStatus, error) {
 		return nil, err
 	}
 	switch event.Status {
-	case "queued", "running", "waiting", "succeeded", "failed", "canceled":
+	case "queued", "building", "running", "waiting", "succeeded", "failed", "canceled":
 	default:
 		return nil, errors.New("invalid task status event")
 	}

@@ -13,6 +13,9 @@ dependencies = [
     "zstandard>=0.25,<1",
 ]
 
+[project.optional-dependencies]
+tui = ["rich>=13.7,<15"]
+
 [dependency-groups]
 dev = [
   "pytest>=8.0.0",
@@ -23,12 +26,19 @@ dev = [
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
+[tool.hatch.build.targets.sdist]
+include = ["/src"]
+
+[tool.hatch.build.targets.sdist.force-include]
+"src/lutra/_gen" = "src/lutra/_gen"
+
 [tool.hatch.build.targets.wheel]
 packages = ["src/lutra"]
 
 [tool.pytest.ini_options]
 addopts = ["-ra"]
 asyncio_mode = "auto"
+markers = ["integration: requires a running Lutra stack"]
 testpaths = ["tests"]
 pythonpath = ["src"]
 

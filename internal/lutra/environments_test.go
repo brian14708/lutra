@@ -13,7 +13,7 @@ func TestEnvironmentImportRootsAreValidated(t *testing.T) {
 	spec := &lutrav1.EnvironmentSpec{
 		NamespaceId: uuid.NewString(), Name: "tasks", SourceUri: uri,
 		Image: &lutrav1.ImageSpec{
-			Name: "local-python", BuildContextUri: uri, Workdir: ".",
+			Name: "container", FromImage: "python:3.12-slim", BuildContextUri: uri, Workdir: ".",
 			BuildCommand: &lutrav1.StartupCommand{Args: []string{"uv", "pip", "sync"}},
 		},
 		Entrypoints: []*lutrav1.Entrypoint{{Command: &lutrav1.StartupCommand{Args: []string{"python", "-m", "lutra.serve"}}, MaxAttempts: 1}},
@@ -26,6 +26,11 @@ func TestEnvironmentImportRootsAreValidated(t *testing.T) {
 	if len(normalized.spec.ImportRoots) != 2 || normalized.spec.ImportRoots[1] != "packages/worker/src" {
 		t.Fatalf("normalized import roots = %v", normalized.spec.ImportRoots)
 	}
+	spec.Image.Name = "local-python"
+	if _, err := normalizeEnvironment(spec); err == nil {
+		t.Fatal("removed local process provider was accepted")
+	}
+	spec.Image.Name = containerTaskImage
 	firstVersion, err := normalized.version([]byte{1})
 	if err != nil {
 		t.Fatal(err)

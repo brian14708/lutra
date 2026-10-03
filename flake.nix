@@ -25,6 +25,7 @@
       perSystem =
         { pkgs, ... }:
         let
+          containerRuntime = if pkgs.stdenv.hostPlatform.isLinux then "podman" else "docker";
           corsFile = pkgs.writeText "lutra-blob-cors.xml" ''
             <CORSConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
               <CORSRule>
@@ -90,8 +91,9 @@
             shellHook = ''
               export DATABASE_URL="postgres://$USER@127.0.0.1:5432/postgres?sslmode=disable"
               export LUTRA_URL="http://127.0.0.1:8080/api"
+              export LUTRA_CONTAINER_RUNTIME="''${LUTRA_CONTAINER_RUNTIME:-${containerRuntime}}"
             '';
-            packages = with pkgs; [
+            packages = (with pkgs; [
               nodejs_26
               pnpm
               go_1_27
@@ -101,7 +103,7 @@
               postgresql
               curl
               docker-client
-            ];
+            ]) ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [ pkgs.podman ];
           };
 
           process-compose.dev = {
@@ -115,7 +117,10 @@
             settings.processes = commonProcesses // {
               build.command = "just build";
               server = {
-                command = "go run ./cmd/server -dev-worker";
+                command = ''
+                  export LUTRA_CONTAINER_RUNTIME="''${LUTRA_CONTAINER_RUNTIME:-${containerRuntime}}"
+                  exec go run ./cmd/server -dev-worker
+                '';
                 depends_on = {
                   build.condition = "process_completed_successfully";
                   pgsql.condition = "process_healthy";

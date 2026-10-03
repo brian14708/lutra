@@ -156,7 +156,7 @@ UPDATE lutra.task_actions
 SET status = 'queued',
   updated_at = now()
 WHERE run_id = sqlc.arg(run_id)::uuid
-  AND status IN ('running', 'waiting')
+  AND status IN ('building', 'running', 'waiting')
   AND EXISTS (
     SELECT 1
     FROM lutra.runs AS r
@@ -171,6 +171,12 @@ SET claim_token = NULL, lease_until = NULL
 WHERE id = $1;
 
 -- name: TransitionRunTaskAction :execrows
+WITH RECURSIVE ancestors AS (
+  SELECT caller_action_id FROM lutra.task_actions WHERE id = sqlc.arg(action_id)::uuid
+  UNION ALL
+  SELECT a.caller_action_id FROM lutra.task_actions a
+  JOIN ancestors parent ON a.id = parent.caller_action_id
+)
 UPDATE lutra.task_actions AS a
 SET status = sqlc.arg(status)::lutra.task_action_status,
   attempts = sqlc.arg(attempt)::integer,
@@ -186,13 +192,18 @@ WHERE a.id = sqlc.arg(action_id)::uuid
   AND r.claim_token = sqlc.arg(claim_token)::uuid
   AND r.lease_until > clock_timestamp()
   AND a.attempts = sqlc.arg(expected_attempt)::integer
+  AND (sqlc.arg(attempt)::integer <= a.attempts OR NOT EXISTS (
+    SELECT 1 FROM ancestors JOIN lutra.task_actions parent ON parent.id = ancestors.caller_action_id
+    WHERE parent.status IN ('succeeded', 'failed', 'canceled')
+  ))
   AND a.status NOT IN ('succeeded', 'failed', 'canceled');
 
 -- name: GetRootStatus :one
 SELECT status FROM lutra.task_actions WHERE id = $1;
 
--- name: CancelRunIfActive :execrows
+-- name: CancelRunIfActive :many
 UPDATE lutra.task_actions SET status = 'canceled', error = 'run canceled', updated_at = now()
 WHERE lutra.task_actions.run_id = $1 AND status NOT IN ('succeeded', 'failed', 'canceled')
   AND EXISTS (SELECT 1 FROM lutra.runs r JOIN lutra.task_actions root ON root.id = r.root_action_id
-              WHERE r.id = $1 AND root.status NOT IN ('succeeded', 'failed', 'canceled'));
+              WHERE r.id = $1 AND root.status NOT IN ('succeeded', 'failed', 'canceled'))
+RETURNING id;

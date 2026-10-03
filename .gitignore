@@ -8,6 +8,7 @@ node_modules/
 
 # Generated files
 /sdk/src/lutra/_gen/
+/sdk/examples/*.lock
 /gen/
 /ui/.output/
 /ui/dist/
