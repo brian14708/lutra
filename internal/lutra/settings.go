@@ -1,4 +1,4 @@
-package settings
+package lutra
 
 import (
 	"context"
@@ -16,7 +16,6 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
-	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 var (
@@ -24,13 +23,7 @@ var (
 	pathPattern = regexp.MustCompile(`^[a-z][a-z0-9_-]{0,63}(/[a-z][a-z0-9_-]{0,63})*$`)
 )
 
-type Service struct{ DB *pgxpool.Pool }
-
 var _ lutrav1connect.SettingsServiceHandler = Service{}
-
-func invalid(message string) error {
-	return connect.NewError(connect.CodeInvalidArgument, errors.New(message))
-}
 
 func namespaceID(ctx context.Context, q *db.Queries, value string) (uuid.UUID, error) {
 	id, err := uuid.Parse(value)

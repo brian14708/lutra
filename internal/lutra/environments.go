@@ -57,55 +57,55 @@ func (e *environmentSpec) version(imageKey []byte) (string, error) {
 
 func validateEnvironmentIdentifier(id *lutrav1.EnvironmentIdentifier) error {
 	if id == nil || !validUUID(id.NamespaceId) ||
-		!namespacePattern.MatchString(id.Name) || !versionPattern.MatchString(id.Version) {
-		return invalidTask("invalid environment identifier")
+		!slugPattern.MatchString(id.Name) || !versionPattern.MatchString(id.Version) {
+		return invalid("invalid environment identifier")
 	}
 	return nil
 }
 
 func normalizeEnvironment(spec *lutrav1.EnvironmentSpec) (*environmentSpec, error) {
-	if spec == nil || !validUUID(spec.NamespaceId) || !namespacePattern.MatchString(spec.Name) {
-		return nil, invalidTask("invalid environment spec")
+	if spec == nil || !validUUID(spec.NamespaceId) || !slugPattern.MatchString(spec.Name) {
+		return nil, invalid("invalid environment spec")
 	}
 	digest, mimeType, err := blob.ParseURI(spec.SourceUri)
 	if err != nil || mimeType != archiveMIME || spec.SourceUri != sourceURI(digest) {
-		return nil, invalidTask("invalid environment source")
+		return nil, invalid("invalid environment source")
 	}
 	image := spec.GetImage()
 	var buildContext []byte
 	switch image.GetName() {
 	case containerTaskImage:
 		if len(image.GetFromImage()) > 2048 {
-			return nil, invalidTask("invalid container base image")
+			return nil, invalid("invalid container base image")
 		}
 		if _, err := reference.ParseNormalizedNamed(image.GetFromImage()); err != nil {
-			return nil, invalidTask("invalid container base image")
+			return nil, invalid("invalid container base image")
 		}
 		buildContext, mimeType, err = blob.ParseURI(image.GetBuildContextUri())
 		if err != nil || mimeType != archiveMIME || image.GetBuildContextUri() != sourceURI(buildContext) {
-			return nil, invalidTask("invalid image build context")
+			return nil, invalid("invalid image build context")
 		}
 		if err := validateCommand(image.GetBuildCommand()); err != nil {
 			return nil, err
 		}
 		if len(image.GetPythonRequires()) > 200 || strings.ContainsRune(image.GetPythonRequires(), 0) {
-			return nil, invalidTask("invalid Python requirement")
+			return nil, invalid("invalid Python requirement")
 		}
 		if image.GetWorkdir() == "" || path.IsAbs(image.GetWorkdir()) || path.Clean(image.GetWorkdir()) != image.GetWorkdir() || image.GetWorkdir() == ".." || strings.HasPrefix(image.GetWorkdir(), "../") || strings.ContainsRune(image.GetWorkdir(), 0) {
-			return nil, invalidTask("invalid image workdir")
+			return nil, invalid("invalid image workdir")
 		}
 		if !containerWorkdirPattern.MatchString(image.GetWorkdir()) {
-			return nil, invalidTask("invalid container workdir")
+			return nil, invalid("invalid container workdir")
 		}
 	case "e2b":
 		if image.GetFromImage() == "" {
-			return nil, invalidTask("image reference is required")
+			return nil, invalid("image reference is required")
 		}
 	default:
-		return nil, invalidTask("invalid task image provider")
+		return nil, invalid("invalid task image provider")
 	}
 	if len(image.GetFromImage()) > 2048 || strings.ContainsRune(image.GetFromImage(), 0) {
-		return nil, invalidTask("invalid image reference")
+		return nil, invalid("invalid image reference")
 	}
 	cpu, memory := image.GetResources().GetCpuMillis(), image.GetResources().GetMemoryBytes()
 	if cpu == 0 {
@@ -115,30 +115,30 @@ func normalizeEnvironment(spec *lutrav1.EnvironmentSpec) (*environmentSpec, erro
 		memory = 1 << 30
 	}
 	if cpu > 1_000_000 || memory > 1<<50 {
-		return nil, invalidTask("resources exceed limits")
+		return nil, invalid("resources exceed limits")
 	}
 	variables := make(map[string]string, len(image.GetEnvVars()))
 	var variableSize int
 	for key, value := range image.GetEnvVars() {
 		if !environmentVariablePattern.MatchString(key) || strings.ContainsRune(value, 0) || strings.HasPrefix(key, "LUTRA_") || strings.HasPrefix(key, "UV_") || key == "PATH" || key == "HOME" || key == "PYTHONPATH" {
-			return nil, invalidTask("invalid or reserved environment variable")
+			return nil, invalid("invalid or reserved environment variable")
 		}
 		variableSize += len(key) + len(value)
 		variables[key] = value
 	}
 	if len(variables) > 128 || variableSize > 64<<10 || len(spec.Dependencies) > 128 {
-		return nil, invalidTask("environment declaration exceeds limits")
+		return nil, invalid("environment declaration exceeds limits")
 	}
 	if err := validateEntrypoints(spec.Entrypoints); err != nil {
 		return nil, err
 	}
 	importRoots := append([]string(nil), spec.GetImportRoots()...)
 	if len(importRoots) == 0 || len(importRoots) > 256 {
-		return nil, invalidTask("environment requires between 1 and 256 import roots")
+		return nil, invalid("environment requires between 1 and 256 import roots")
 	}
 	for _, root := range importRoots {
 		if root == "" || path.IsAbs(root) || path.Clean(root) != root || root == ".." || strings.HasPrefix(root, "../") || strings.ContainsAny(root, ":\\\x00") {
-			return nil, invalidTask("invalid environment import root")
+			return nil, invalid("invalid environment import root")
 		}
 	}
 	deps := append([]*lutrav1.EnvironmentIdentifier(nil), spec.Dependencies...)
@@ -148,7 +148,7 @@ func normalizeEnvironment(spec *lutrav1.EnvironmentSpec) (*environmentSpec, erro
 			return nil, err
 		}
 		if dep.NamespaceId != spec.NamespaceId || names[dep.Name] {
-			return nil, invalidTask("dependencies must have unique names in the same namespace")
+			return nil, invalid("dependencies must have unique names in the same namespace")
 		}
 		names[dep.Name] = true
 	}
@@ -174,18 +174,18 @@ func normalizeEnvironment(spec *lutrav1.EnvironmentSpec) (*environmentSpec, erro
 
 func validateEntrypoints(entries []*lutrav1.Entrypoint) error {
 	if len(entries) == 0 || len(entries) > 1000 {
-		return invalidTask("environment requires between 1 and 1000 entrypoints")
+		return invalid("environment requires between 1 and 1000 entrypoints")
 	}
 	for _, entry := range entries {
 		if entry == nil {
-			return invalidTask("invalid entrypoint")
+			return invalid("invalid entrypoint")
 		}
 		if entry.GetCache() {
 			if len(entry.GetTaskVersion()) > 200 || (entry.GetTaskVersion() != "" && !semanticVersionPattern.MatchString(entry.GetTaskVersion())) {
-				return invalidTask("cached tasks require a semantic or source-derived task version")
+				return invalid("cached tasks require a semantic or source-derived task version")
 			}
 		} else if entry.GetTaskVersion() != "" {
-			return invalidTask("uncached tasks cannot include a cache version")
+			return invalid("uncached tasks cannot include a cache version")
 		}
 		if _, err := resolveAttempts(entry, 0); err != nil {
 			return err
@@ -199,17 +199,17 @@ func validateEntrypoints(entries []*lutrav1.Entrypoint) error {
 
 func validateCommand(command *lutrav1.StartupCommand) error {
 	if command == nil || len(command.Args) == 0 || len(command.Args) > 128 || command.Args[0] == "" {
-		return invalidTask("invalid command")
+		return invalid("invalid command")
 	}
 	var size int
 	for _, arg := range command.Args {
 		if strings.ContainsRune(arg, 0) {
-			return invalidTask("invalid command")
+			return invalid("invalid command")
 		}
 		size += len(arg)
 	}
 	if size > 64<<10 {
-		return invalidTask("command exceeds limits")
+		return invalid("command exceeds limits")
 	}
 	return nil
 }
@@ -239,7 +239,7 @@ func (s Service) RegisterEnvironment(ctx context.Context, req *connect.Request[l
 	}
 	namespaceID, err := uuid.Parse(spec.spec.NamespaceId)
 	if err != nil || namespaceID == uuid.Nil {
-		return nil, invalidTask("invalid namespace ID")
+		return nil, invalid("invalid namespace ID")
 	}
 	namespace, err := db.New(s.DB).GetNamespaceByID(ctx, namespaceID)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -258,12 +258,12 @@ func (s Service) RegisterEnvironment(ctx context.Context, req *connect.Request[l
 		return nil, err
 	}
 	if _, err := db.New(s.DB).GetBlobBySHA256(ctx, spec.source); errors.Is(err, pgx.ErrNoRows) {
-		return nil, invalidTask("environment source blob is not uploaded")
+		return nil, invalid("environment source blob is not uploaded")
 	} else if err != nil {
 		return nil, err
 	}
 	if _, err := db.New(s.DB).GetBlobBySHA256(ctx, spec.buildContext); errors.Is(err, pgx.ErrNoRows) {
-		return nil, invalidTask("image build context blob is not uploaded")
+		return nil, invalid("image build context blob is not uploaded")
 	} else if err != nil {
 		return nil, err
 	}
@@ -300,7 +300,7 @@ func lookupEnvironment(ctx context.Context, q *db.Queries, id *lutrav1.Environme
 	}
 	namespaceID, err := uuid.Parse(id.NamespaceId)
 	if err != nil {
-		return db.LutraTaskEnvironment{}, invalidTask("invalid environment identifier")
+		return db.LutraTaskEnvironment{}, invalid("invalid environment identifier")
 	}
 	row, err := q.GetEnvironment(ctx, db.GetEnvironmentParams{NamespaceID: namespaceID, Name: id.Name, Version: id.Version})
 	if errors.Is(err, pgx.ErrNoRows) {

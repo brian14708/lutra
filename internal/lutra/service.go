@@ -2,6 +2,9 @@
 package lutra
 
 import (
+	"errors"
+
+	"connectrpc.com/connect"
 	"github.com/brian14708/lutra/internal/runlog"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -10,4 +13,8 @@ import (
 type Service struct {
 	DB   *pgxpool.Pool
 	Logs runlog.Service
+}
+
+func invalid(message string) error {
+	return connect.NewError(connect.CodeInvalidArgument, errors.New(message))
 }

@@ -36,9 +36,7 @@ type RunWorker struct {
 	TaskAPIHandler                http.Handler
 	slots                         tasktree.Slots
 	processes                     *tasktree.ProcessPool
-	adapter                       *Worker
-	Cache                         *cache.Service
-	ctx                           context.Context
+	cache                         *cache.Service
 	cancelMu                      sync.Mutex
 	owners                        map[uuid.UUID]context.CancelFunc
 	wg                            sync.WaitGroup
@@ -51,7 +49,6 @@ func (w *RunWorker) Start(ctx context.Context) {
 	if w.MaxRuns < 1 {
 		w.MaxRuns = 16
 	}
-	w.ctx = ctx
 	w.owners = make(map[uuid.UUID]context.CancelFunc)
 	w.slots = tasktree.NewSlots(w.Capacity)
 	if w.ProcessTarget < 1 {
@@ -67,25 +64,20 @@ func (w *RunWorker) Start(ctx context.Context) {
 		w.ProcessCeiling = 4 * w.ProcessTarget
 	}
 	w.processes = tasktree.NewProcessPool(w.ProcessTarget, w.ProcessCeiling)
-	w.Cache = cache.New(w.DB)
-	w.adapter = &Worker{Logs: w.Logs, Blobs: w.Blobs, TaskAPIHandler: w.TaskAPIHandler}
+	w.cache = cache.New(w.DB)
 	w.wg.Add(1)
 	go func() { defer w.wg.Done(); w.loop(ctx) }()
 	w.wg.Add(1)
-	go func() { defer w.wg.Done(); w.listenCancels(ctx, nil) }()
+	go func() { defer w.wg.Done(); w.listenCancels(ctx) }()
 }
 
 func (w *RunWorker) Wait() { w.wg.Wait() }
 
-func (w *RunWorker) listenCancels(ctx context.Context, ready chan<- struct{}) {
+func (w *RunWorker) listenCancels(ctx context.Context) {
 	for ctx.Err() == nil {
 		conn, err := w.DB.Acquire(ctx)
 		if err == nil {
 			_, err = conn.Exec(ctx, "LISTEN lutra_run_cancel")
-			if err == nil && ready != nil {
-				close(ready)
-				ready = nil
-			}
 			for err == nil && ctx.Err() == nil {
 				var notification *pgconn.Notification
 				notification, err = conn.Conn().WaitForNotification(ctx)
@@ -351,7 +343,7 @@ func (d *runDriver) Ensure(ctx context.Context, key []byte) error {
 				wait.err = err
 				return
 			}
-			provider, err := d.worker.adapter.executor(row.Provider)
+			provider, err := d.worker.executor(row.Provider)
 			if err != nil {
 				wait.err = err
 				return
@@ -367,7 +359,7 @@ func (d *runDriver) Ensure(ctx context.Context, key []byte) error {
 				if phase == "build" {
 					image = fmt.Sprintf("lutra:sha-%x", key)
 				}
-				logDone := d.worker.adapter.collectTaskLogs(runlog.TaskLogEvent{
+				logDone := d.worker.collectTaskLogs(runlog.TaskLogEvent{
 					ActionID: row.ID.String(), Attempt: max(row.Attempts, 1),
 					Phase: phase, Runtime: runtime, Image: image,
 				}, d.runID, reader)
@@ -381,7 +373,7 @@ func (d *runDriver) Ensure(ctx context.Context, key []byte) error {
 					task.Stderr = writer
 				}
 			}
-			wait.image, wait.err = d.worker.adapter.ensureImage(d.ctx, key, provider, task)
+			wait.image, wait.err = ensureImage(d.ctx, key, provider, task)
 		}()
 	}
 	d.mu.Unlock()
@@ -429,5 +421,5 @@ func (d *runDriver) Run(ctx context.Context, attempt tasktree.Attempt) ([]byte, 
 		}
 		return fmt.Errorf("child action %s is missing", child)
 	}
-	return d.worker.adapter.executeEnvironment(ctx, image.image, identity, task)
+	return d.worker.executeEnvironment(ctx, image.image, identity, task)
 }

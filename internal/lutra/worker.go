@@ -13,21 +13,13 @@ import (
 	"connectrpc.com/connect"
 
 	lutrav1 "github.com/brian14708/lutra/gen/lutra/v1"
-	lutrav1connect "github.com/brian14708/lutra/gen/lutra/v1/lutrav1connect"
 	"github.com/brian14708/lutra/internal/runlog"
 	"github.com/google/uuid"
 )
 
 const maxSourceSize = 64 << 20
 
-// Worker provides sandbox, image and log adapters for run executors.
-type Worker struct {
-	TaskAPIHandler http.Handler
-	Blobs          lutrav1connect.BlobServiceClient
-	Logs           runlog.Service
-}
-
-func (w *Worker) openBundle(ctx context.Context, digest []byte) (io.ReadCloser, error) {
+func (w *RunWorker) openBundle(ctx context.Context, digest []byte) (io.ReadCloser, error) {
 	url, err := w.presignBundle(ctx, digest)
 	if err != nil {
 		return nil, err
@@ -47,7 +39,7 @@ func (w *Worker) openBundle(ctx context.Context, digest []byte) (io.ReadCloser, 
 	return response.Body, nil
 }
 
-func (w *Worker) presignBundle(ctx context.Context, digest []byte) (string, error) {
+func (w *RunWorker) presignBundle(ctx context.Context, digest []byte) (string, error) {
 	if w.Blobs == nil {
 		return "", errors.New("blob client unavailable")
 	}
@@ -60,7 +52,7 @@ func (w *Worker) presignBundle(ctx context.Context, digest []byte) (string, erro
 
 // executor returns the provider for an image name. Unconfigured providers
 // fail explicitly until their adapters exist.
-func (w *Worker) executor(name string) (Executor, error) {
+func (w *RunWorker) executor(name string) (Executor, error) {
 	switch name {
 	case containerTaskImage:
 		runtime, err := containerRuntime()
@@ -72,7 +64,7 @@ func (w *Worker) executor(name string) (Executor, error) {
 	return nil, connect.NewError(connect.CodeUnimplemented, fmt.Errorf("%s executor is not configured", name))
 }
 
-func (w *Worker) executeEnvironment(ctx context.Context, image *Image, identity taskContext, task *EnvironmentExecution) ([]byte, error) {
+func (w *RunWorker) executeEnvironment(ctx context.Context, image *Image, identity taskContext, task *EnvironmentExecution) ([]byte, error) {
 	runID, actionID := uuid.MustParse(task.RunID), uuid.MustParse(task.ActionID)
 	stderrReader, stderrWriter := io.Pipe()
 	logDone := w.collectTaskLogs(runlog.TaskLogEvent{ActionID: actionID.String(), Attempt: task.Attempt, Phase: "task"}, runID, stderrReader)
@@ -97,14 +89,14 @@ func (w *Worker) executeEnvironment(ctx context.Context, image *Image, identity 
 	return output, waitErr
 }
 
-func (w *Worker) newTaskAPIHandler(identity taskContext) http.Handler {
+func (w *RunWorker) newTaskAPIHandler(identity taskContext) http.Handler {
 	return http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
 		requestCtx := withTaskContext(request.Context(), identity)
 		w.TaskAPIHandler.ServeHTTP(response, request.WithContext(requestCtx))
 	})
 }
 
-func (w *Worker) collectTaskLogs(metadata runlog.TaskLogEvent, runID uuid.UUID, reader io.Reader) <-chan struct{} {
+func (w *RunWorker) collectTaskLogs(metadata runlog.TaskLogEvent, runID uuid.UUID, reader io.Reader) <-chan struct{} {
 	actionID, attempt := metadata.ActionID, metadata.Attempt
 	collectionID := uuid.New()
 	done := make(chan struct{})

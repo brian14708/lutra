@@ -65,31 +65,6 @@ func URI(mimeType string, digest []byte) string {
 	return "blob:" + mimeType + "," + base64.StdEncoding.EncodeToString(digest)
 }
 
-// Put stores data as a content-addressed blob, deduplicating by digest, and
-// returns its canonical URI.
-func Put(ctx context.Context, store *minio.Core, bucket string, queries *db.Queries, mimeType string, data []byte) (string, error) {
-	hash := sha256.Sum256(data)
-	uri := URI(mimeType, hash[:])
-	if _, err := queries.GetBlobBySHA256(ctx, hash[:]); err == nil {
-		return uri, nil
-	} else if !errors.Is(err, pgx.ErrNoRows) {
-		return "", err
-	}
-	id := uuid.New()
-	if _, err := store.Client.PutObject(ctx, bucket, ObjectKey(id), bytes.NewReader(data), int64(len(data)), minio.PutObjectOptions{ContentType: mimeType}); err != nil {
-		return "", err
-	}
-	rows, err := queries.InsertBlobIfAbsent(ctx, db.InsertBlobIfAbsentParams{Sha256: hash[:], ObjectKey: id})
-	if err != nil {
-		return "", err
-	}
-	if rows == 0 {
-		// Another upload owns the content; drop the duplicate object.
-		_ = store.RemoveObject(ctx, bucket, ObjectKey(id), minio.RemoveObjectOptions{})
-	}
-	return uri, nil
-}
-
 func partCount(size int64) int32 {
 	return int32((size + partSize - 1) / partSize)
 }

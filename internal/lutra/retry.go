@@ -11,7 +11,7 @@ func resolveAttempts(entry *lutrav1.Entrypoint, override int32) (int32, error) {
 		attempts = override
 	}
 	if attempts < 1 || attempts > 100 {
-		return 0, invalidTask("max_attempts must be between 1 and 100")
+		return 0, invalid("max_attempts must be between 1 and 100")
 	}
 	return attempts, nil
 }
@@ -21,7 +21,7 @@ func resolvedActionSpec(entry *lutrav1.Entrypoint, requested *lutrav1.ActionSpec
 		return nil, err
 	}
 	if entry.GetCache() != requested.GetCache() || entry.GetTaskVersion() != requested.GetTaskVersion() {
-		return nil, invalidTask("action cache policy must match the registered task")
+		return nil, invalid("action cache policy must match the registered task")
 	}
 	attempts, err := resolveAttempts(entry, requested.GetMaxAttempts())
 	if err != nil {

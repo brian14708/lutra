@@ -61,20 +61,11 @@ type Image struct {
 	ArtifactURI string
 }
 
-// ImageBuilder constructs an image from the environment recipe.
-type ImageBuilder interface {
+// Executor builds images and starts tasks in its runtime.
+type Executor interface {
 	ImageKey(spec *lutrav1.EnvironmentSpec) ([]byte, error)
 	Build(context.Context, *EnvironmentExecution) (*Image, error)
-}
-
-// TaskRunner starts a task using an image built for its runtime.
-type TaskRunner interface {
 	Run(context.Context, *Image, *EnvironmentExecution) (Job, error)
-}
-
-type Executor interface {
-	ImageBuilder
-	TaskRunner
 }
 
 // Job is a started task execution. The provider owns its lifetime: Wait
@@ -145,4 +136,18 @@ func unpackSource(ctx context.Context, openBundle func(context.Context, []byte) 
 		return errors.New("source bundle checksum mismatch")
 	}
 	return nil
+}
+
+func ensureImage(ctx context.Context, imageKey []byte, executor Executor, req *EnvironmentExecution) (*Image, error) {
+	if len(imageKey) != 32 {
+		return nil, errors.New("invalid image key")
+	}
+	currentKey, err := executor.ImageKey(req.Spec)
+	if err != nil {
+		return nil, err
+	}
+	if !bytes.Equal(imageKey, currentKey) {
+		return nil, errors.New("image recipe differs from registered environment")
+	}
+	return executor.Build(ctx, req)
 }

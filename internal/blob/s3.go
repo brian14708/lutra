@@ -1,5 +1,4 @@
-// Package s3 provides the server-side S3 client used by Lutra.
-package s3
+package blob
 
 import (
 	"errors"
@@ -9,14 +8,15 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
 )
 
-// Config contains the connection settings for an S3-compatible object store.
+// s3Config contains the connection settings for an S3-compatible object store.
 // The AWS_* environment names are intentionally used so the same settings can
 // be shared with AWS tooling and SDKs.
-type Config struct {
+type s3Config struct {
 	Endpoint        string
 	PublicEndpoint  string
 	Bucket          string
@@ -27,9 +27,9 @@ type Config struct {
 	Secure          bool
 }
 
-// ConfigFromEnv reads the canonical AWS environment variables.
-func ConfigFromEnv() (Config, error) {
-	config := Config{
+// s3ConfigFromEnv reads the canonical AWS environment variables.
+func s3ConfigFromEnv() (s3Config, error) {
+	config := s3Config{
 		Endpoint:        os.Getenv("AWS_ENDPOINT_URL_S3"),
 		PublicEndpoint:  os.Getenv("AWS_S3_PUBLIC_ENDPOINT_URL"),
 		Bucket:          os.Getenv("AWS_S3_BUCKET"),
@@ -42,7 +42,7 @@ func ConfigFromEnv() (Config, error) {
 	if value := os.Getenv("AWS_S3_SECURE"); value != "" {
 		secure, err := strconv.ParseBool(value)
 		if err != nil {
-			return Config{}, fmt.Errorf("parse AWS_S3_SECURE: %w", err)
+			return s3Config{}, fmt.Errorf("parse AWS_S3_SECURE: %w", err)
 		}
 		config.Secure = secure
 	}
@@ -50,36 +50,33 @@ func ConfigFromEnv() (Config, error) {
 		config.Region = "us-east-1"
 	}
 	if config.Endpoint == "" || config.Bucket == "" || config.AccessKeyID == "" || config.SecretAccessKey == "" {
-		return Config{}, errors.New("S3 endpoint, bucket, AWS access key, and AWS secret key are required")
+		return s3Config{}, errors.New("S3 endpoint, bucket, AWS access key, and AWS secret key are required")
 	}
 	return config, nil
 }
 
-// NewFromEnv creates an S3 client using ConfigFromEnv.
-func NewFromEnv() (*minio.Client, Config, error) {
-	config, err := ConfigFromEnv()
+// NewFromEnv configures blob storage and download signing using AWS settings.
+func NewFromEnv(pool *pgxpool.Pool) (Service, error) {
+	config, err := s3ConfigFromEnv()
 	if err != nil {
-		return nil, Config{}, err
+		return Service{}, err
 	}
-	client, err := New(config)
+	client, err := newS3Client(config)
 	if err != nil {
-		return nil, Config{}, err
+		return Service{}, err
 	}
-	return client, config, nil
+	// Sign URLs for the endpoint clients actually reach.
+	if config.PublicEndpoint != "" {
+		config.Endpoint = config.PublicEndpoint
+	}
+	signer, err := newS3Client(config)
+	if err != nil {
+		return Service{}, fmt.Errorf("configure blob signer: %w", err)
+	}
+	return Service{DB: pool, Store: &minio.Core{Client: client}, Signer: signer, Bucket: config.Bucket}, nil
 }
 
-// SignerConfig returns the configuration for presigning URLs: when a public
-// endpoint is configured, signatures must be created for the host clients
-// actually reach.
-func (c Config) SignerConfig() Config {
-	if c.PublicEndpoint != "" {
-		c.Endpoint = c.PublicEndpoint
-	}
-	return c
-}
-
-// New creates an S3-compatible client from explicit settings.
-func New(config Config) (*minio.Client, error) {
+func newS3Client(config s3Config) (*minio.Client, error) {
 	endpoint := config.Endpoint
 	if parsed, err := url.Parse(endpoint); err == nil && parsed.Host != "" {
 		if parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" || (parsed.Path != "" && parsed.Path != "/") {

@@ -23,7 +23,6 @@ import (
 )
 
 var (
-	namespacePattern       = regexp.MustCompile(`^[a-z][a-z0-9-]{0,62}$`)
 	versionPattern         = regexp.MustCompile(`^[a-f0-9]{64}$`)
 	semanticVersionPattern = regexp.MustCompile(`^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)(\.(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*)?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$`)
 )
@@ -34,22 +33,18 @@ func sourceURI(digest []byte) string {
 	return blob.URI(archiveMIME, digest)
 }
 
-func invalidTask(message string) error {
-	return connect.NewError(connect.CodeInvalidArgument, errors.New(message))
-}
-
 func validateInput(input []byte) error {
 	var arguments []cbor.RawMessage
 	if err := cbor.Unmarshal(input, &arguments); err != nil || len(arguments) != 2 {
-		return invalidTask("input must contain positional and keyword arguments")
+		return invalid("input must contain positional and keyword arguments")
 	}
 	var positional []cbor.RawMessage
 	var keyword map[string]cbor.RawMessage
 	if err := cbor.Unmarshal(arguments[0], &positional); err != nil {
-		return invalidTask("invalid positional arguments")
+		return invalid("invalid positional arguments")
 	}
 	if err := cbor.Unmarshal(arguments[1], &keyword); err != nil {
-		return invalidTask("invalid keyword arguments")
+		return invalid("invalid keyword arguments")
 	}
 	return nil
 }
@@ -57,22 +52,22 @@ func validateInput(input []byte) error {
 func validateActionCache(spec *lutrav1.ActionSpec) error {
 	if !spec.GetCache() {
 		if spec.GetTaskVersion() != "" {
-			return invalidTask("uncached actions cannot include cache fields")
+			return invalid("uncached actions cannot include cache fields")
 		}
 		return nil
 	}
 	if len(spec.GetTaskVersion()) > 200 || (spec.GetTaskVersion() != "" && !semanticVersionPattern.MatchString(spec.GetTaskVersion())) {
-		return invalidTask("cached actions require a semantic version or source-derived version and a 32-byte dependency digest")
+		return invalid("cached actions require a semantic version or source-derived version")
 	}
 	return nil
 }
 
 func validateIdempotency(key string, required bool) error {
 	if required && key == "" {
-		return invalidTask("idempotency key is required")
+		return invalid("idempotency key is required")
 	}
 	if len(key) > 200 {
-		return invalidTask("idempotency key is too long")
+		return invalid("idempotency key is too long")
 	}
 	return nil
 }
@@ -83,7 +78,7 @@ func (s Service) CreateRun(ctx context.Context, req *connect.Request[lutrav1.Cre
 	}
 	actionSpec := req.Msg.GetActionSpec()
 	if actionSpec == nil {
-		return nil, invalidTask("action spec is required")
+		return nil, invalid("action spec is required")
 	}
 	if err := validateInput(actionSpec.GetInputCbor()); err != nil {
 		return nil, err
@@ -127,7 +122,7 @@ func (s Service) CreateRun(ctx context.Context, req *connect.Request[lutrav1.Cre
 			return nil, lookupErr
 		}
 		if action.EnvironmentID != environment.ID || action.EntrypointID != int64(req.Msg.GetEntrypointId()) || !bytes.Equal(action.ActionSpec, storedSpec) {
-			return nil, invalidTask("idempotency key already belongs to a different invocation")
+			return nil, invalid("idempotency key already belongs to a different invocation")
 		}
 		runID = existing.ID
 	} else if err != nil {
@@ -165,7 +160,7 @@ func (s Service) CreateTaskAction(ctx context.Context, req *connect.Request[lutr
 	}
 	actionSpec := req.Msg.GetActionSpec()
 	if actionSpec == nil {
-		return nil, invalidTask("action spec is required")
+		return nil, invalid("action spec is required")
 	}
 	if err := validateInput(actionSpec.GetInputCbor()); err != nil {
 		return nil, err
@@ -192,18 +187,18 @@ func (s Service) CreateTaskAction(ctx context.Context, req *connect.Request[lutr
 	}
 	locked, err := q.LockRun(ctx, active.RunID)
 	if err != nil || locked.RootActionID == nil {
-		return nil, invalidTask("run is not active")
+		return nil, invalid("run is not active")
 	}
 	if environment.NamespaceID != locked.NamespaceID {
-		return nil, invalidTask("child task belongs to a different namespace")
+		return nil, invalid("child task belongs to a different namespace")
 	}
 	rootStatus, err := q.GetRootStatus(ctx, *locked.RootActionID)
 	if err != nil || terminal(string(rootStatus)) {
-		return nil, invalidTask("run is not active")
+		return nil, invalid("run is not active")
 	}
 	caller, err := q.GetActiveCaller(ctx, active.ActionID)
 	if err != nil || caller.RunID != active.RunID || caller.ClaimToken == nil || *caller.ClaimToken != active.ClaimToken || caller.Attempts != active.Attempt {
-		return nil, invalidTask("caller action is not active")
+		return nil, invalid("caller action is not active")
 	}
 	var callerSpec lutrav1.EnvironmentSpec
 	if err := proto.Unmarshal(caller.EnvironmentSpec, &callerSpec); err != nil {
@@ -225,7 +220,7 @@ func (s Service) CreateTaskAction(ctx context.Context, req *connect.Request[lutr
 	var actionID uuid.UUID
 	if lookupErr == nil {
 		if existing.CallerActionID == nil || *existing.CallerActionID != active.ActionID || existing.EnvironmentID != environment.ID || existing.EntrypointID != int64(req.Msg.GetEntrypointId()) || !bytes.Equal(existing.ActionSpec, storedSpec) {
-			return nil, invalidTask("idempotency key already belongs to a different action")
+			return nil, invalid("idempotency key already belongs to a different action")
 		}
 		actionID = existing.ID
 	} else if !errors.Is(lookupErr, pgx.ErrNoRows) {
@@ -239,7 +234,7 @@ func (s Service) CreateTaskAction(ctx context.Context, req *connect.Request[lutr
 		if errors.Is(err, pgx.ErrNoRows) {
 			existing, lookupErr = q.GetTaskActionByIdempotency(ctx, db.GetTaskActionByIdempotencyParams{RunID: active.RunID, CallerActionID: &active.ActionID, IdempotencyKey: key})
 			if lookupErr != nil || existing.CallerActionID == nil || *existing.CallerActionID != active.ActionID || existing.EnvironmentID != environment.ID || existing.EntrypointID != int64(req.Msg.GetEntrypointId()) || !bytes.Equal(existing.ActionSpec, storedSpec) {
-				return nil, invalidTask("idempotency key already belongs to a different action")
+				return nil, invalid("idempotency key already belongs to a different action")
 			}
 			actionID = existing.ID
 		} else if err != nil {
@@ -255,7 +250,7 @@ func (s Service) CreateTaskAction(ctx context.Context, req *connect.Request[lutr
 		return nil, err
 	}
 	if active.add == nil {
-		return nil, invalidTask("run coordinator is unavailable")
+		return nil, invalid("run coordinator is unavailable")
 	}
 	if err := active.add(ctx, actionID); err != nil {
 		return nil, err
@@ -339,7 +334,7 @@ func actionRowFromList(row db.ListTaskActionsRow) actionRow {
 func (s Service) GetRun(ctx context.Context, req *connect.Request[lutrav1.GetRunRequest]) (*connect.Response[lutrav1.GetRunResponse], error) {
 	id, err := uuid.Parse(req.Msg.GetId())
 	if err != nil {
-		return nil, invalidTask("invalid run id")
+		return nil, invalid("invalid run id")
 	}
 	run, err := s.readRun(ctx, id)
 	if err != nil {
@@ -364,21 +359,21 @@ func (s Service) GetRun(ctx context.Context, req *connect.Request[lutrav1.GetRun
 func (s Service) GetTaskAction(ctx context.Context, req *connect.Request[lutrav1.GetTaskActionRequest]) (*connect.Response[lutrav1.GetTaskActionResponse], error) {
 	id, err := uuid.Parse(req.Msg.GetId())
 	if err != nil {
-		return nil, invalidTask("invalid task action id")
+		return nil, invalid("invalid task action id")
 	}
 	if active, ok := TaskIdentityFromContext(ctx); ok {
 		caller, lookupErr := db.New(s.DB).GetTaskActionCaller(ctx, id)
 		if lookupErr != nil || caller.RunID != active.RunID || caller.CallerActionID == nil || *caller.CallerActionID != active.ActionID {
-			return nil, invalidTask("task action is not a child of this task")
+			return nil, invalid("task action is not a child of this task")
 		}
 	}
 	if req.Msg.GetWait() {
 		active, ok := taskContextFromContext(ctx)
 		if !ok {
-			return nil, invalidTask("waiting is only available inside a task")
+			return nil, invalid("waiting is only available inside a task")
 		}
 		if active.coordinator == nil {
-			return nil, invalidTask("run coordinator is unavailable")
+			return nil, invalid("run coordinator is unavailable")
 		}
 		if _, err := active.coordinator.Wait(ctx, active.ActionID, active.Attempt, id); err != nil {
 			node, lookupErr := active.coordinator.Get(ctx, id)
@@ -397,7 +392,7 @@ func (s Service) GetTaskAction(ctx context.Context, req *connect.Request[lutrav1
 func (s Service) ListTaskActions(ctx context.Context, req *connect.Request[lutrav1.ListTaskActionsRequest]) (*connect.Response[lutrav1.ListTaskActionsResponse], error) {
 	runID, err := uuid.Parse(req.Msg.GetRunId())
 	if err != nil {
-		return nil, invalidTask("invalid run id")
+		return nil, invalid("invalid run id")
 	}
 	pageSize := req.Msg.GetPageSize()
 	if pageSize <= 0 || pageSize > 1000 {
@@ -414,16 +409,16 @@ func (s Service) ListTaskActions(ctx context.Context, req *connect.Request[lutra
 	} else {
 		decoded, decodeErr := base64.RawURLEncoding.DecodeString(req.Msg.GetPageToken())
 		if decodeErr != nil {
-			return nil, invalidTask("invalid page token")
+			return nil, invalid("invalid page token")
 		}
 		parts := strings.Split(string(decoded), "|")
 		if len(parts) != 2 {
-			return nil, invalidTask("invalid page token")
+			return nil, invalid("invalid page token")
 		}
 		cursorTime, parseErr := time.Parse(time.RFC3339Nano, parts[0])
 		cursorID, uuidErr := uuid.Parse(parts[1])
 		if parseErr != nil || uuidErr != nil {
-			return nil, invalidTask("invalid page token")
+			return nil, invalid("invalid page token")
 		}
 		listRows, queryErr := q.ListTaskActions(ctx, db.ListTaskActionsParams{RunID: runID, CursorTime: pgtype.Timestamptz{Time: cursorTime, Valid: true}, CursorID: cursorID, PageSize: pageSize + 1})
 		err = queryErr
@@ -456,7 +451,7 @@ func (s Service) ListTaskActions(ctx context.Context, req *connect.Request[lutra
 func (s Service) CancelRun(ctx context.Context, req *connect.Request[lutrav1.CancelRunRequest]) (*connect.Response[lutrav1.CancelRunResponse], error) {
 	id, err := uuid.Parse(req.Msg.GetId())
 	if err != nil {
-		return nil, invalidTask("invalid run id")
+		return nil, invalid("invalid run id")
 	}
 	tx, err := s.DB.Begin(ctx)
 	if err != nil {
@@ -500,11 +495,11 @@ func (s Service) CancelRun(ctx context.Context, req *connect.Request[lutrav1.Can
 func (s Service) WatchRun(ctx context.Context, req *connect.Request[lutrav1.WatchRunRequest], stream *connect.ServerStream[lutrav1.WatchRunResponse]) error {
 	id, err := uuid.Parse(req.Msg.GetId())
 	if err != nil {
-		return invalidTask("invalid run id")
+		return invalid("invalid run id")
 	}
 	cursor := req.Msg.GetTaskLogs()
 	if cursor != nil && (cursor.GetStream() != runlog.TaskLogStream || cursor.GetAfterSeq() < 0 || len(cursor.GetKeyPrefix()) > 1024) {
-		return invalidTask("invalid task log cursor")
+		return invalid("invalid task log cursor")
 	}
 	return s.watchRun(ctx, id, cursor, stream.Send)
 }

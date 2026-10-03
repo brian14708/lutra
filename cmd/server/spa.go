@@ -1,5 +1,4 @@
-// Package web serves the Lutra single-page application built by Vite.
-package web
+package main
 
 import (
 	"io"
@@ -9,11 +8,11 @@ import (
 	"strings"
 )
 
-// New returns a handler that serves the static files in fsys, falling back to
+// newSPAHandler serves the static files in fsys, falling back to
 // index.html for requests that match no file so client-side routes such as
 // /users/1 load on direct visits. fsys is typically os.DirFS of the Vite build
-// output (ui/dist/client), or an embed.FS to ship the UI inside the binary.
-func New(fsys fs.FS) http.Handler {
+// output (ui/dist).
+func newSPAHandler(fsys fs.FS) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet && r.Method != http.MethodHead {
 			w.Header().Set("Allow", "GET, HEAD")

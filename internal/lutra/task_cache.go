@@ -14,14 +14,13 @@ func (d *runDriver) Acquire(ctx context.Context, key []byte) ([]byte, error, tas
 		return nil, nil, nil, errors.New("invalid task cache key")
 	}
 	copy(digest[:], key)
-	result, lease, err := d.worker.Cache.Acquire(ctx, cache.Key{Kind: cache.KindTaskResult, Digest: digest})
+	task, lease, err := d.worker.cache.Acquire(ctx, digest)
 	if err != nil {
 		return nil, nil, nil, err
 	}
 	if lease != nil {
 		return nil, nil, taskLease{lease}, nil
 	}
-	task := result.(cache.TaskResult)
 	if task.ErrorCode == "" {
 		return task.OutputCBOR, nil, nil, nil
 	}
@@ -41,7 +40,7 @@ func (l taskLease) Finish(ctx context.Context, output []byte, taskErr error) err
 		return l.Release(ctx)
 	}
 	if failure != nil {
-		return l.Complete(ctx, cache.TaskResult{ErrorCode: failure.Code, ErrorDetailsCBOR: failure.Details})
+		return l.Complete(ctx, cache.Result{ErrorCode: failure.Code, ErrorDetailsCBOR: failure.Details})
 	}
-	return l.Complete(ctx, cache.TaskResult{OutputCBOR: output})
+	return l.Complete(ctx, cache.Result{OutputCBOR: output})
 }
