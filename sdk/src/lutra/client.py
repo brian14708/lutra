@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import shlex
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Generic, Literal, TypeVar
 
@@ -26,6 +27,7 @@ from lutra._gen.lutra.v1.lutra_pb import (
     EnvValue,
     GetRunRequest,
     ImageSpec,
+    OciCopy,
     RegisterEnvironmentRequest,
     Resources,
     Run,
@@ -39,6 +41,7 @@ from lutra._gen.lutra.v1.settings_pb import ListNamespacesRequest
 from lutra._result import failure_message, load_result
 from lutra._source_bundle import build_source_bundle
 from lutra.blob import BlobStore
+from lutra.package_managers import wrap
 from lutra.task import normalize_retry
 from lutra.value import dumps, loads
 
@@ -284,27 +287,56 @@ def _require_action(action: TaskAction | None) -> TaskAction:
 class _BundleInputs:
     source: bytes
     build_context: bytes
-    python_paths: tuple[str, ...]
-    python_requires: str
     workdir: str
     entrypoints: tuple[tuple[str, ...], ...]
     prepare_command: tuple[str, ...]
+    oci_copies: tuple[OciCopy, ...]
+    build_commands: tuple[tuple[str, ...], ...]
+    build_env: dict[str, str]
 
 
 def _prepare_bundle(environment: TaskEnvironment) -> _BundleInputs:
-    source = environment.dependency_source
+    outputs = environment.manager_outputs
+    source = next(output.source for output in outputs if output.source is not None)
+    source = replace(
+        source,
+        runtime_files={
+            name: value for output in outputs for name, value in output.runtime_files.items()
+        },
+    )
+    prefix = next(output.entrypoint_prefix for output in outputs if output.entrypoint_prefix)
     root = source.bundle_root
     bundle = build_source_bundle(
         source, tuple(task.source_file.relative_to(root) for task in environment.tasks)
     )
     return _BundleInputs(
         bundle,
-        bundle_bytes(source.build_files),
-        source.python_paths,
-        source.python_requires,
+        bundle_bytes({
+            name: value for output in outputs for name, value in output.build_files.items()
+        }),
         source.root.relative_to(root).as_posix(),
-        tuple(task.entrypoint(source) for task in environment.tasks),
-        source.prepare_command,
+        tuple(wrap((*prefix, task.entrypoint(source)), outputs) for task in environment.tasks),
+        (
+            "sh",
+            "-c",
+            " && ".join(
+                shlex.join(wrap(command, outputs))
+                for output in outputs
+                for command in output.prepare_commands
+            )
+            or "true",
+        ),
+        tuple(
+            OciCopy(image=copy.image, source=copy.source, destination=copy.destination)
+            for output in outputs
+            for copy in output.oci_copies
+        ),
+        tuple(
+            wrap(command, outputs[:index])
+            for index, output in enumerate(outputs)
+            for command in output.build_commands
+        ),
+        {key: value for output in outputs for key, value in output.build_env.items()},
     )
 
 
@@ -544,7 +576,6 @@ class Client:
                         namespace_id=namespace_id,
                         name=current.name,
                         source_uri=uri,
-                        python_paths=list(inputs.python_paths),
                         workdir=inputs.workdir,
                         prepare_command=Command(args=list(inputs.prepare_command)),
                         image=ImageSpec(
@@ -565,7 +596,11 @@ class Client:
                             },
                             build_context_uri=build_uri,
                             platform=current.image.platform or "",
-                            python_requires=inputs.python_requires,
+                            oci_copies=list(inputs.oci_copies),
+                            build_commands=[
+                                Command(args=list(command)) for command in inputs.build_commands
+                            ],
+                            build_env=inputs.build_env,
                         ),
                         dependencies=[
                             identifiers[dependency]

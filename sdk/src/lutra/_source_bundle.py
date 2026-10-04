@@ -16,7 +16,19 @@ if TYPE_CHECKING:
     from collections.abc import Sequence
     from typing import IO
 
-    from lutra._dependency import UvSource
+
+@dataclass(frozen=True)
+class PreparedSource:
+    """Shared source layout for snapshots and task registration."""
+
+    root: Path
+    bundle_root: Path
+    project_roots: tuple[Path, ...]
+    includes: tuple[Path, ...]
+    required_files: tuple[Path, ...]
+    excluded_roots: tuple[Path, ...]
+    runtime_files: dict[str, bytes]
+    script: Path | None = None
 
 
 @dataclass
@@ -84,7 +96,7 @@ def _local_path(root: Path, path: Path) -> Path:
     return path.resolve().relative_to(root)
 
 
-def build_source_bundle(source: UvSource, task_files: Sequence[Path]) -> bytes:
+def build_source_bundle(source: PreparedSource, task_files: Sequence[Path]) -> bytes:
     """Snapshot selected projects, explicit assets, manifests and task files.
 
     Returns:

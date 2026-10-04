@@ -31,8 +31,6 @@ var (
 	containerIDPattern = regexp.MustCompile(`^[a-f0-9]{64}$`)
 )
 
-const uvBuildImage = "docker.io/astral/uv:0.12.11"
-
 // ContainerExecutor builds and runs images in the worker's selected local engine.
 type ContainerExecutor struct {
 	OpenBundle func(context.Context, []byte) (io.ReadCloser, error)
@@ -56,7 +54,6 @@ func (e *ContainerExecutor) ImageKey(spec *lutrav1.EnvironmentSpec) ([]byte, err
 	if err != nil {
 		return nil, err
 	}
-	// The recipe includes the base image, uv toolchain, and Python requirement.
 	hash := multihash.Sum([]byte(recipe), []byte(image.GetBuildContextUri()), []byte(imagePlatform(image)))
 	return hash[:], nil
 }
@@ -72,27 +69,62 @@ func imagePlatform(image *lutrav1.ImageSpec) string {
 
 const containerBootstrap = `#!/bin/sh
 set -eu
-if [ "$1" = sh ] && [ "$2" = -c ]; then
-    sh -c "$3"
-    shift 3
-else
-    "$1"
-    shift
-fi
-[ "$#" -gt 0 ] && [ "$1" = "--" ] && shift
+sh -c "$1"
+shift
 exec "$@"
 `
 
 func dockerfile(image *lutrav1.ImageSpec) (string, error) {
-	venv, err := json.Marshal([]string{"uv", "venv", "--python", image.GetPythonRequires(), "/opt/lutra/venv"})
-	if err != nil {
+	if err := validateImageInputs(image); err != nil {
 		return "", err
 	}
 	bootstrap, err := json.Marshal([]string{"/bin/sh", "-c", "printf '%s' '" + containerBootstrap + "' > /opt/lutra/bootstrap && chmod 755 /opt/lutra/bootstrap"})
 	if err != nil {
 		return "", err
 	}
-	return fmt.Sprintf("FROM %s AS lutra_uv\nFROM %s\nCOPY --from=lutra_uv /uv /usr/local/bin/uv\nUSER 0:0\nWORKDIR /opt/lutra\nENV PATH=/opt/lutra/venv/bin:/usr/local/bin:$PATH\nENV VIRTUAL_ENV=/opt/lutra/venv\nENV UV_PYTHON_INSTALL_DIR=/opt/lutra/python\nENV UV_CACHE_DIR=/opt/lutra/cache\nENV UV_LINK_MODE=copy\nCOPY . /opt/lutra/dependencies/\nRUN %s\nRUN [\"sh\", \"/opt/lutra/dependencies/sync.sh\"]\nRUN %s\nWORKDIR /workspace\n", uvBuildImage, image.GetFromImage(), venv, bootstrap), nil
+	var b strings.Builder
+	stages := make(map[string]string)
+	for _, copy := range image.GetOciCopies() {
+		if _, ok := stages[copy.GetImage()]; !ok {
+			stage := fmt.Sprintf("lutra_oci_%d", len(stages))
+			stages[copy.GetImage()] = stage
+			fmt.Fprintf(&b, "FROM --platform=%s %s AS %s\n", imagePlatform(image), copy.GetImage(), stage)
+		}
+	}
+	fmt.Fprintf(&b, "FROM %s\nUSER 0:0\nWORKDIR /opt/lutra\n", image.GetFromImage())
+	keys := make([]string, 0, len(image.GetBuildEnv()))
+	for key := range image.GetBuildEnv() {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		// ENV uses Dockerfile quoting rather than the JSON form of COPY and RUN.
+		value := strings.NewReplacer("\\", "\\\\", "\"", "\\\"", "$", "\\$").Replace(image.GetBuildEnv()[key])
+		fmt.Fprintf(&b, "ENV %s=\"%s\"\n", key, value)
+	}
+	fmt.Fprint(&b, "COPY [\".\", \"/opt/lutra/dependencies/\"]\n")
+	seen := make(map[string]bool)
+	for _, copy := range image.GetOciCopies() {
+		key := copy.GetImage() + "\x00" + copy.GetSource() + "\x00" + copy.GetDestination()
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		paths, err := json.Marshal([]string{copy.GetSource(), copy.GetDestination()})
+		if err != nil {
+			return "", err
+		}
+		fmt.Fprintf(&b, "COPY --from=%s %s\n", stages[copy.GetImage()], paths)
+	}
+	for _, command := range image.GetBuildCommands() {
+		args, err := json.Marshal(command.GetArgs())
+		if err != nil {
+			return "", err
+		}
+		fmt.Fprintf(&b, "RUN %s\n", args)
+	}
+	fmt.Fprintf(&b, "RUN %s\nWORKDIR /workspace\n", bootstrap)
+	return b.String(), nil
 }
 
 func (e *ContainerExecutor) Build(ctx context.Context, req *EnvironmentExecution) (*Image, error) {
@@ -157,12 +189,8 @@ func containerTaskEnv(req *EnvironmentExecution) ([]string, error) {
 		return nil, err
 	}
 	workdir := containerWorkdir(req.Spec.GetWorkdir())
-	importPaths := make([]string, 0, len(req.Spec.GetPythonPaths()))
-	for _, root := range req.Spec.GetPythonPaths() {
-		importPaths = append(importPaths, path.Join("/workspace", root))
-	}
 	values := map[string]string{
-		"HOME": workdir, "PYTHONPATH": strings.Join(importPaths, ":"),
+		"HOME":                 workdir,
 		"LUTRA_TASK_NAMESPACE": req.Environment.NamespaceId, "LUTRA_TASK_VERSION": req.Environment.Version,
 		"LUTRA_ENVIRONMENT_NAME": req.Environment.Name, "LUTRA_ENVIRONMENTS_JSON": string(environmentsJSON),
 		"LUTRA_ATTEMPT": strconv.FormatInt(int64(req.Attempt), 10), "LUTRA_TASK_RUN_ID": req.RunID,
@@ -230,14 +258,13 @@ func (e *ContainerExecutor) Run(ctx context.Context, image *Image, req *Environm
 	}
 	args := []string{"create", "--rm", "--interactive", "--name", containerName, "--user", "0:0", "--cpus", strconv.FormatFloat(float64(imageSpec.GetResources().GetCpuMillis())/1000, 'f', 3, 64), "--memory", strconv.FormatUint(imageSpec.GetResources().GetMemoryBytes(), 10), "--memory-swap", strconv.FormatUint(imageSpec.GetResources().GetMemoryBytes(), 10), "--workdir", workdir, "--entrypoint", "/opt/lutra/bootstrap", "--platform", imagePlatform(imageSpec), "--label", "lutra.run=" + req.RunID, "--label", "lutra.action=" + req.ActionID}
 	args = append(args, "--network", "host")
-	// Cache uv downloads and isolated backend requirements within a namespace
-	// and dependency image. Containers and their virtualenvs remain fresh.
-	cacheKey := multihash.Sum([]byte(req.Environment.NamespaceId), []byte(tag))
-	args = append(args, "--volume", "lutra-uv-"+hex.EncodeToString(cacheKey[:])+":/opt/lutra/cache")
 	args = append(args, env...)
 	args = append(args, tag)
-	args = append(args, prepare...)
-	args = append(args, "--")
+	quoted := make([]string, len(prepare))
+	for i, arg := range prepare {
+		quoted[i] = "'" + strings.ReplaceAll(arg, "'", "'\"'\"'") + "'"
+	}
+	args = append(args, strings.Join(quoted, " "))
 	args = append(args, startup...)
 	if err := ctx.Err(); err != nil {
 		return nil, err

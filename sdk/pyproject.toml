@@ -47,7 +47,7 @@ pythonpath = ["src"]
 project-includes = ["src", "tests"]
 project-excludes = ["src/lutra/_gen"]
 python-version = "3.11"
-search-path = ["src"]
+search-path = ["src", "."]
 preset = "strict"
 
 [tool.lutra]

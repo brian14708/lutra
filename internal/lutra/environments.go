@@ -27,6 +27,74 @@ var (
 	containerPlatformPattern   = regexp.MustCompile(`^linux/[a-z0-9_]+(?:/v[0-9]+)?$`)
 )
 
+func validateImageInputs(image *lutrav1.ImageSpec) error {
+	if len(image.GetOciCopies()) > 256 || len(image.GetBuildCommands()) > 256 || len(image.GetBuildEnv()) > 256 {
+		return invalid("image build declaration exceeds limits")
+	}
+	size := 0
+	for key, value := range image.GetBuildEnv() {
+		if !environmentVariablePattern.MatchString(key) || strings.ContainsAny(value, "\x00\r\n") || strings.HasPrefix(key, "LUTRA_") {
+			return invalid("invalid build environment")
+		}
+		size += len(key) + len(value)
+	}
+	for _, command := range image.GetBuildCommands() {
+		if err := validateCommand(command); err != nil {
+			return err
+		}
+		for _, arg := range command.GetArgs() {
+			size += len(arg)
+		}
+	}
+	destinations := map[string]string{}
+	for _, copy := range image.GetOciCopies() {
+		if copy == nil || len(copy.GetImage()) > 2048 || !validCopyPath(copy.GetSource()) || !validCopyPath(copy.GetDestination()) {
+			return invalid("invalid OCI copy")
+		}
+		if _, err := reference.ParseNormalizedNamed(copy.GetImage()); err != nil {
+			return invalid("invalid OCI image reference")
+		}
+		for _, reserved := range []string{"/opt/lutra/dependencies", "/opt/lutra/bootstrap", "/workspace"} {
+			if pathsOverlap(copy.GetDestination(), reserved) {
+				return invalid("OCI destination overlaps executor infrastructure")
+			}
+		}
+		key := copy.GetImage() + "\x00" + copy.GetSource() + "\x00" + copy.GetDestination()
+		for destination, previous := range destinations {
+			if pathsOverlap(destination, copy.GetDestination()) && previous != key {
+				return invalid("overlapping OCI destinations")
+			}
+		}
+		destinations[copy.GetDestination()] = key
+		size += len(key)
+	}
+	if size > 256<<10 {
+		return invalid("image build declaration exceeds limits")
+	}
+	return nil
+}
+
+func validCopyPath(value string) bool {
+	return len(value) <= 4096 && path.IsAbs(value) && value != "/" && path.Clean(value) == value && !strings.ContainsAny(value, "*?[]\\\x00\r\n")
+}
+
+func pathsOverlap(a, b string) bool {
+	return a == b || strings.HasPrefix(a, b+"/") || strings.HasPrefix(b, a+"/")
+}
+
+func deduplicateCopies(copies []*lutrav1.OciCopy) []*lutrav1.OciCopy {
+	seen := map[string]bool{}
+	result := make([]*lutrav1.OciCopy, 0, len(copies))
+	for _, copy := range copies {
+		key := copy.GetImage() + "\x00" + copy.GetSource() + "\x00" + copy.GetDestination()
+		if !seen[key] {
+			seen[key] = true
+			result = append(result, copy)
+		}
+	}
+	return result
+}
+
 func validUUID(value string) bool {
 	id, err := uuid.Parse(value)
 	return err == nil && id != uuid.Nil
@@ -88,8 +156,8 @@ func normalizeEnvironment(spec *lutrav1.EnvironmentSpec) (*environmentSpec, erro
 		if err != nil || mimeType != archiveMIME || image.GetBuildContextUri() != sourceURI(buildContext) {
 			return nil, invalid("invalid image build context")
 		}
-		if len(image.GetPythonRequires()) > 200 || strings.ContainsRune(image.GetPythonRequires(), 0) {
-			return nil, invalid("invalid Python requirement")
+		if err := validateImageInputs(image); err != nil {
+			return nil, err
 		}
 		if spec.GetWorkdir() == "" || path.IsAbs(spec.GetWorkdir()) || path.Clean(spec.GetWorkdir()) != spec.GetWorkdir() || spec.GetWorkdir() == ".." || strings.HasPrefix(spec.GetWorkdir(), "../") || strings.ContainsAny(spec.GetWorkdir(), ":\\\x00") {
 			return nil, invalid("invalid environment workdir")
@@ -117,7 +185,7 @@ func normalizeEnvironment(spec *lutrav1.EnvironmentSpec) (*environmentSpec, erro
 	variables := make(map[string]*lutrav1.EnvValue, len(image.GetEnv()))
 	var variableSize int
 	for key, value := range image.GetEnv() {
-		if !environmentVariablePattern.MatchString(key) || strings.ContainsRune(value.GetStaticValue(), 0) || strings.HasPrefix(key, "LUTRA_") || strings.HasPrefix(key, "UV_") || key == "PATH" || key == "HOME" || key == "PYTHONPATH" {
+		if !environmentVariablePattern.MatchString(key) || strings.ContainsRune(value.GetStaticValue(), 0) || strings.HasPrefix(key, "LUTRA_") || key == "HOME" {
 			return nil, invalid("invalid or reserved environment variable")
 		}
 		switch value.GetSource().(type) {
@@ -146,15 +214,6 @@ func normalizeEnvironment(spec *lutrav1.EnvironmentSpec) (*environmentSpec, erro
 			return nil, err
 		}
 	}
-	pythonPaths := append([]string(nil), spec.GetPythonPaths()...)
-	if len(pythonPaths) > 256 {
-		return nil, invalid("environment requires at most 256 Python paths")
-	}
-	for _, root := range pythonPaths {
-		if root == "" || path.IsAbs(root) || path.Clean(root) != root || root == ".." || strings.HasPrefix(root, "../") || strings.ContainsAny(root, ":\\\x00") {
-			return nil, invalid("invalid environment Python path")
-		}
-	}
 	deps := append([]*lutrav1.EnvironmentIdentifier(nil), spec.Dependencies...)
 	names := map[string]bool{spec.Name: true}
 	for _, dep := range deps {
@@ -173,12 +232,12 @@ func normalizeEnvironment(spec *lutrav1.EnvironmentSpec) (*environmentSpec, erro
 		Image: &lutrav1.ImageSpec{
 			Name: image.Name, FromImage: image.FromImage,
 			Resources: &lutrav1.Resources{CpuMillis: cpu, MemoryBytes: memory},
-			Env:       variables, BuildContextUri: image.BuildContextUri, PythonRequires: image.PythonRequires, Platform: imagePlatform(image),
+			Env:       variables, BuildContextUri: image.BuildContextUri, Platform: imagePlatform(image),
+			OciCopies: deduplicateCopies(image.OciCopies), BuildCommands: image.BuildCommands, BuildEnv: image.BuildEnv,
 		},
 		Dependencies:   deps,
 		PrepareCommand: spec.PrepareCommand,
 		Entrypoints:    spec.Entrypoints,
-		PythonPaths:    pythonPaths,
 		Workdir:        spec.Workdir,
 	}
 	specBytes, err := proto.MarshalOptions{Deterministic: true}.Marshal(normalized)

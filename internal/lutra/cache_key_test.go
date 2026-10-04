@@ -59,7 +59,7 @@ func TestTaskCacheKeyContract(t *testing.T) {
 	if !bytes.Equal(explicit, cacheKey(row, spec, "docker", nil)) {
 		t.Fatal("explicit version did not preserve reuse across source changes")
 	}
-	environment.PythonPaths = []string{"src"}
+	environment.Image.BuildEnv = map[string]string{"PYTHONPATH": "/workspace/src"}
 	row.EnvironmentSpec, err = proto.Marshal(environment)
 	if err != nil {
 		t.Fatal(err)
@@ -67,7 +67,7 @@ func TestTaskCacheKeyContract(t *testing.T) {
 	if bytes.Equal(explicit, cacheKey(row, spec, "docker", nil)) {
 		t.Fatal("changed Python paths reused the task result")
 	}
-	environment.PythonPaths = nil
+	environment.Image.BuildEnv = nil
 	environment.Image.BuildContextUri = "blob:build,bbb"
 	row.EnvironmentSpec, err = proto.Marshal(environment)
 	if err != nil {

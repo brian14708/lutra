@@ -4,6 +4,7 @@ from lutra._context import TaskContext, current_context
 from lutra.blob import BlobStore
 from lutra.checkpoint import CheckpointEvent, CheckpointManager, CheckpointNotFound
 from lutra.client import Client, RunHandle
+from lutra.package_managers import Mise, OciCopy, PackageManager, Uv
 from lutra.runtime import ChildHandle, run, spawn
 from lutra.task import (
     CacheableError,
@@ -31,6 +32,9 @@ __all__ = [
     "ConfigBinding",
     "ConfigError",
     "Invocation",
+    "Mise",
+    "OciCopy",
+    "PackageManager",
     "Resources",
     "RetryMode",
     "RunHandle",
@@ -39,6 +43,7 @@ __all__ = [
     "TaskContext",
     "TaskEnvironment",
     "TaskImage",
+    "Uv",
     "current_context",
     "run",
     "spawn",

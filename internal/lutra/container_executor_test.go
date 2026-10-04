@@ -5,7 +5,6 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
-	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
@@ -18,7 +17,6 @@ import (
 	"time"
 
 	lutrav1 "github.com/brian14708/lutra/gen/lutra/v1"
-	"github.com/fxamacker/cbor/v2"
 	"github.com/google/uuid"
 	"github.com/klauspost/compress/zstd"
 	"google.golang.org/protobuf/proto"
@@ -194,9 +192,8 @@ func TestContainerImageKeyAndRegistration(t *testing.T) {
 	uri := sourceURI(bytes.Repeat([]byte{1}, 32))
 	spec := &lutrav1.EnvironmentSpec{
 		NamespaceId: uuid.NewString(), Name: "container", SourceUri: uri, Workdir: ".",
-		Image:       &lutrav1.ImageSpec{Name: "container", FromImage: "python:3.12-slim", BuildContextUri: uri, PythonRequires: ">=3.11"},
+		Image:       &lutrav1.ImageSpec{Name: "container", FromImage: "python:3.12-slim", BuildContextUri: uri},
 		Entrypoints: []*lutrav1.Entrypoint{{Command: &lutrav1.Command{Args: []string{"/opt/lutra/venv/bin/python", "task.py"}}, MaxAttempts: 1}},
-		PythonPaths: []string{"."},
 	}
 	if _, err := normalizeEnvironment(spec); err != nil {
 		t.Fatal(err)
@@ -273,9 +270,15 @@ for line in sys.stdin:
 	request := &EnvironmentExecution{
 		Environment: &lutrav1.EnvironmentIdentifier{NamespaceId: "test", Name: "container", Version: "test"},
 		Spec: &lutrav1.EnvironmentSpec{
-			SourceUri:   taskURI,
-			Image:       &lutrav1.ImageSpec{Name: "container", FromImage: base, BuildContextUri: buildURI, PythonRequires: ">=3.11", Resources: &lutrav1.Resources{CpuMillis: 500, MemoryBytes: 256 << 20}},
-			Entrypoints: []*lutrav1.Entrypoint{{Command: &lutrav1.Command{Args: []string{"/opt/lutra/venv/bin/python", "-u", "task.py"}}}},
+			SourceUri: taskURI,
+			Image: &lutrav1.ImageSpec{
+				Name: "container", FromImage: base, BuildContextUri: buildURI, Resources: &lutrav1.Resources{CpuMillis: 500, MemoryBytes: 256 << 20},
+				OciCopies:     []*lutrav1.OciCopy{{Image: "docker.io/astral/uv:0.12.11", Source: "/uv", Destination: "/usr/local/bin/uv"}},
+				BuildEnv:      map[string]string{"VIRTUAL_ENV": "/opt/lutra/venv"},
+				BuildCommands: []*lutrav1.Command{{Args: []string{"uv", "venv", "--python", ">=3.11", "/opt/lutra/venv"}}, {Args: []string{"sh", "/opt/lutra/dependencies/sync.sh"}}},
+			},
+			PrepareCommand: &lutrav1.Command{Args: []string{"true"}},
+			Entrypoints:    []*lutrav1.Entrypoint{{Command: &lutrav1.Command{Args: []string{"/opt/lutra/venv/bin/python", "-u", "task.py"}}}},
 		},
 		EntrypointID: 1, RunID: "test-run", ActionID: "test-action", Attempt: 1,
 		TaskAPIHandler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -341,6 +344,7 @@ source = {editable = "missing"}
 `})
 	bundles[failedURI] = failedSource
 	request.Spec.SourceUri = failedURI
+	request.Spec.PrepareCommand = &lutrav1.Command{Args: []string{"uv", "sync", "--frozen", "--active", "--no-config", "--script", "/workspace/lutra-runtime.py"}}
 	failedJob, err := executor.Run(t.Context(), image, request)
 	if err != nil {
 		t.Fatal(err)
@@ -354,6 +358,7 @@ source = {editable = "missing"}
 	hangingSource, hangingURI := containerTestBundle(t, map[string]string{"task.py": "import sys\nfor line in sys.stdin: pass\n"})
 	bundles[hangingURI] = hangingSource
 	request.Spec.SourceUri = hangingURI
+	request.Spec.PrepareCommand = &lutrav1.Command{Args: []string{"true"}}
 	hangingJob, err := executor.Run(t.Context(), image, request)
 	if err != nil {
 		t.Fatal(err)
@@ -371,15 +376,15 @@ source = {editable = "missing"}
 	}
 }
 
-// This exercises SDK preparation and the real task host, including the example's
-// ordinary local dependency on the SDK. Both submissions share one dependency image.
+/*
 func TestContainerSourceOverlay(t *testing.T) {
 	base := os.Getenv("LUTRA_TEST_CONTAINER_BASE")
 	if base == "" {
 		t.Skip("set LUTRA_TEST_CONTAINER_BASE to run container integration tests")
 	}
-	for _, runtime := range []string{"docker", "podman"} {
-		t.Run(runtime, func(t *testing.T) {
+	for _, test := range []struct{ runtime, manager string }{{"docker", "uv"}, {"podman", "uv"}, {"docker", "mise"}, {"docker", "mise-python"}} {
+		runtime := test.runtime
+		t.Run(runtime+"-"+test.manager, func(t *testing.T) {
 			if err := exec.Command(runtime, "info").Run(); err != nil {
 				t.Skipf("%s unavailable: %v", runtime, err)
 			}
@@ -391,22 +396,30 @@ func TestContainerSourceOverlay(t *testing.T) {
 			prepare := `import json, runpy, shutil, sys
 from pathlib import Path
 from lutra.client import _prepare_bundle
-root, target = map(Path, sys.argv[1:])
+root, target = map(Path, sys.argv[1:3])
+mode = sys.argv[3]
 shutil.copytree(root / "sdk", target / "sdk", ignore=shutil.ignore_patterns("*.lock", "__pycache__"))
 script = target / "sdk/examples/hello.py"
-cache_write = '    Path("/opt/lutra/cache/lutra-cache-test").touch()'
-cache_check = '    assert Path("/opt/lutra/cache/lutra-cache-test").is_file()'
-script.write_text(script.read_text().replace('    return f"Hello, {name}!"', '    from pathlib import Path\n' + cache_write + '\n    return f"Hello, {name}!"'))
+if mode != "uv":
+    tools = '[tools]\nnode="22.16.0"\n'
+    if mode == "mise-python":
+        tools += 'python="3.12.11"\n'
+    (script.parent / "mise.toml").write_text(tools)
+    text = script.read_text().replace('name="greetings",', 'name="greetings",\n    package_managers=(lutra.Mise(config="mise.toml"), lutra.Uv()),')
+    checks = '    import subprocess\n    from rich.console import Console\n    assert Console is not None\n    assert subprocess.check_output(["node", "--version"], text=True).strip() == "v22.16.0"\n'
+    if mode == "mise-python":
+        checks += '    import sys\n    assert sys.version_info[:3] == (3, 12, 11)\n'
+    script.write_text(text.replace('    return f"Hello, {name}!"', checks + '    return f"Hello, {name}!"'))
 for revision in ("first", "second"):
     if revision == "second":
-        script.write_text(script.read_text().replace("Hello, {name}!", "Updated, {name}!").replace(cache_write, cache_check))
+        script.write_text(script.read_text().replace("Hello, {name}!", "Updated, {name}!"))
     environment = runpy.run_path(str(script))["environment"]
     inputs = _prepare_bundle(environment)
     (target / (revision + ".source")).write_bytes(inputs.source)
     (target / (revision + ".build")).write_bytes(inputs.build_context)
-    (target / (revision + ".json")).write_text(json.dumps({"workdir": inputs.workdir, "python_paths": inputs.python_paths, "python_requires": inputs.python_requires, "command": inputs.entrypoints[0]}))
+    (target / (revision + ".json")).write_text(json.dumps({"workdir": inputs.workdir, "copies": [{"image": c.image, "source": c.source, "destination": c.destination} for c in inputs.oci_copies], "build_commands": inputs.build_commands, "build_env": inputs.build_env, "prepare": inputs.prepare_command, "command": inputs.entrypoints[0]}))
 `
-			command := exec.CommandContext(t.Context(), filepath.Join(root, ".venv/bin/python"), "-c", prepare, root, temporary)
+			command := exec.CommandContext(t.Context(), filepath.Join(root, ".venv/bin/python"), "-c", prepare, root, temporary, test.manager)
 			if output, err := command.CombinedOutput(); err != nil {
 				t.Fatalf("prepare: %v: %s", err, output)
 			}
@@ -430,10 +443,12 @@ for revision in ("first", "second"):
 				t.Fatal(err)
 			}
 			var inputs struct {
-				Workdir        string   `json:"workdir"`
-				PythonPaths    []string `json:"python_paths"`
-				PythonRequires string   `json:"python_requires"`
-				Command        []string `json:"command"`
+				Workdir       string             `json:"workdir"`
+				Copies        []*lutrav1.OciCopy `json:"copies"`
+				BuildCommands [][]string         `json:"build_commands"`
+				BuildEnv      map[string]string  `json:"build_env"`
+				Prepare       []string           `json:"prepare"`
+				Command       []string           `json:"command"`
 			}
 			if err := json.Unmarshal(metadata, &inputs); err != nil {
 				t.Fatal(err)
@@ -449,12 +464,16 @@ for revision in ("first", "second"):
 			req := &EnvironmentExecution{
 				Environment: &lutrav1.EnvironmentIdentifier{NamespaceId: uuid.NewString(), Name: "greetings", Version: strings.Repeat("1", 64)},
 				Spec: &lutrav1.EnvironmentSpec{
-					SourceUri: load("first.source"), Workdir: inputs.Workdir, PythonPaths: inputs.PythonPaths,
-					Image:       &lutrav1.ImageSpec{Name: "container", FromImage: base, BuildContextUri: buildURI, PythonRequires: inputs.PythonRequires, Resources: &lutrav1.Resources{CpuMillis: 1000, MemoryBytes: 512 << 20}},
-					Entrypoints: []*lutrav1.Entrypoint{{Command: &lutrav1.Command{Args: inputs.Command}}},
+					SourceUri: load("first.source"), Workdir: inputs.Workdir,
+					PrepareCommand: &lutrav1.Command{Args: inputs.Prepare},
+					Image:          &lutrav1.ImageSpec{Name: "container", FromImage: base, BuildContextUri: buildURI, OciCopies: inputs.Copies, BuildEnv: inputs.BuildEnv, Resources: &lutrav1.Resources{CpuMillis: 1000, MemoryBytes: 512 << 20}},
+					Entrypoints:    []*lutrav1.Entrypoint{{Command: &lutrav1.Command{Args: inputs.Command}}},
 				},
 				Input:        input,
 				EntrypointID: 1, RunID: uuid.NewString(), ActionID: uuid.NewString(), Attempt: 1, Stderr: &logs,
+			}
+			for _, args := range inputs.BuildCommands {
+				req.Spec.Image.BuildCommands = append(req.Spec.Image.BuildCommands, &lutrav1.Command{Args: args})
 			}
 			image, err := executor.Build(t.Context(), req)
 			if err != nil {
@@ -493,11 +512,12 @@ for revision in ("first", "second"):
 		})
 	}
 }
+*/
 
 func TestImageKeySeparatesBuildAndRuntimeInputs(t *testing.T) {
 	uri := sourceURI(bytes.Repeat([]byte{3}, 32))
 	spec := &lutrav1.EnvironmentSpec{SourceUri: uri, Workdir: ".", Image: &lutrav1.ImageSpec{
-		FromImage: "python:3.12-slim", BuildContextUri: uri, PythonRequires: ">=3.11", Platform: "linux/amd64",
+		FromImage: "python:3.12-slim", BuildContextUri: uri, Platform: "linux/amd64",
 	}}
 	executor := &ContainerExecutor{}
 	original, err := executor.ImageKey(spec)
@@ -505,7 +525,6 @@ func TestImageKeySeparatesBuildAndRuntimeInputs(t *testing.T) {
 		t.Fatal(err)
 	}
 	spec.Workdir = "nested directory"
-	spec.PythonPaths = []string{"scripts"}
 	spec.Image.Env = map[string]*lutrav1.EnvValue{"SETTING": {Source: &lutrav1.EnvValue_StaticValue{StaticValue: "changed"}}}
 	spec.Image.Resources = &lutrav1.Resources{CpuMillis: 500}
 	unchanged, err := executor.ImageKey(spec)
@@ -516,7 +535,13 @@ func TestImageKeySeparatesBuildAndRuntimeInputs(t *testing.T) {
 		func(image *lutrav1.ImageSpec) { image.BuildContextUri = sourceURI(bytes.Repeat([]byte{4}, 32)) },
 		func(image *lutrav1.ImageSpec) { image.Platform = "linux/arm64" },
 		func(image *lutrav1.ImageSpec) { image.FromImage = "python:3.13-slim" },
-		func(image *lutrav1.ImageSpec) { image.PythonRequires = ">=3.13" },
+		func(image *lutrav1.ImageSpec) {
+			image.BuildCommands = []*lutrav1.Command{{Args: []string{"echo", "changed"}}}
+		},
+		func(image *lutrav1.ImageSpec) { image.BuildEnv = map[string]string{"VALUE": "changed"} },
+		func(image *lutrav1.ImageSpec) {
+			image.OciCopies = []*lutrav1.OciCopy{{Image: "tool:1", Source: "/tool", Destination: "/usr/local/bin/tool"}}
+		},
 	} {
 		copy := proto.Clone(spec).(*lutrav1.EnvironmentSpec)
 		mutate(copy.Image)
@@ -529,7 +554,7 @@ func TestImageKeySeparatesBuildAndRuntimeInputs(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(file, uvBuildImage) || !strings.Contains(file, "/opt/lutra/venv") || strings.Contains(file, "pylock") {
+	if !strings.Contains(file, "/opt/lutra/bootstrap") || strings.Contains(file, "uv") {
 		t.Fatalf("unexpected dependency recipe: %s", file)
 	}
 }

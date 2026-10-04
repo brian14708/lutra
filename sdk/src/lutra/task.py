@@ -13,13 +13,16 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Generic, ParamSpec, TypeVar, cast, overload
 
-from lutra._dependency import UvSource, _safe_path, prepare_source
+from lutra._dependency import _safe_path
 from lutra._gen.lutra.v1.lutra_pb import ActionSpec
+from lutra.package_managers import ManagerOutput, PackageManager, Uv, prepare_managers
 from lutra.value import dumps
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable, Mapping
     from types import FunctionType
+
+    from lutra._source_bundle import PreparedSource
 P = ParamSpec("P")
 R_co = TypeVar("R_co", covariant=True)
 _MAX_ATTEMPTS = 100
@@ -115,7 +118,7 @@ def normalize_retry(retry: RetryMode | str, max_attempts: int | None) -> tuple[R
 
 @dataclass(frozen=True)
 class TaskImage:
-    """Container image. Lutra adds uv and installs Python when needed.
+    """Container image assembled from package manager adapters.
 
     Custom bases need Linux and the system libraries required by Python and
     task dependencies. Use a standard distribution image such as Debian or
@@ -184,27 +187,14 @@ class TaskEnvironment:
     resources: Resources = field(default_factory=Resources)
     env: Mapping[str, str | SettingRef] = field(default_factory=dict)
     dependencies: tuple[TaskEnvironment, ...] = ()
-    dependency_groups: tuple[str, ...] | None = None
-    extras: tuple[str, ...] | None = None
+    package_managers: tuple[PackageManager, ...] = field(default_factory=lambda: (Uv(),))
     _tasks: list[Task[..., object]] = field(default_factory=list, init=False, repr=False)
 
     def __post_init__(self) -> None:
-        """Copy mutable declarations supplied by the caller.
-
-        Raises:
-            ValueError: If a dependency selector is invalid.
-
-        """
+        """Copy mutable declarations supplied by the caller."""
         object.__setattr__(self, "env", MappingProxyType(dict(self.env)))
         object.__setattr__(self, "dependencies", tuple(self.dependencies))
-        for field_name in ("dependency_groups", "extras"):
-            value = getattr(self, field_name)
-            if value is not None:
-                if any(not isinstance(item, str) or not item for item in value):
-                    msg = f"{field_name} must contain non-empty strings"
-                    raise ValueError(msg)
-                normalized = tuple(sorted(set(value)))
-                object.__setattr__(self, field_name, normalized)
+        object.__setattr__(self, "package_managers", tuple(self.package_managers))
 
     @property
     def tasks(self) -> tuple[Task[..., object], ...]:
@@ -212,12 +202,12 @@ class TaskEnvironment:
         return tuple(self._tasks)
 
     @property
-    def dependency_source(self) -> UvSource:
-        """The one locked dependency source shared by all entrypoints."""
-        return prepare_source(
+    def manager_outputs(self) -> tuple[ManagerOutput, ...]:
+        """Composed manager outputs for registration."""
+        return prepare_managers(
+            tuple(self.package_managers),
             tuple(task.source_file for task in self._tasks),
-            dependency_groups=self.dependency_groups,
-            extras=self.extras,
+            self.image.platform,
         )
 
     @overload
@@ -365,7 +355,7 @@ class Task(Generic[P, R_co]):
         inspect.signature(self.function).bind(*args, **kwargs)
         return Invocation(self, args, kwargs)
 
-    def entrypoint(self, source: UvSource) -> tuple[str, ...]:
+    def entrypoint(self, source: PreparedSource) -> str:
         """Return the server registration declaration.
 
         Returns:
@@ -383,4 +373,4 @@ class Task(Generic[P, R_co]):
             entrypoint = f"file:{relative}:{self.qualname}"
         else:
             entrypoint = f"{self.module}:{self.qualname}"
-        return ("/opt/lutra/venv/bin/python", "-m", "lutra.serve", entrypoint)
+        return entrypoint

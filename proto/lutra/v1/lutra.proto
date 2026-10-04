@@ -25,10 +25,17 @@ message ImageSpec {
   Resources resources = 3;
   map<string, EnvValue> env = 4;
   string build_context_uri = 5;
-  // Interpreter constraint from the uv lock.
-  string python_requires = 8;
   // Linux container target (for example linux/arm64).
   string platform = 9;
+  repeated OciCopy oci_copies = 10;
+  repeated Command build_commands = 11;
+  map<string, string> build_env = 12;
+}
+
+message OciCopy {
+  string image = 1;
+  string source = 2;
+  string destination = 3;
 }
 
 message EnvValue {
@@ -64,7 +71,6 @@ message EnvironmentSpec {
   repeated Entrypoint entrypoints = 7;
   // Runtime paths, relative to the source bundle; never image build inputs.
   string workdir = 9;
-  repeated string python_paths = 10;
 }
 
 message Entrypoint {

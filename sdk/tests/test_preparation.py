@@ -110,13 +110,15 @@ def test_missing_stale_locks_and_dependency_identity(tmp_path: Path) -> None:
     first = prepare_source([task])
     assert first.lock.exists()
     original = first.lock.read_bytes()
-    first_bundle = build_source_bundle(first, [task.relative_to(first.bundle_root)])
+    first_bundle = build_source_bundle(first.layout, [task.relative_to(first.bundle_root)])
     task.write_text(task.read_text() + "\n# source changed\n")
     manifest = task.parent / "pyproject.toml"
     manifest.write_text(manifest.read_text() + "\n[tool.editor]\nwidth=90\n")
     second = prepare_source([task])
     assert second.build_files == first.build_files
-    assert build_source_bundle(second, [task.relative_to(second.bundle_root)]) != first_bundle
+    assert (
+        build_source_bundle(second.layout, [task.relative_to(second.bundle_root)]) != first_bundle
+    )
     second.lock.write_bytes(original + b"\n# lock changed\n")
     assert prepare_source([task]).build_files != first.build_files
     manifest.write_text(manifest.read_text().replace('version="1.2.3"', 'version="1.2.4"'))
@@ -135,7 +137,7 @@ def test_workspace_selection_and_virtual_root(tmp_path: Path) -> None:
     selected = prepare_source([a])
     assert set(selected.project_roots) == {a.parent, b.parent}
     assert prepare_source([a, b]).build_files != selected.build_files
-    files = unpack(tmp_path, build_source_bundle(selected, [Path("a/tasks.py")]))
+    files = unpack(tmp_path, build_source_bundle(selected.layout, [Path("a/tasks.py")]))
     assert (files / "a/src/a/__init__.py").exists()
     assert (files / "b/src/b/__init__.py").exists()
     assert not (files / "unused").exists()
@@ -144,7 +146,9 @@ def test_workspace_selection_and_virtual_root(tmp_path: Path) -> None:
     virtual = prepare_source([root_task])
     assert virtual.project_roots == (tmp_path,)
     assert not virtual.runtime_files
-    root_files = unpack(tmp_path, build_source_bundle(virtual, [Path("tasks.py")]), "virtual")
+    root_files = unpack(
+        tmp_path, build_source_bundle(virtual.layout, [Path("tasks.py")]), "virtual"
+    )
     assert not (root_files / "unused").exists()
     assert not (root_files / "a").exists()
 
@@ -168,7 +172,7 @@ def test_adjacent_cross_repository_transitive_and_relocation(tmp_path: Path) -> 
     selected = prepare_source([a])
     assert set(selected.project_roots) == {a.parent, shared.parent, leaf.parent}
     assert selected.bundle_root == root
-    first = build_source_bundle(selected, [Path("app/tasks.py")])
+    first = build_source_bundle(selected.layout, [Path("app/tasks.py")])
     files = unpack(tmp_path, first)
     assert not (files / "unrelated-secret").exists()
     local = tomllib.loads((files / "lutra-runtime.py.lock").read_text())
@@ -176,7 +180,7 @@ def test_adjacent_cross_repository_transitive_and_relocation(tmp_path: Path) -> 
     shutil.copytree(root, tmp_path / "relocated")
     relocated = prepare_source([tmp_path / "relocated/app/tasks.py"])
     assert bundle_bytes(relocated.build_files) == bundle_bytes(selected.build_files)
-    assert build_source_bundle(relocated, [Path("app/tasks.py")]) == first
+    assert build_source_bundle(relocated.layout, [Path("app/tasks.py")]) == first
 
 
 def test_script_local_dependency_and_independent_owners(tmp_path: Path) -> None:
@@ -195,7 +199,8 @@ def test_script_local_dependency_and_independent_owners(tmp_path: Path) -> None:
     assert prepared.lock == Path(f"{script}.lock")
     assert not (local.parent / "uv.lock").exists()
     files = unpack(
-        tmp_path, build_source_bundle(prepared, [Path("scripts/run.py"), Path("local/tasks.py")])
+        tmp_path,
+        build_source_bundle(prepared.layout, [Path("scripts/run.py"), Path("local/tasks.py")]),
     )
     assert (files / "scripts/asset.txt").exists()
     assert not (files / "scripts/unrelated.txt").exists()
@@ -225,8 +230,8 @@ def test_ignores_required_files_modes_and_includes(tmp_path: Path) -> None:
         manifest.read_text() + '\n[tool.lutra]\nsource-includes=["ignored/keep.txt"]\n'
     )
     prepared = prepare_source([task])
-    contents = build_source_bundle(prepared, [Path("tasks.py")])
-    assert contents == build_source_bundle(prepared, [Path("tasks.py")])
+    contents = build_source_bundle(prepared.layout, [Path("tasks.py")])
+    assert contents == build_source_bundle(prepared.layout, [Path("tasks.py")])
     files = unpack(tmp_path, contents)
     assert (files / "ignored/keep.txt").read_text() == "keep"
     assert not (files / "ignored/drop.txt").exists()
@@ -236,7 +241,7 @@ def test_ignores_required_files_modes_and_includes(tmp_path: Path) -> None:
     assert (files / "run").stat().st_mode & 0o111
     (root / "link").symlink_to(task)
     with pytest.raises(ValueError, match="regular file"):
-        build_source_bundle(prepared, [Path("tasks.py")])
+        build_source_bundle(prepared.layout, [Path("tasks.py")])
     with pytest.raises(ValueError, match="inside"):
         select_files(root, includes=[Path("../../outside")])
     with pytest.raises(ValueError, match="no files"):
@@ -254,7 +259,7 @@ def test_editable_metadata_entrypoints_data_and_source_edits(tmp_path: Path, lay
     package = task.parent / layout / "demo"
     (package / "asset.txt").write_text("package data")
     prepared = prepare_source([task])
-    files = unpack(tmp_path, build_source_bundle(prepared, [Path("tasks.py")]))
+    files = unpack(tmp_path, build_source_bundle(prepared.layout, [Path("tasks.py")]))
     env = tmp_path / "venv"
     sync_source(files, env)
     code = (
@@ -277,7 +282,7 @@ def test_inline_sdk_example(tmp_path: Path) -> None:
     prepared = prepare_source([script])
     assert json.loads(prepared.build_files["selection.json"])["uv"] == UV_VERSION
     files = unpack(
-        tmp_path, build_source_bundle(prepared, [script.relative_to(prepared.bundle_root)])
+        tmp_path, build_source_bundle(prepared.layout, [script.relative_to(prepared.bundle_root)])
     )
     assert (files / "src/lutra/_gen/lutra/v1/lutra_pb.py").exists()
     dependencies = selected_names(files / "lutra-runtime.py")
@@ -316,7 +321,7 @@ def test_runtime_extras_markers_and_nondefault_dev_group(tmp_path: Path) -> None
         optional.parent,
         tmp_path / "devtool",
     }
-    files = unpack(tmp_path, build_source_bundle(source, [Path("app/tasks.py")]))
+    files = unpack(tmp_path, build_source_bundle(source.layout, [Path("app/tasks.py")]))
     assert selected_names(files / "lutra-runtime.py") == {"app", "devtool", "shared", "optional"}
     env = tmp_path / "venv"
     sync_source(files, env)
@@ -367,7 +372,7 @@ def test_namespace_package_is_installed_by_backend(tmp_path: Path) -> None:
     namespace.mkdir(parents=True)
     (namespace / "__init__.py").write_text('VALUE = "namespace"\n')
     source = prepare_source([task])
-    files = unpack(tmp_path, build_source_bundle(source, [Path("tasks.py")]))
+    files = unpack(tmp_path, build_source_bundle(source.layout, [Path("tasks.py")]))
     env = tmp_path / "venv"
     sync_source(files, env)
     assert (
@@ -383,7 +388,7 @@ def test_required_files_conflicts_and_archive_limits(
     source = prepare_source([task])
     (task.parent / "lutra-runtime.py.lock").write_text("conflicting user data")
     with pytest.raises(ValueError, match="conflicting bundle contents"):
-        build_source_bundle(source, [Path("tasks.py")])
+        build_source_bundle(source.layout, [Path("tasks.py")])
     with pytest.raises(ValueError, match="unsafe"):
         bundle_bytes({"../escape": b"no"})
     with pytest.raises(ValueError, match="conflicting"):
@@ -397,7 +402,7 @@ def test_required_files_conflicts_and_archive_limits(
         select_files(task.parent)
     task.rename(task.with_suffix(".missing"))
     with pytest.raises(ValueError, match="no files"):
-        build_source_bundle(source, [Path("tasks.py")])
+        build_source_bundle(source.layout, [Path("tasks.py")])
 
 
 def test_workspace_exclusion_owns_its_lock(tmp_path: Path) -> None:

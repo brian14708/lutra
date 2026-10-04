@@ -17,10 +17,13 @@ from typing import TYPE_CHECKING, Any
 
 import tomli_w
 
+from lutra._source_bundle import PreparedSource
+
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
 UV_VERSION = "0.12.11"
+UV_IMAGE = f"docker.io/astral/uv:{UV_VERSION}"
 RECIPE = "lutra.uv-native.v1"
 _SCRIPT_BLOCK = re.compile(r"(?ms)^# /// script[ \t]*\n.*?^# ///[ \t]*(?:\n|$)")
 _LOCAL_KINDS = ("editable", "directory", "virtual")
@@ -184,6 +187,20 @@ class UvSource:
             if not uv.get("package", "build-system" in metadata):
                 roots.add(root)
         return tuple(sorted(path.relative_to(self.bundle_root).as_posix() for path in roots))
+
+    @property
+    def layout(self) -> PreparedSource:
+        """Source layout shared by bundling and registration."""
+        return PreparedSource(
+            self.root,
+            self.bundle_root,
+            self.project_roots,
+            self.includes,
+            self.required_files,
+            self.excluded_roots,
+            self.runtime_files,
+            self.script,
+        )
 
 
 def _prepare_lock(root: Path, lock: Path, script: Path | None) -> tuple[bytes, str]:
