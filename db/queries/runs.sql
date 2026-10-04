@@ -35,8 +35,7 @@ SELECT
   r.created_at AS run_created_at,
   a.id,
   a.status,
-  a.output_cbor,
-  a.error,
+  a.result_cbor,
   a.updated_at,
   e.name AS environment_name,
   e.version,
@@ -58,9 +57,8 @@ SELECT
   a.entrypoint_id,
   a.environment_id,
   a.action_spec,
-  a.output_cbor,
+  a.result_cbor,
   a.status,
-  a.error,
   a.attempts,
   a.created_at,
   a.updated_at
@@ -73,9 +71,8 @@ SELECT
   a.id,
   a.caller_action_id,
   a.action_spec,
-  a.output_cbor,
+  a.result_cbor,
   a.status,
-  a.error,
   a.attempts,
   a.next_attempt_at,
   a.failures,
@@ -95,7 +92,7 @@ ORDER BY a.created_at, a.id;
 -- name: ListTaskActions :many
 SELECT a.id, a.run_id, a.caller_action_id, e.namespace_id,
        e.name AS environment_name, e.version, a.entrypoint_id, a.environment_id,
-       a.action_spec, a.output_cbor, a.status, a.error, a.attempts,
+       a.action_spec, a.result_cbor, a.status, a.attempts,
        a.created_at, a.updated_at
 FROM lutra.task_actions a
 JOIN lutra.task_environments e ON e.id = a.environment_id
@@ -181,8 +178,7 @@ UPDATE lutra.task_actions AS a
 SET status = sqlc.arg(status)::lutra.task_action_status,
   attempts = sqlc.arg(attempt)::integer,
   failures = sqlc.arg(failures)::integer,
-  output_cbor = sqlc.narg(output_cbor)::bytea,
-  error = sqlc.arg(error)::text,
+  result_cbor = sqlc.narg(result_cbor)::bytea,
   next_attempt_at = sqlc.narg(next_attempt_at)::timestamptz,
   updated_at = now()
 FROM lutra.runs AS r
@@ -202,7 +198,7 @@ WHERE a.id = sqlc.arg(action_id)::uuid
 SELECT status FROM lutra.task_actions WHERE id = $1;
 
 -- name: CancelRunIfActive :many
-UPDATE lutra.task_actions SET status = 'canceled', error = 'run canceled', updated_at = now()
+UPDATE lutra.task_actions SET status = 'canceled', result_cbor = sqlc.arg(result_cbor)::bytea, updated_at = now()
 WHERE lutra.task_actions.run_id = $1 AND status NOT IN ('succeeded', 'failed', 'canceled')
   AND EXISTS (SELECT 1 FROM lutra.runs r JOIN lutra.task_actions root ON root.id = r.root_action_id
               WHERE r.id = $1 AND root.status NOT IN ('succeeded', 'failed', 'canceled'))

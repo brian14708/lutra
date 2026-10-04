@@ -5,6 +5,7 @@ import (
 	"errors"
 
 	"github.com/brian14708/lutra/internal/db"
+	"github.com/brian14708/lutra/internal/result"
 	"github.com/brian14708/lutra/internal/runlog"
 	"github.com/brian14708/lutra/internal/tasktree"
 	"github.com/jackc/pgx/v5/pgtype"
@@ -46,6 +47,17 @@ func (s taskStore) Transition(ctx context.Context, t tasktree.Transition) error 
 	}
 	defer func() { _ = tx.Rollback(context.Background()) }()
 	q := db.New(tx)
+	encoded := t.Output
+	if t.Error != "" {
+		if _, tagged, decodeErr := result.DecodeFailure(encoded); decodeErr != nil {
+			return decodeErr
+		} else if !tagged {
+			encoded, err = result.EncodeFailure(result.Failure{Cacheable: false, Message: t.Error})
+			if err != nil {
+				return err
+			}
+		}
+	}
 	run, err := q.LockRun(ctx, t.RunID)
 	if err != nil {
 		return err
@@ -56,7 +68,7 @@ func (s taskStore) Transition(ctx context.Context, t tasktree.Transition) error 
 	}
 	rows, err := q.TransitionRunTaskAction(ctx, db.TransitionRunTaskActionParams{
 		Status: taskStatus(t.State), Attempt: t.Attempt, Failures: t.Failures,
-		OutputCbor: t.Output, Error: t.Error, NextAttemptAt: next,
+		ResultCbor: encoded, NextAttemptAt: next,
 		ActionID: t.NodeID, RunID: t.RunID, ClaimToken: t.ClaimToken,
 		ExpectedAttempt: t.ExpectedAttempt,
 	})

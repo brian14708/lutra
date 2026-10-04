@@ -10,6 +10,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/brian14708/lutra/internal/result"
+
 	"connectrpc.com/connect"
 	lutrav1 "github.com/brian14708/lutra/gen/lutra/v1"
 	"github.com/brian14708/lutra/internal/blob"
@@ -284,7 +286,7 @@ func readRun(ctx context.Context, q *db.Queries, id uuid.UUID) (*lutrav1.Run, er
 	if row.RootActionID != nil {
 		rootID = row.RootActionID.String()
 	}
-	return &lutrav1.Run{Id: id.String(), RootActionId: rootID, Environment: environmentIdentifier(row.NamespaceID, row.EnvironmentName, row.Version), EntrypointId: uint32(row.EntrypointID), Status: string(row.Status), OutputCbor: row.OutputCbor, Error: row.Error, CreatedAt: formatTime(row.RunCreatedAt), UpdatedAt: formatTime(row.UpdatedAt)}, nil
+	return &lutrav1.Run{Id: id.String(), RootActionId: rootID, Environment: environmentIdentifier(row.NamespaceID, row.EnvironmentName, row.Version), EntrypointId: uint32(row.EntrypointID), Status: string(row.Status), ResultCbor: row.ResultCbor, CreatedAt: formatTime(row.RunCreatedAt), UpdatedAt: formatTime(row.UpdatedAt)}, nil
 }
 
 func environmentIdentifier(namespaceID uuid.UUID, name, version string) *lutrav1.EnvironmentIdentifier {
@@ -305,16 +307,16 @@ func (s Service) readTaskAction(ctx context.Context, id uuid.UUID) (*lutrav1.Tas
 }
 
 type actionRow struct {
-	NamespaceID                             uuid.UUID
-	ID                                      uuid.UUID
-	RunID                                   uuid.UUID
-	CallerActionID                          *uuid.UUID
-	EnvironmentName, Version, Status, Error string
-	EnvironmentID                           uuid.UUID
-	EntrypointID                            int64
-	ActionSpec, OutputCbor                  []byte
-	Attempts                                int32
-	CreatedAt, UpdatedAt                    pgtype.Timestamptz
+	NamespaceID                      uuid.UUID
+	ID                               uuid.UUID
+	RunID                            uuid.UUID
+	CallerActionID                   *uuid.UUID
+	EnvironmentName, Version, Status string
+	EnvironmentID                    uuid.UUID
+	EntrypointID                     int64
+	ActionSpec, ResultCbor           []byte
+	Attempts                         int32
+	CreatedAt, UpdatedAt             pgtype.Timestamptz
 }
 
 func actionFromRow(row actionRow) (*lutrav1.TaskAction, error) {
@@ -323,7 +325,7 @@ func actionFromRow(row actionRow) (*lutrav1.TaskAction, error) {
 		return nil, err
 	}
 	spec.ConfigOverridesCbor = nil
-	action := &lutrav1.TaskAction{Id: row.ID.String(), RunId: row.RunID.String(), Environment: environmentIdentifier(row.NamespaceID, row.EnvironmentName, row.Version), EntrypointId: uint32(row.EntrypointID), ActionSpec: &spec, OutputCbor: row.OutputCbor, Status: row.Status, Error: row.Error, Attempts: row.Attempts, CreatedAt: formatTime(row.CreatedAt), UpdatedAt: formatTime(row.UpdatedAt)}
+	action := &lutrav1.TaskAction{Id: row.ID.String(), RunId: row.RunID.String(), Environment: environmentIdentifier(row.NamespaceID, row.EnvironmentName, row.Version), EntrypointId: uint32(row.EntrypointID), ActionSpec: &spec, ResultCbor: row.ResultCbor, Status: row.Status, Attempts: row.Attempts, CreatedAt: formatTime(row.CreatedAt), UpdatedAt: formatTime(row.UpdatedAt)}
 	if row.CallerActionID != nil {
 		action.CallerActionId = row.CallerActionID.String()
 	}
@@ -331,11 +333,11 @@ func actionFromRow(row actionRow) (*lutrav1.TaskAction, error) {
 }
 
 func actionRowFromRead(row db.ReadTaskActionRow) actionRow {
-	return actionRow{ID: row.ID, RunID: row.RunID, CallerActionID: row.CallerActionID, NamespaceID: row.NamespaceID, EnvironmentName: row.EnvironmentName, Version: row.Version, EntrypointID: row.EntrypointID, EnvironmentID: row.EnvironmentID, ActionSpec: row.ActionSpec, OutputCbor: row.OutputCbor, Status: string(row.Status), Error: row.Error, Attempts: row.Attempts, CreatedAt: row.CreatedAt, UpdatedAt: row.UpdatedAt}
+	return actionRow{ID: row.ID, RunID: row.RunID, CallerActionID: row.CallerActionID, NamespaceID: row.NamespaceID, EnvironmentName: row.EnvironmentName, Version: row.Version, EntrypointID: row.EntrypointID, EnvironmentID: row.EnvironmentID, ActionSpec: row.ActionSpec, ResultCbor: row.ResultCbor, Status: string(row.Status), Attempts: row.Attempts, CreatedAt: row.CreatedAt, UpdatedAt: row.UpdatedAt}
 }
 
 func actionRowFromList(row db.ListTaskActionsRow) actionRow {
-	return actionRow{ID: row.ID, RunID: row.RunID, CallerActionID: row.CallerActionID, NamespaceID: row.NamespaceID, EnvironmentName: row.EnvironmentName, Version: row.Version, EntrypointID: row.EntrypointID, EnvironmentID: row.EnvironmentID, ActionSpec: row.ActionSpec, OutputCbor: row.OutputCbor, Status: string(row.Status), Error: row.Error, Attempts: row.Attempts, CreatedAt: row.CreatedAt, UpdatedAt: row.UpdatedAt}
+	return actionRow{ID: row.ID, RunID: row.RunID, CallerActionID: row.CallerActionID, NamespaceID: row.NamespaceID, EnvironmentName: row.EnvironmentName, Version: row.Version, EntrypointID: row.EntrypointID, EnvironmentID: row.EnvironmentID, ActionSpec: row.ActionSpec, ResultCbor: row.ResultCbor, Status: string(row.Status), Attempts: row.Attempts, CreatedAt: row.CreatedAt, UpdatedAt: row.UpdatedAt}
 }
 
 func (s Service) GetRun(ctx context.Context, req *connect.Request[lutrav1.GetRunRequest]) (*connect.Response[lutrav1.GetRunResponse], error) {
@@ -471,7 +473,11 @@ func (s Service) CancelRun(ctx context.Context, req *connect.Request[lutrav1.Can
 	} else if err != nil {
 		return nil, err
 	}
-	if actions, err := q.CancelRunIfActive(ctx, id); err != nil {
+	canceled, err := result.EncodeFailure(result.Failure{Message: "run canceled"})
+	if err != nil {
+		return nil, err
+	}
+	if actions, err := q.CancelRunIfActive(ctx, db.CancelRunIfActiveParams{RunID: id, ResultCbor: canceled}); err != nil {
 		return nil, connect.NewError(connect.CodeInternal, err)
 	} else if len(actions) > 0 {
 		for _, action := range actions {
@@ -579,7 +585,7 @@ func (s Service) watchRun(ctx context.Context, id uuid.UUID, taskLogs *lutrav1.S
 			}
 			next := &lutrav1.Run{
 				Id: run.Id, RootActionId: run.RootActionId, Environment: run.Environment, EntrypointId: run.EntrypointId, CreatedAt: run.CreatedAt,
-				Status: event.Status, OutputCbor: event.OutputCBOR, Error: event.Error, UpdatedAt: event.UpdatedAt,
+				Status: event.Status, ResultCbor: event.ResultCBOR, UpdatedAt: event.UpdatedAt,
 			}
 			if err := send(&lutrav1.WatchRunResponse{Run: next}); err != nil {
 				return err

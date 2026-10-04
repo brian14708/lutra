@@ -207,7 +207,7 @@ func TestConnectModes(t *testing.T) {
 					case "message":
 						count++
 						if mode == "bidi" {
-							if err := write(frame{ID: id, Type: "message", Value: json.RawMessage(`{"output":"YQ=="}`)}); err != nil {
+							if err := write(frame{ID: id, Type: "message", Value: json.RawMessage(`{"resultCbor":"YQ=="}`)}); err != nil {
 								serverDone <- err
 								return
 							}
@@ -225,7 +225,7 @@ func TestConnectModes(t *testing.T) {
 							n = 0
 						}
 						for range n {
-							if err := write(frame{ID: id, Type: "message", Value: json.RawMessage(`{"output":"YQ=="}`)}); err != nil {
+							if err := write(frame{ID: id, Type: "message", Value: json.RawMessage(`{"resultCbor":"YQ=="}`)}); err != nil {
 								serverDone <- err
 								return
 							}
@@ -243,7 +243,7 @@ func TestConnectModes(t *testing.T) {
 			switch mode {
 			case "unary":
 				res, err := client.CallUnary(ctx, connect.NewRequest(request))
-				if err != nil || string(res.Msg.GetOutput()) != "a" {
+				if err != nil || string(res.Msg.GetResultCbor()) != "a" {
 					t.Fatalf("unary: %v, %v", res, err)
 				}
 			case "client":
@@ -254,7 +254,7 @@ func TestConnectModes(t *testing.T) {
 					}
 				}
 				res, err := stream.CloseAndReceive()
-				if err != nil || string(res.Msg.GetOutput()) != "a" {
+				if err != nil || string(res.Msg.GetResultCbor()) != "a" {
 					t.Fatalf("client stream: %v, %v", res, err)
 				}
 			case "server":
@@ -265,7 +265,7 @@ func TestConnectModes(t *testing.T) {
 				n := 0
 				for stream.Receive() {
 					n++
-					if string(stream.Msg().GetOutput()) != "a" {
+					if string(stream.Msg().GetResultCbor()) != "a" {
 						t.Fatalf("server stream message: %v", stream.Msg())
 					}
 				}
@@ -279,7 +279,7 @@ func TestConnectModes(t *testing.T) {
 						t.Fatal(err)
 					}
 					response, err := stream.Receive()
-					if err != nil || string(response.GetOutput()) != "a" {
+					if err != nil || string(response.GetResultCbor()) != "a" {
 						t.Fatalf("bidi message: %v, %v", response, err)
 					}
 				}

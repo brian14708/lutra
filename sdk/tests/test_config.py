@@ -4,6 +4,7 @@ import base64
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
+import cbor2
 import pytest
 from lutra import ConfigError
 from lutra._gen.lutra.task.v1.task_pb import ExecuteRequest, ExecuteResponse
@@ -47,7 +48,7 @@ async def test_config_import_context(tmp_path: Path, monkeypatch: pytest.MonkeyP
         ),
         ctx,
     )
-    assert response.output == dumps([["provider-value", None], None])
+    assert response.result_cbor == dumps([["provider-value", None], None])
 
 
 @pytest.mark.asyncio
@@ -86,6 +87,6 @@ async def test_missing_config_prevents_import(
     service.api_client = TaskAPIClient(cast("_Host", object()))
     ctx = cast("RequestContext[ExecuteRequest, ExecuteResponse]", None)
     response = await service.execute(ExecuteRequest(invocation_id="test"), ctx)
-    assert response.error_code == "config.missing"
-    assert response.output == b""
-    assert response.error_details == b""
+    assert cbor2.loads(response.result_cbor).value["message"] == "config.missing"
+    assert cbor2.loads(response.result_cbor).value["cacheable"] is False
+    assert cbor2.loads(response.result_cbor).value["details"] is None

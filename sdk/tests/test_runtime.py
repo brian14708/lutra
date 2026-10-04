@@ -65,7 +65,7 @@ async def test_reordered_spawns_keep_stable_keys_and_independent_results(
             if key == "second":
                 await release_second.wait()
             return SimpleNamespace(
-                action=TaskAction(id=key, status="succeeded", output_cbor=dumps(key))
+                action=TaskAction(id=key, status="succeeded", result_cbor=dumps(key))
             )
 
     monkeypatch.setattr("lutra.runtime.LutraServiceClient", FakeRPC)

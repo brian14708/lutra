@@ -13,6 +13,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/brian14708/lutra/internal/result"
+
 	lutrav1 "github.com/brian14708/lutra/gen/lutra/v1"
 	lutrav1connect "github.com/brian14708/lutra/gen/lutra/v1/lutrav1connect"
 	"github.com/brian14708/lutra/internal/cache"
@@ -152,7 +154,11 @@ func taskNode(row db.LoadRunTasksRow, runtime string, config RunConfigSnapshot) 
 			return tasktree.Node{}, errors.New("invalid cached task environment")
 		}
 	}
-	return tasktree.Node{ID: row.ID, ParentID: row.CallerActionID, Attempt: row.Attempts, Failures: row.Failures, MaxAttempts: max(spec.MaxAttempts, 1), State: state, ImageKey: row.ImageKey, CacheKey: key, Output: row.OutputCbor, Error: row.Error, NextAttemptAt: row.NextAttemptAt.Time}, nil
+	failure, _, err := result.DecodeFailure(row.ResultCbor)
+	if err != nil {
+		return tasktree.Node{}, err
+	}
+	return tasktree.Node{ID: row.ID, ParentID: row.CallerActionID, Attempt: row.Attempts, Failures: row.Failures, MaxAttempts: max(spec.MaxAttempts, 1), State: state, ImageKey: row.ImageKey, CacheKey: key, Output: row.ResultCbor, Error: failure.Message, NextAttemptAt: row.NextAttemptAt.Time}, nil
 }
 
 func cacheKey(row db.LoadRunTasksRow, spec *lutrav1.ActionSpec, runtime string, config RunConfigSnapshot) []byte {

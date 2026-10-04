@@ -20,7 +20,7 @@ type actionStatusEvent struct {
 	EntrypointID   uint32 `cbor:"entrypoint_id"`
 	Status         string `cbor:"status"`
 	Attempt        int32  `cbor:"attempt"`
-	Error          string `cbor:"error"`
+	ResultCBOR     []byte `cbor:"result_cbor"`
 	UpdatedAt      string `cbor:"updated_at"`
 	MaxAttempts    int32  `cbor:"max_attempts"`
 	CacheHit       bool   `cbor:"cache_hit"`
@@ -35,7 +35,7 @@ func (s Service) DecodeActionStatus(ctx context.Context, value []byte) (*lutrav1
 	if err := cbor.Unmarshal(value, &event); err != nil {
 		return nil, err
 	}
-	if event.Type != "task.status.v1" {
+	if event.Type != "task.status.v2" {
 		return nil, errors.New("unknown task status event type or version")
 	}
 	if _, err := uuid.Parse(event.ActionID); err != nil {
@@ -54,7 +54,7 @@ func (s Service) DecodeActionStatus(ctx context.Context, value []byte) (*lutrav1
 	default:
 		return nil, errors.New("invalid task status event")
 	}
-	return &lutrav1.TaskActionStatus{ActionId: event.ActionID, CallerActionId: event.CallerActionID, EntrypointId: event.EntrypointID, Status: event.Status, Attempt: event.Attempt, Error: event.Error, UpdatedAt: event.UpdatedAt, MaxAttempts: event.MaxAttempts, CacheHit: event.CacheHit}, nil
+	return &lutrav1.TaskActionStatus{ActionId: event.ActionID, CallerActionId: event.CallerActionID, EntrypointId: event.EntrypointID, Status: event.Status, Attempt: event.Attempt, ResultCbor: event.ResultCBOR, UpdatedAt: event.UpdatedAt, MaxAttempts: event.MaxAttempts, CacheHit: event.CacheHit}, nil
 }
 
 func (s Service) AppendActionStatus(ctx context.Context, tx pgx.Tx, id uuid.UUID, cacheHit bool) error {
@@ -77,7 +77,7 @@ func (s Service) AppendActionStatus(ctx context.Context, tx pgx.Tx, id uuid.UUID
 	if err != nil {
 		return err
 	}
-	value, err := mode.Marshal(actionStatusEvent{Type: "task.status.v1", ActionID: id.String(), CallerActionID: caller, EntrypointID: uint32(row.EntrypointID), Status: string(row.Status), Attempt: row.Attempts, Error: row.Error, UpdatedAt: row.UpdatedAt.Time.UTC().Format(time.RFC3339Nano), MaxAttempts: spec.MaxAttempts, CacheHit: cacheHit})
+	value, err := mode.Marshal(actionStatusEvent{Type: "task.status.v2", ActionID: id.String(), CallerActionID: caller, EntrypointID: uint32(row.EntrypointID), Status: string(row.Status), Attempt: row.Attempts, ResultCBOR: row.ResultCbor, UpdatedAt: row.UpdatedAt.Time.UTC().Format(time.RFC3339Nano), MaxAttempts: spec.MaxAttempts, CacheHit: cacheHit})
 	if err != nil {
 		return err
 	}

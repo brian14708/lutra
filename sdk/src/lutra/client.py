@@ -36,9 +36,10 @@ from lutra._gen.lutra.v1.lutra_pb import (
 from lutra._gen.lutra.v1.lutra_pb import ConfigBinding as WireConfigBinding
 from lutra._gen.lutra.v1.settings_connect import SettingsServiceClient
 from lutra._gen.lutra.v1.settings_pb import ListNamespacesRequest
+from lutra._result import failure_message, load_result
 from lutra._source_bundle import build_source_bundle
 from lutra.blob import BlobStore
-from lutra.task import CacheableError, ConfigError, normalize_retry
+from lutra.task import normalize_retry
 from lutra.value import dumps, loads
 
 if TYPE_CHECKING:
@@ -134,7 +135,7 @@ class _RunLogger:
         )
         self.action_names[event.action_id] = name
         previous = self.actions.get(event.action_id)
-        current = (event.status, event.attempt, event.cache_hit, event.error)
+        current = (event.status, event.attempt, event.cache_hit, failure_message(event.result_cbor))
         if previous == current:
             return
         self.actions[event.action_id] = current
@@ -149,8 +150,9 @@ class _RunLogger:
             else ""
         )
         error = (
-            f" · {event.error}"
-            if event.error and event.status in {"queued", "failed", "canceled"}
+            f" · {failure_message(event.result_cbor)}"
+            if failure_message(event.result_cbor)
+            and event.status in {"queued", "failed", "canceled"}
             else ""
         )
         _log_message(
@@ -214,7 +216,10 @@ class _RunLogger:
                 entrypoint_id=event.entrypoint_id,
             )
         self.root_action_id = event.root_action_id or self.root_action_id
-        if event.status == self.run_status and event.error == self.last_error:
+        if (
+            event.status == self.run_status
+            and failure_message(event.result_cbor) == self.last_error
+        ):
             return
         self.run_status = event.status
         status = event.status
@@ -223,8 +228,8 @@ class _RunLogger:
                 event.created_at
             )
             status += f" · {duration.total_seconds():.1f}s"
-        if event.error:
-            status += f" · {event.error}"
+        if failure_message(event.result_cbor):
+            status += f" · {failure_message(event.result_cbor)}"
         _log_message(
             self.logger,
             self.run_id,
@@ -234,7 +239,7 @@ class _RunLogger:
             warning=event.status in {"failed", "canceled"},
             action_id=self.root_action_id,
         )
-        self.last_error = event.error
+        self.last_error = failure_message(event.result_cbor)
 
 
 @dataclass(frozen=True)
@@ -395,9 +400,7 @@ class RunHandle(Generic[R]):
         )
         return await self._result(writer)
 
-    async def _result(  # ruff: ignore[complex-structure]
-        self, writer: _RunLogger | LiveDisplay | None
-    ) -> R:
+    async def _result(self, writer: _RunLogger | LiveDisplay | None) -> R:
         terminal: Run | None = None
         events = self.watch() if writer is None else self.events()
         async for event in events:
@@ -411,18 +414,11 @@ class RunHandle(Generic[R]):
             message = "run status stream ended before completion"
             raise RuntimeError(message)
         if terminal.status != "succeeded":
-            if terminal.error in {"config.invalid", "config.missing"}:
-                raise ConfigError(terminal.error)
-            if terminal.status == "failed" and terminal.output_cbor:
-                failure = await loads(terminal.output_cbor, self.client.resolve_blob)
-                if (
-                    isinstance(failure, list)
-                    and len(failure) == len(("lutra.cacheable-error.v1", "", None))
-                    and failure[0] == "lutra.cacheable-error.v1"
-                ):
-                    raise CacheableError(failure[1], failure[2])
-            raise RuntimeError(terminal.error or f"run {terminal.status}")
-        result = await loads(terminal.output_cbor, self.client.resolve_blob)
+            if terminal.result_cbor:
+                await load_result(terminal.result_cbor, self.client.resolve_blob)
+            message = f"run {terminal.status}"
+            raise RuntimeError(message)
+        result = await load_result(terminal.result_cbor, self.client.resolve_blob)
         if isinstance(writer, _RunLogger):
             _log_message(writer.logger, self.id, "result", _preview(result))
         elif writer is not None:

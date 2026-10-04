@@ -5,6 +5,7 @@ import (
 	"errors"
 
 	"github.com/brian14708/lutra/internal/cache"
+	"github.com/brian14708/lutra/internal/result"
 	"github.com/brian14708/lutra/internal/tasktree"
 )
 
@@ -21,15 +22,11 @@ func (d *runDriver) Acquire(ctx context.Context, key []byte) ([]byte, error, tas
 	if lease != nil {
 		return nil, nil, taskLease{lease}, nil
 	}
-	if task.ErrorCode == "" {
-		return task.OutputCBOR, nil, nil, nil
+	failure, tagged, err := result.DecodeFailure(task.ResultCBOR)
+	if err != nil || !tagged || !failure.Cacheable {
+		return task.ResultCBOR, nil, nil, err
 	}
-	failure := &CacheableError{Code: task.ErrorCode, Details: task.ErrorDetailsCBOR}
-	output, err := failure.output()
-	if err != nil {
-		return nil, nil, nil, err
-	}
-	return output, failure, nil, nil
+	return task.ResultCBOR, &CacheableError{Code: failure.Message, Details: failure.Details}, nil, nil
 }
 
 type taskLease struct{ *cache.Lease }
@@ -40,7 +37,11 @@ func (l taskLease) Finish(ctx context.Context, output []byte, taskErr error) err
 		return l.Release(ctx)
 	}
 	if failure != nil {
-		return l.Complete(ctx, cache.Result{ErrorCode: failure.Code, ErrorDetailsCBOR: failure.Details})
+		encoded, err := result.EncodeFailure(result.Failure{Cacheable: true, Message: failure.Code, Details: failure.Details})
+		if err != nil {
+			return err
+		}
+		return l.Complete(ctx, cache.Result{ResultCBOR: encoded})
 	}
-	return l.Complete(ctx, cache.Result{OutputCBOR: output})
+	return l.Complete(ctx, cache.Result{ResultCBOR: output})
 }

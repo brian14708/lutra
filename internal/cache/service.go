@@ -10,22 +10,16 @@ import (
 	"time"
 
 	"github.com/brian14708/lutra/internal/db"
-	"github.com/fxamacker/cbor/v2"
+	"github.com/brian14708/lutra/internal/result"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-// Tag 60000 is the cache exception CBOR profile v1: [message, details].
-// The SDK value profile accepts only tag 32, so task output cannot use it.
-const exceptionTag = 60000
-
 const maxResultCBOR = 1 << 20
 
 type Result struct {
-	OutputCBOR       []byte
-	ErrorCode        string
-	ErrorDetailsCBOR []byte
+	ResultCBOR []byte
 }
 
 var ErrLeaseLost = errors.New("cache lease lost")
@@ -45,41 +39,19 @@ func storedDigest(key [32]byte) [32]byte {
 	return sha256.Sum256(source[:])
 }
 
-func encodeException(message string, details []byte) ([]byte, error) {
-	mode, err := cbor.CanonicalEncOptions().EncMode()
-	if err != nil {
-		return nil, err
-	}
-	var content any
-	if details != nil {
-		content = cbor.RawMessage(details)
-	}
-	return mode.Marshal(cbor.Tag{Number: exceptionTag, Content: []any{message, content}})
-}
-
-func decodeException(encoded []byte) (string, []byte, bool, error) {
-	var tag cbor.RawTag
-	if err := cbor.Unmarshal(encoded, &tag); err != nil || tag.Number != exceptionTag {
-		return "", nil, false, nil
-	}
-	var parts []cbor.RawMessage
-	if err := cbor.Unmarshal(tag.Content, &parts); err != nil || len(parts) != 2 {
-		return "", nil, true, errors.New("invalid cached exception")
-	}
-	var message string
-	if err := cbor.Unmarshal(parts[0], &message); err != nil || message == "" {
-		return "", nil, true, errors.New("invalid cached exception")
-	}
-	return message, parts[1], true, nil
-}
-
 func validateCBOR(encoded []byte) error {
 	if len(encoded) == 0 || len(encoded) > maxResultCBOR {
 		return errors.New("cache CBOR size is out of bounds")
 	}
-	var value any
-	if err := cbor.Unmarshal(encoded, &value); err != nil {
-		return fmt.Errorf("invalid cache CBOR: %w", err)
+	if err := result.Validate(encoded); err != nil {
+		return err
+	}
+	failure, tagged, err := result.DecodeFailure(encoded)
+	if err != nil {
+		return err
+	}
+	if tagged && (!failure.Cacheable || len(failure.Details) > 64<<10) {
+		return errors.New("invalid cached failure")
 	}
 	return nil
 }
@@ -118,14 +90,7 @@ func (s *Service) Acquire(ctx context.Context, key [32]byte) (Result, *Lease, er
 			if err := validateCBOR(entry.ResultCbor); err != nil {
 				return Result{}, nil, err
 			}
-			code, details, tagged, err := decodeException(entry.ResultCbor)
-			if err != nil {
-				return Result{}, nil, err
-			}
-			if tagged {
-				return Result{ErrorCode: code, ErrorDetailsCBOR: details}, nil, nil
-			}
-			return Result{OutputCBOR: entry.ResultCbor}, nil, nil
+			return Result{ResultCBOR: entry.ResultCbor}, nil, nil
 		case db.LutraCacheStatusBuilding:
 			// Wait for the owner to complete or release its claim.
 		default:
@@ -206,32 +171,10 @@ func (l *Lease) finish(ctx context.Context, apply func(context.Context) (int64, 
 }
 
 func (l *Lease) Complete(ctx context.Context, value Result) error {
-	if (value.OutputCBOR == nil) != (value.ErrorCode != "") ||
-		(value.ErrorCode != "" && value.ErrorDetailsCBOR == nil) ||
-		(value.ErrorCode == "" && value.ErrorDetailsCBOR != nil) {
+	if value.ResultCBOR == nil {
 		return errors.New("invalid task cache result")
 	}
-	encoded := value.OutputCBOR
-	if value.ErrorDetailsCBOR != nil {
-		if len(value.ErrorDetailsCBOR) > 64<<10 {
-			return errors.New("cache error details exceed 64 KiB")
-		}
-		if err := validateCBOR(value.ErrorDetailsCBOR); err != nil {
-			return err
-		}
-	}
-	if value.ErrorCode != "" {
-		var err error
-		encoded, err = encodeException(value.ErrorCode, value.ErrorDetailsCBOR)
-		if err != nil {
-			return err
-		}
-	} else {
-		var tag cbor.RawTag
-		if err := cbor.Unmarshal(encoded, &tag); err == nil && tag.Number == exceptionTag {
-			return errors.New("task output uses reserved cache exception tag")
-		}
-	}
+	encoded := value.ResultCBOR
 	if err := validateCBOR(encoded); err != nil {
 		return err
 	}

@@ -18,6 +18,33 @@ export type Value =
   | Value[]
   | { [key: string]: Value };
 
+export function failureMessage(bytes: Uint8Array): string {
+  if (!bytes.length) return "";
+  const value: unknown = decodeCbor(bytes, {
+    tags: {
+      2: bigIntDecoder,
+      3: bigNegIntDecoder,
+      32: Tagged.decoder(32),
+      30001: Tagged.decoder(30001),
+    },
+  });
+  if (!(value instanceof Tagged) || value.tag !== 30001) return "";
+  const fields: unknown = value.value;
+  if (
+    fields === null ||
+    typeof fields !== "object" ||
+    !("cacheable" in fields) ||
+    typeof fields.cacheable !== "boolean" ||
+    !("message" in fields) ||
+    typeof fields.message !== "string" ||
+    !fields.message ||
+    !("details" in fields)
+  ) {
+    throw new Error("invalid result failure");
+  }
+  return fields.message;
+}
+
 export function encode(value: Value): Uint8Array {
   return encodeCbor(value, {
     typeEncoders: {

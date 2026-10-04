@@ -43,7 +43,7 @@ async def test_synchronous_handler_does_not_block_other_calls() -> None:
     response = await asyncio.wait_for(
         service.execute(ExecuteRequest(invocation_id="release", input=b"ok"), ctx), timeout=1
     )
-    assert response.output == b"ok"
+    assert response.result_cbor == b"ok"
     await asyncio.wait_for(slow, timeout=1)
 
 
@@ -59,7 +59,7 @@ async def test_task_context_uses_python_retry_mode() -> None:
     service.api_client = TaskAPIClient(cast("_Host", object()))
     ctx = cast("RequestContext[ExecuteRequest, ExecuteResponse]", None)
     response = await service.execute(ExecuteRequest(invocation_id="test"), ctx)
-    assert response.output == b"idempotent"
+    assert response.result_cbor == b"idempotent"
 
 
 @pytest.mark.asyncio
@@ -74,8 +74,8 @@ async def test_cacheable_error_is_typed_on_task_protocol() -> None:
     service.api_client = TaskAPIClient(cast("_Host", object()))
     ctx = cast("RequestContext[ExecuteRequest, ExecuteResponse]", None)
     response = await service.execute(ExecuteRequest(invocation_id="error"), ctx)
-    assert response.error_code == "invalid_input"
-    assert cbor2.loads(response.error_details) == {"field": "value"}
+    assert cbor2.loads(response.result_cbor).value["message"] == "invalid_input"
+    assert cbor2.loads(response.result_cbor).value["details"] == {"field": "value"}
 
 
 @pytest.mark.asyncio

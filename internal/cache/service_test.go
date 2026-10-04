@@ -4,13 +4,13 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
-	"encoding/hex"
 	"errors"
 	"os"
 	"testing"
 	"time"
 
 	"github.com/brian14708/lutra/db/migrations"
+	"github.com/brian14708/lutra/internal/result"
 	"github.com/fxamacker/cbor/v2"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -18,26 +18,19 @@ import (
 )
 
 func TestExceptionTagEncodings(t *testing.T) {
-	// These all encode tag 60000, including valid noncanonical widths.
-	for _, encoded := range []string{
-		"d9ea6082666661696c6564f6",
-		"da0000ea6082666661696c6564f6",
-		"db000000000000ea6082666661696c6564f6",
-	} {
-		t.Run(encoded, func(t *testing.T) {
-			data, err := hex.DecodeString(encoded)
-			if err != nil {
-				t.Fatal(err)
-			}
-			message, details, tagged, err := decodeException(data)
-			if err != nil || !tagged || message != "failed" || !bytes.Equal(details, []byte{0xf6}) {
-				t.Fatalf("decode: message=%q details=%x tagged=%v err=%v", message, details, tagged, err)
-			}
-			var lease Lease
-			if err := lease.Complete(t.Context(), Result{OutputCBOR: data}); err == nil || err.Error() != "task output uses reserved cache exception tag" {
-				t.Fatalf("reserved task output: %v", err)
-			}
-		})
+	encoded, err := result.EncodeFailure(result.Failure{Cacheable: true, Message: "failed"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := validateCBOR(encoded); err != nil {
+		t.Fatal(err)
+	}
+	encoded, err = result.EncodeFailure(result.Failure{Message: "failed"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := validateCBOR(encoded); err == nil {
+		t.Fatal("cached runtime failure")
 	}
 }
 
@@ -47,15 +40,15 @@ func TestDecodeExceptionDistinguishesTaskOutput(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if _, _, tagged, err := decodeException(encoded); tagged || err != nil {
+		if _, tagged, err := result.DecodeFailure(encoded); tagged || err != nil {
 			t.Fatalf("ordinary output %v: tagged=%v err=%v", value, tagged, err)
 		}
 	}
-	encoded, err := cbor.Marshal(cbor.Tag{Number: exceptionTag, Content: "invalid envelope"})
+	encoded, err := cbor.Marshal(cbor.Tag{Number: result.ErrorTag, Content: "invalid envelope"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, _, tagged, err := decodeException(encoded); !tagged || err == nil {
+	if _, tagged, err := result.DecodeFailure(encoded); !tagged || err == nil {
 		t.Fatalf("invalid exception: tagged=%v err=%v", tagged, err)
 	}
 }
@@ -79,9 +72,9 @@ func TestTaskCacheLifecycle(t *testing.T) {
 	}
 	service := New(pool)
 	for _, want := range []Result{
-		{OutputCBOR: []byte{0x01}},
-		{OutputCBOR: []byte{0xf6}},
-		{ErrorCode: "task.failed", ErrorDetailsCBOR: []byte{0xa0}},
+		{ResultCBOR: []byte{0x01}},
+		{ResultCBOR: []byte{0xf6}},
+		{ResultCBOR: []byte{0x01}},
 	} {
 		key := sha256.Sum256([]byte(uuid.NewString()))
 		_, lease, err := service.Acquire(ctx, key)
@@ -108,7 +101,7 @@ func TestTaskCacheLifecycle(t *testing.T) {
 			t.Fatal(err)
 		}
 		got, next, err := service.Acquire(ctx, key)
-		if err != nil || next != nil || got.ErrorCode != want.ErrorCode || !bytes.Equal(got.OutputCBOR, want.OutputCBOR) || !bytes.Equal(got.ErrorDetailsCBOR, want.ErrorDetailsCBOR) {
+		if err != nil || next != nil || !bytes.Equal(got.ResultCBOR, want.ResultCBOR) {
 			t.Fatalf("cache hit: got=%+v lease=%v err=%v; want=%+v", got, next, err, want)
 		}
 		if err := lease.Complete(ctx, want); !errors.Is(err, ErrLeaseLost) {
@@ -130,7 +123,7 @@ func TestTaskCacheLifecycle(t *testing.T) {
 		t.Fatalf("replace expired claim: lease=%v err=%v", replacement, err)
 	}
 	defer func() { _ = replacement.Release(context.Background()) }()
-	if err := owner.Complete(ctx, Result{OutputCBOR: []byte{0x01}}); !errors.Is(err, ErrLeaseLost) {
+	if err := owner.Complete(ctx, Result{ResultCBOR: []byte{0x01}}); !errors.Is(err, ErrLeaseLost) {
 		t.Fatalf("expired owner published result: %v", err)
 	}
 	if err := replacement.Release(ctx); err != nil {

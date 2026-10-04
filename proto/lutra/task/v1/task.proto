@@ -24,7 +24,5 @@ message ExecuteRequest {
 
 message ExecuteResponse {
   string content_type = 1;
-  bytes output = 2;
-  string error_code = 3;
-  bytes error_details = 4;
+  bytes result_cbor = 2;
 }

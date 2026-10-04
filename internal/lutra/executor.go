@@ -15,8 +15,8 @@ import (
 	taskv1 "github.com/brian14708/lutra/gen/lutra/task/v1"
 	lutrav1 "github.com/brian14708/lutra/gen/lutra/v1"
 	"github.com/brian14708/lutra/internal/blob"
+	"github.com/brian14708/lutra/internal/result"
 	"github.com/brian14708/lutra/internal/taskstdio"
-	"github.com/fxamacker/cbor/v2"
 )
 
 // EnvironmentExecution is the executor-neutral request. Resolved artifact
@@ -50,11 +50,7 @@ func (e *CacheableError) Error() string { return e.Code }
 func (*CacheableError) Cacheable() bool { return true }
 
 func (e *CacheableError) output() ([]byte, error) {
-	mode, err := cbor.CanonicalEncOptions().EncMode()
-	if err != nil {
-		return nil, err
-	}
-	return mode.Marshal([]any{"lutra.cacheable-error.v1", e.Code, cbor.RawMessage(e.Details)})
+	return result.EncodeFailure(result.Failure{Cacheable: true, Message: e.Code, Details: e.Details})
 }
 
 // Image references an artifact resolved by the selected runner.
@@ -80,7 +76,7 @@ type Job interface {
 
 func executeProcess(ctx context.Context, process *taskstdio.Process, req *EnvironmentExecution) ([]byte, error) {
 	filter := req.Config.filter()
-	result, callErr := process.Client().Execute(ctx, connect.NewRequest(&taskv1.ExecuteRequest{InvocationId: req.ActionID, RunId: req.RunID, ActionId: req.ActionID, Attempt: req.Attempt, ContentType: "application/cbor", Input: req.Input}))
+	response, callErr := process.Client().Execute(ctx, connect.NewRequest(&taskv1.ExecuteRequest{InvocationId: req.ActionID, RunId: req.RunID, ActionId: req.ActionID, Attempt: req.Attempt, ContentType: "application/cbor", Input: req.Input}))
 	closeErr := process.Close()
 	if err := errors.Join(callErr, closeErr); err != nil {
 		if stderr := strings.TrimSpace(process.StderrTail()); stderr != "" {
@@ -88,34 +84,37 @@ func executeProcess(ctx context.Context, process *taskstdio.Process, req *Enviro
 		}
 		return nil, errors.New(filter.String(err.Error()))
 	}
-	if result.Msg.GetErrorCode() != "" {
-		if result.Msg.GetErrorCode() == "config.missing" || result.Msg.GetErrorCode() == "config.invalid" {
-			return nil, &ConfigError{Code: result.Msg.GetErrorCode()}
-		}
-		if !cacheErrorCodePattern.MatchString(result.Msg.GetErrorCode()) || len(result.Msg.GetErrorDetails()) > 64<<10 || len(result.Msg.GetOutput()) != 0 {
-			return nil, errors.New("task returned invalid cacheable error")
-		}
-		var details any
-		if err := cbor.Unmarshal(result.Msg.GetErrorDetails(), &details); err != nil {
-			return nil, errors.New("task returned invalid cacheable error details")
-		}
-		failure := &CacheableError{Code: result.Msg.GetErrorCode(), Details: result.Msg.GetErrorDetails()}
-		failure.Code = filter.String(failure.Code)
-		detailsBytes, err := filter.CBOR(failure.Details)
+	raw := response.Msg.GetResultCbor()
+	failure, tagged, err := result.DecodeFailure(raw)
+	if err != nil {
+		return nil, err
+	}
+	if tagged {
+		message := filter.String(failure.Message)
+		details, err := filter.CBOR(failure.Details)
 		if err != nil {
 			return nil, &ConfigError{Code: "config.invalid"}
 		}
-		failure.Details = detailsBytes
-		output, err := failure.output()
-		if err != nil {
-			return nil, err
+		if failure.Cacheable {
+			if !cacheErrorCodePattern.MatchString(message) || len(details) > 64<<10 {
+				return nil, errors.New("task returned invalid cacheable error")
+			}
+			failure := &CacheableError{Code: message, Details: details}
+			encoded, err := failure.output()
+			if err != nil {
+				return nil, err
+			}
+			return encoded, failure
 		}
-		return output, failure
+		if message == "config.missing" || message == "config.invalid" {
+			return nil, &ConfigError{Code: message}
+		}
+		return nil, errors.New(message)
 	}
-	if result.Msg.GetContentType() != "application/cbor" {
+	if response.Msg.GetContentType() != "application/cbor" {
 		return nil, errors.New("task returned unsupported content type")
 	}
-	return filter.CBOR(result.Msg.GetOutput())
+	return filter.CBOR(raw)
 }
 
 func unpackSource(ctx context.Context, openBundle func(context.Context, []byte) (io.ReadCloser, error), uri, dir string) error {

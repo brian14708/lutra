@@ -18,8 +18,7 @@ const StatusStream = "__run_status"
 type StatusEvent struct {
 	Type       string `cbor:"type"`
 	Status     string `cbor:"status"`
-	OutputCBOR []byte `cbor:"output_cbor"`
-	Error      string `cbor:"error"`
+	ResultCBOR []byte `cbor:"result_cbor"`
 	UpdatedAt  string `cbor:"updated_at"`
 }
 
@@ -32,7 +31,7 @@ func (s Service) DecodeStatus(ctx context.Context, value []byte) (StatusEvent, e
 	if err := cbor.Unmarshal(value, &event); err != nil {
 		return event, err
 	}
-	if event.Type != "run.status.v1" {
+	if event.Type != "run.status.v2" {
 		return event, errors.New("unknown run status event type or version")
 	}
 	switch event.Status {
@@ -56,13 +55,13 @@ func (s Service) AppendStatus(ctx context.Context, tx pgx.Tx, id uuid.UUID) erro
 	if err != nil {
 		return err
 	}
-	output := row.OutputCbor
+	output := row.ResultCbor
 	if output == nil {
 		output = []byte{}
 	}
 	value, err := mode.Marshal(StatusEvent{
-		Type: "run.status.v1", Status: string(row.Status),
-		OutputCBOR: output, Error: row.Error, UpdatedAt: row.UpdatedAt.Time.UTC().Format(time.RFC3339Nano),
+		Type: "run.status.v2", Status: string(row.Status),
+		ResultCBOR: output, UpdatedAt: row.UpdatedAt.Time.UTC().Format(time.RFC3339Nano),
 	})
 	if err != nil {
 		return err

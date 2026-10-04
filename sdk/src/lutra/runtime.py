@@ -16,17 +16,16 @@ from lutra._gen.lutra.v1.lutra_pb import (
     EnvironmentIdentifier,
     GetTaskActionRequest,
 )
+from lutra._result import load_result
 from lutra.client import _require_action
 from lutra.serve import StdioTransport, TaskAPIClient
-from lutra.task import CacheableError, ConfigError, normalize_retry
-from lutra.value import loads
+from lutra.task import normalize_retry
 
 if TYPE_CHECKING:
     from lutra.task import Invocation
 
 R = TypeVar("R")
 _MAX_CHILD_KEY_BYTES = 200
-_CACHEABLE_FAILURE_FIELDS = 3
 
 
 @dataclass
@@ -57,7 +56,6 @@ class ChildHandle(Generic[R]):
             The decoded result.
 
         Raises:
-            CacheableError: If the child returns a deterministic typed failure.
             RuntimeError: If the server omits the action or the child fails.
 
         """
@@ -69,19 +67,12 @@ class ChildHandle(Generic[R]):
                 message = "server returned no task action"
                 raise RuntimeError(message)
             if state.status == "succeeded":
-                return cast("R", await loads(state.output_cbor, self.api_client.resolve_blob))
+                return cast("R", await load_result(state.result_cbor, self.api_client.resolve_blob))
             if state.status in {"failed", "canceled"}:
-                if state.error in {"config.invalid", "config.missing"}:
-                    raise ConfigError(state.error)
-                if state.status == "failed" and state.output_cbor:
-                    failure = await loads(state.output_cbor, self.api_client.resolve_blob)
-                    if (
-                        isinstance(failure, list)
-                        and len(failure) == _CACHEABLE_FAILURE_FIELDS
-                        and failure[0] == "lutra.cacheable-error.v1"
-                    ):
-                        raise CacheableError(failure[1], failure[2])
-                raise RuntimeError(state.error or f"child {state.status}")
+                if state.result_cbor:
+                    await load_result(state.result_cbor, self.api_client.resolve_blob)
+                message = f"child {state.status}"
+                raise RuntimeError(message)
             await asyncio.sleep(0)
 
 

@@ -168,7 +168,7 @@ message TaskActionStatus {
   uint32 entrypoint_id = 3;
   string status = 4;
   int32 attempt = 5;
-  string error = 6;
+  bytes result_cbor = 6;
   string updated_at = 7;
   int32 max_attempts = 8;
   bool cache_hit = 9;
@@ -178,8 +178,7 @@ message Run {
   string root_action_id = 2;
   EnvironmentIdentifier environment = 3;
   string status = 4;
-  bytes output_cbor = 5;
-  string error = 6;
+  bytes result_cbor = 5;
   string created_at = 7;
   string updated_at = 8;
   uint32 entrypoint_id = 9;
@@ -191,9 +190,8 @@ message TaskAction {
   string caller_action_id = 3;
   EnvironmentIdentifier environment = 4;
   ActionSpec action_spec = 5;
-  bytes output_cbor = 6;
+  bytes result_cbor = 6;
   string status = 7;
-  string error = 8;
   int32 attempts = 9;
   string created_at = 10;
   string updated_at = 11;

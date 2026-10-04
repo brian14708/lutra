@@ -23,6 +23,7 @@ from lutra._gen.lutra.task.v1.task_pb import ExecuteRequest, ExecuteResponse
 from lutra._gen.lutra.v1.blob_connect import BlobServiceClient
 from lutra._gen.lutra.v1.blob_pb import GetDownloadRequest
 from lutra._gen.lutra.v1.log_connect import LogServiceClient
+from lutra._result import encode_failure
 from lutra.blob import BlobStore
 from lutra.checkpoint import CheckpointManager
 from lutra.task import CacheableError, ConfigError, RetryMode
@@ -105,12 +106,15 @@ class _TaskService:
             if inspect.isawaitable(result):
                 result = await result
             content_type, output = await normalize_result(result, self.api_client)
-            return ExecuteResponse(content_type=content_type, output=output)
+            return ExecuteResponse(content_type=content_type, result_cbor=output)
         except ConfigError as exc:
-            return ExecuteResponse(content_type="", error_code=exc.code)
+            return ExecuteResponse(
+                content_type="", result_cbor=encode_failure(cacheable=False, message=exc.code)
+            )
         except CacheableError as exc:
             return ExecuteResponse(
-                content_type="", error_code=exc.code, error_details=dumps(exc.details)
+                content_type="",
+                result_cbor=encode_failure(cacheable=True, message=exc.code, details=exc.details),
             )
         finally:
             task_context.reset(context_token)

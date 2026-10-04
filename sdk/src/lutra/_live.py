@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from typing import Any, Self
 
 from lutra._gen.lutra.v1.lutra_pb import Run, TaskActionStatus
+from lutra._result import failure_message
 from lutra.client import LogEvent, _id_suffix, _preview, _RunLogger, _task_display_status
 
 _RECENT_LOGS = 12
@@ -110,7 +111,7 @@ class LiveDisplay:
         if isinstance(event, Run):
             self.status = event.status
             self.root_action_id = event.root_action_id or self.root_action_id
-            self.error = event.error
+            self.error = failure_message(event.result_cbor)
             if event.environment is not None:
                 self.target = f"{event.environment.name}.{self.task_name}"
         elif isinstance(event, TaskActionStatus):
@@ -127,7 +128,7 @@ class LiveDisplay:
                 _task_display_status(event),
                 event.attempt,
                 event.max_attempts,
-                event.error,
+                failure_message(event.result_cbor),
             )
         else:
             if not isinstance(event.event, dict):
