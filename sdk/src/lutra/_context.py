@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from lutra.blob import BlobStore
     from lutra.checkpoint import CheckpointManager
     from lutra.task import RetryMode
 
@@ -20,6 +21,7 @@ class TaskContext:
     attempt: int
     retry: RetryMode
     checkpoint: CheckpointManager
+    blobs: BlobStore
 
 
 task_context: ContextVar[TaskContext] = ContextVar("lutra_task_context")

@@ -23,6 +23,7 @@ from lutra._gen.lutra.task.v1.task_pb import ExecuteRequest, ExecuteResponse
 from lutra._gen.lutra.v1.blob_connect import BlobServiceClient
 from lutra._gen.lutra.v1.blob_pb import GetDownloadRequest
 from lutra._gen.lutra.v1.log_connect import LogServiceClient
+from lutra.blob import BlobStore
 from lutra.checkpoint import CheckpointManager
 from lutra.task import CacheableError, RetryMode
 from lutra.value import BlobRef, _parse_blob_name, dumps
@@ -92,6 +93,7 @@ class _TaskService:
                 request.attempt,
                 self._retry,
                 CheckpointManager(self.api_client, request.run_id, request.action_id),
+                BlobStore(self.api_client.blob),
             )
         )
         args = (request.invocation_id, request.content_type, request.input, self.api_client)

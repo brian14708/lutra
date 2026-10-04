@@ -224,6 +224,7 @@ func (e *ContainerExecutor) Run(ctx context.Context, image *Image, req *Environm
 		}
 	}
 	args := []string{"create", "--rm", "--interactive", "--name", containerName, "--user", "0:0", "--cpus", strconv.FormatFloat(float64(imageSpec.GetResources().GetCpuMillis())/1000, 'f', 3, 64), "--memory", strconv.FormatUint(imageSpec.GetResources().GetMemoryBytes(), 10), "--memory-swap", strconv.FormatUint(imageSpec.GetResources().GetMemoryBytes(), 10), "--workdir", workdir, "--entrypoint", "/opt/lutra/bootstrap", "--platform", imagePlatform(imageSpec), "--label", "lutra.run=" + req.RunID, "--label", "lutra.action=" + req.ActionID}
+	args = append(args, "--network", "host")
 	// Cache uv downloads and isolated backend requirements within a namespace
 	// and dependency image. Containers and their virtualenvs remain fresh.
 	cacheKey := multihash.Sum([]byte(req.Environment.NamespaceId), []byte(tag))

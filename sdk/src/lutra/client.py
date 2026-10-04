@@ -34,6 +34,7 @@ from lutra._gen.lutra.v1.lutra_pb import (
 from lutra._gen.lutra.v1.settings_connect import SettingsServiceClient
 from lutra._gen.lutra.v1.settings_pb import ListNamespacesRequest
 from lutra._source_bundle import build_source_bundle
+from lutra.blob import BlobStore
 from lutra.task import CacheableError, normalize_retry
 from lutra.value import loads
 
@@ -480,6 +481,7 @@ class Client:
         """Create a client for the API URL and namespace."""
         self.rpc = LutraServiceClient(url, http_client=pyqwest.Client())
         self.blob = BlobServiceClient(url, http_client=pyqwest.Client())
+        self.blobs = BlobStore(self.blob)
         self.namespace = namespace
         self.settings = SettingsServiceClient(url, http_client=pyqwest.Client())
         self._namespace_id: str | None = None

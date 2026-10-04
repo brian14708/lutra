@@ -1,13 +1,14 @@
 """Task host execution behavior."""
 
 import asyncio
+import io
 import threading
 from typing import TYPE_CHECKING, cast
 from unittest.mock import AsyncMock
 
 import cbor2
 import pytest
-from lutra import CacheableError, RetryMode, _blob, current_context
+from lutra import BlobStore, CacheableError, RetryMode, _blob, current_context
 from lutra._gen.lutra.task.v1.task_pb import ExecuteRequest, ExecuteResponse
 from lutra.serve import TaskAPIClient, _host, normalize_result
 from lutra.serve._host import _Host, _TaskService
@@ -51,6 +52,7 @@ async def test_task_context_uses_python_retry_mode() -> None:
     def handler(
         _invocation_id: str, _content_type: str, _payload: bytes, _api_client: TaskAPIClient
     ) -> tuple[str, bytes]:
+        assert isinstance(current_context().blobs, BlobStore)
         return "text/plain", current_context().retry.value.encode()
 
     service = _TaskService(handler, RetryMode.IDEMPOTENT)
@@ -105,6 +107,6 @@ async def test_multipart_abort_on_missing_etag(monkeypatch: pytest.MonkeyPatch) 
     client.presign_part.return_value.headers = headers
     monkeypatch.setattr(_blob, "_put", AsyncMock(return_value=""))
     with pytest.raises(ValueError, match="ETag"):
-        await _blob._upload(client, "session", b"abcdef", 3, 2)  # ruff: ignore[private-member-access]
+        await _blob._upload(client, "session", io.BytesIO(b"abcdef"), 3, 2)  # ruff: ignore[private-member-access]
     client.abort_upload.assert_awaited_once()
     client.complete_upload.assert_not_awaited()

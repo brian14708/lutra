@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
+import io
 import tempfile
 from contextlib import suppress
 from pathlib import Path
@@ -21,6 +23,8 @@ from lutra._gen.lutra.v1.blob_pb import (
 from lutra.archive import create_archive, zstd_chunked_manifest_metadata
 
 if TYPE_CHECKING:
+    from typing import BinaryIO
+
     from lutra._gen.lutra.v1.blob_connect import BlobServiceClient
 
 
@@ -32,7 +36,7 @@ async def _put(url: str, headers: dict[str, str], contents: bytes) -> str:
 
 
 async def _upload(
-    client: BlobServiceClient, session_id: str, contents: bytes, part_size: int, part_count: int
+    client: BlobServiceClient, session_id: str, contents: BinaryIO, part_size: int, part_count: int
 ) -> str:
     async def send_parts() -> list[BlobPart]:
         parts = []
@@ -40,7 +44,10 @@ async def _upload(
             part = await client.presign_part(
                 PresignPartRequest(session_id=session_id, part_number=number)
             )
-            chunk = contents[(number - 1) * part_size : number * part_size]
+            if not 0 < part_size <= 8 << 20:
+                msg = "invalid upload part size"
+                raise ValueError(msg)
+            chunk = await asyncio.to_thread(contents.read, part_size)
             etag = await _put(part.url, part.headers, chunk)
             if part_count > 1:
                 if not etag:
@@ -79,7 +86,7 @@ async def upload_blob(
     if created.already_exists:
         return uri
     returned_uri = await _upload(
-        client, created.session_id, contents, created.part_size, created.part_count
+        client, created.session_id, io.BytesIO(contents), created.part_size, created.part_count
     )
     if returned_uri != uri:
         msg = "blob service returned a different URI"
@@ -104,9 +111,9 @@ async def upload_directory(client: BlobServiceClient, directory: Path, *, prefix
     with tempfile.TemporaryDirectory() as temporary:
         archive = Path(temporary) / "archive.tar.zst"
         create_archive(directory, archive, prefix=prefix)
-        return await upload_blob(
-            client,
-            archive.read_bytes(),
-            "application/x-tar+zstd",
-            metadata=zstd_chunked_manifest_metadata(archive),
+        from lutra.blob import BlobStore  # ruff: ignore[import-outside-top-level]
+
+        ref = await BlobStore(client).upload_file(
+            archive, "application/x-tar+zstd", metadata=zstd_chunked_manifest_metadata(archive)
         )
+        return ref.uri
