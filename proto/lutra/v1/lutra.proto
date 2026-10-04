@@ -23,12 +23,20 @@ message ImageSpec {
   // Base image used by providers that build from another image.
   string from_image = 2;
   Resources resources = 3;
-  map<string, string> env_vars = 4;
+  map<string, EnvValue> env = 4;
   string build_context_uri = 5;
   // Interpreter constraint from the uv lock.
   string python_requires = 8;
   // Linux container target (for example linux/arm64).
   string platform = 9;
+}
+
+message EnvValue {
+  oneof source {
+    string static_value = 1;
+    string setting_ref = 2;
+  }
+  optional bool sensitive = 3;
 }
 
 message Resources {
@@ -65,6 +73,14 @@ message Entrypoint {
   int32 max_attempts = 3;
   bool cache = 4;
   string task_version = 5;
+  repeated ConfigBinding config = 6;
+}
+
+message ConfigBinding {
+  string name = 1;
+  string setting_ref = 2;
+  optional bool required = 3;
+  optional bool sensitive = 4;
 }
 
 message Command {
@@ -76,6 +92,7 @@ message ActionSpec {
   int32 max_attempts = 2;
   bool cache = 3;
   string task_version = 4;
+  bytes config_overrides_cbor = 5;
 }
 
 message RegisterEnvironmentRequest {

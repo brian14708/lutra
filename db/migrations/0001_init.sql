@@ -32,6 +32,7 @@ CREATE TABLE lutra.settings (
     namespace_id uuid NOT NULL REFERENCES lutra.namespaces(id) ON DELETE CASCADE,
     path text NOT NULL CHECK (path ~ '^[a-z][a-z0-9_-]{0,63}(/[a-z][a-z0-9_-]{0,63})*$'),
     value bytea NOT NULL CHECK (length(value) BETWEEN 1 AND 65536),
+    sensitive boolean NOT NULL DEFAULT false,
     updated_at timestamptz NOT NULL DEFAULT now(),
     PRIMARY KEY (namespace_id, path)
 );
@@ -75,6 +76,14 @@ CREATE TABLE lutra.runs (
     created_at timestamptz NOT NULL DEFAULT now()
 );
 CREATE UNIQUE INDEX runs_idempotency_idx ON lutra.runs (namespace_id, root_idempotency_key) WHERE root_idempotency_key IS NOT NULL;
+
+CREATE TABLE lutra.run_settings (
+    run_id uuid NOT NULL REFERENCES lutra.runs(id) ON DELETE CASCADE,
+    path text NOT NULL CHECK (length(path) <= 512 AND path ~ '^[a-z][a-z0-9_-]{0,63}(/[a-z][a-z0-9_-]{0,63})*$'),
+    value_cbor bytea CHECK (length(value_cbor) BETWEEN 1 AND 65536),
+    sensitive boolean NOT NULL,
+    PRIMARY KEY (run_id, path)
+);
 
 CREATE TABLE lutra.task_actions (
     id uuid PRIMARY KEY,
@@ -141,6 +150,7 @@ DROP TABLE IF EXISTS lutra.run_log_appends;
 DROP TABLE IF EXISTS lutra.run_log_streams;
 ALTER TABLE IF EXISTS lutra.runs DROP CONSTRAINT IF EXISTS runs_root_action_fk;
 DROP TABLE IF EXISTS lutra.task_actions;
+DROP TABLE IF EXISTS lutra.run_settings;
 DROP TABLE IF EXISTS lutra.runs;
 DROP TABLE IF EXISTS lutra.cache_entries;
 DROP TABLE IF EXISTS lutra.task_environments;

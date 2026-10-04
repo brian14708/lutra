@@ -2,6 +2,7 @@ package lutra
 
 import (
 	lutrav1 "github.com/brian14708/lutra/gen/lutra/v1"
+	"github.com/fxamacker/cbor/v2"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -27,5 +28,17 @@ func resolvedActionSpec(entry *lutrav1.Entrypoint, requested *lutrav1.ActionSpec
 	if err != nil {
 		return nil, err
 	}
-	return proto.Marshal(&lutrav1.ActionSpec{InputCbor: requested.GetInputCbor(), MaxAttempts: attempts, Cache: requested.GetCache(), TaskVersion: requested.GetTaskVersion()})
+	overrides, err := configOverrides(requested.GetConfigOverridesCbor())
+	if err != nil {
+		return nil, err
+	}
+	overrideBytes := []byte(nil)
+	if len(overrides) != 0 {
+		mode, _ := cbor.CanonicalEncOptions().EncMode()
+		overrideBytes, err = mode.Marshal(overrides)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return proto.Marshal(&lutrav1.ActionSpec{InputCbor: requested.GetInputCbor(), MaxAttempts: attempts, Cache: requested.GetCache(), TaskVersion: requested.GetTaskVersion(), ConfigOverridesCbor: overrideBytes})
 }

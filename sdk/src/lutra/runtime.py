@@ -18,7 +18,7 @@ from lutra._gen.lutra.v1.lutra_pb import (
 )
 from lutra.client import _require_action
 from lutra.serve import StdioTransport, TaskAPIClient
-from lutra.task import CacheableError, normalize_retry
+from lutra.task import CacheableError, ConfigError, normalize_retry
 from lutra.value import loads
 
 if TYPE_CHECKING:
@@ -71,6 +71,8 @@ class ChildHandle(Generic[R]):
             if state.status == "succeeded":
                 return cast("R", await loads(state.output_cbor, self.api_client.resolve_blob))
             if state.status in {"failed", "canceled"}:
+                if state.error in {"config.invalid", "config.missing"}:
+                    raise ConfigError(state.error)
                 if state.status == "failed" and state.output_cbor:
                     failure = await loads(state.output_cbor, self.api_client.resolve_blob)
                     if (

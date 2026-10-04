@@ -21,6 +21,7 @@ function Home() {
   >([]);
   const [settingPath, setSettingPath] = useState("");
   const [settingValue, setSettingValue] = useState("{}");
+  const [settingSensitive, setSettingSensitive] = useState(false);
   const [settingsError, setSettingsError] = useState<string | null>(null);
   const [runId, setRunId] = useState("");
 
@@ -53,7 +54,13 @@ function Home() {
     setSettingsError(null);
     try {
       const value = encodeCbor(JSON.parse(settingValue));
-      await settingsRpc.upsertSetting({ namespaceId, path: settingPath, valueCbor: value });
+      await settingsRpc.upsertSetting({
+        namespaceId,
+        path: settingPath,
+        valueCbor: value,
+        sensitive: settingSensitive,
+      });
+      if (settingSensitive) setSettingValue("");
       const response = await settingsRpc.listSettings({ namespaceId, paths: [] });
       setSettings(response.settings);
     } catch (cause) {
@@ -111,9 +118,18 @@ function Home() {
             <input
               required
               value={settingValue}
+              type={settingSensitive ? "password" : "text"}
               onChange={(event) => setSettingValue(event.target.value)}
               className="mt-1 block w-full rounded-md border border-slate-300 p-2 font-mono text-[13px] font-normal"
             />
+          </label>
+          <label className="flex items-center gap-2 text-[13px] font-semibold">
+            <input
+              type="checkbox"
+              checked={settingSensitive}
+              onChange={(event) => setSettingSensitive(event.target.checked)}
+            />
+            Sensitive
           </label>
           <Button
             type="submit"
@@ -136,7 +152,9 @@ function Home() {
             <div key={setting.path} className="grid gap-2 py-3 md:grid-cols-[1fr_2fr]">
               <span className="font-mono text-[13px] font-semibold">{setting.path}</span>
               <code className="break-all text-[13px] text-slate-600">
-                {JSON.stringify(decodeCbor(setting.valueCbor))}
+                {setting.sensitive
+                  ? "******** (sensitive)"
+                  : JSON.stringify(decodeCbor(setting.valueCbor))}
               </code>
             </div>
           ))}

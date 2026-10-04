@@ -142,6 +142,9 @@ func (s Service) CreateRun(ctx context.Context, req *connect.Request[lutrav1.Cre
 		if err := s.Logs.AppendStatus(ctx, tx, runID); err != nil {
 			return nil, err
 		}
+		if err := snapshotRunConfig(ctx, q, inserted, environment, actionSpec.GetConfigOverridesCbor()); err != nil {
+			return nil, err
+		}
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return nil, err
@@ -154,6 +157,9 @@ func (s Service) CreateRun(ctx context.Context, req *connect.Request[lutrav1.Cre
 }
 
 func (s Service) CreateTaskAction(ctx context.Context, req *connect.Request[lutrav1.CreateTaskActionRequest]) (*connect.Response[lutrav1.CreateTaskActionResponse], error) {
+	if len(req.Msg.GetActionSpec().GetConfigOverridesCbor()) != 0 {
+		return nil, configFailure("config.invalid")
+	}
 	active, ok := taskContextFromContext(ctx)
 	if !ok {
 		return nil, connect.NewError(connect.CodePermissionDenied, errors.New("task actions are only available inside a task"))
@@ -316,6 +322,7 @@ func actionFromRow(row actionRow) (*lutrav1.TaskAction, error) {
 	if err := proto.Unmarshal(row.ActionSpec, &spec); err != nil {
 		return nil, err
 	}
+	spec.ConfigOverridesCbor = nil
 	action := &lutrav1.TaskAction{Id: row.ID.String(), RunId: row.RunID.String(), Environment: environmentIdentifier(row.NamespaceID, row.EnvironmentName, row.Version), EntrypointId: uint32(row.EntrypointID), ActionSpec: &spec, OutputCbor: row.OutputCbor, Status: row.Status, Error: row.Error, Attempts: row.Attempts, CreatedAt: formatTime(row.CreatedAt), UpdatedAt: formatTime(row.UpdatedAt)}
 	if row.CallerActionID != nil {
 		action.CallerActionId = row.CallerActionID.String()

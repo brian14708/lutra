@@ -61,6 +61,33 @@ class RetryMode(StrEnum):
     IDEMPOTENT = "idempotent"
 
 
+class ConfigError(Exception):
+    """A non-retryable configuration failure."""
+
+    def __init__(self, code: str = "config.invalid") -> None:
+        """Create a failure with no value diagnostics."""
+        super().__init__(code)
+        self.code = code
+
+
+@dataclass(frozen=True)
+class SettingRef:
+    """Reference a namespace setting."""
+
+    path: str
+    sensitive: bool | None = None
+
+
+@dataclass(frozen=True)
+class ConfigBinding:
+    """Expose a setting through the task context."""
+
+    name: str
+    setting_ref: str
+    required: bool = True
+    sensitive: bool | None = None
+
+
 def normalize_retry(retry: RetryMode | str, max_attempts: int | None) -> tuple[RetryMode, int]:
     """Normalize a declaration or invocation policy.
 
@@ -155,7 +182,7 @@ class TaskEnvironment:
     name: str
     image: TaskImage = field(default_factory=TaskImage)
     resources: Resources = field(default_factory=Resources)
-    env_vars: Mapping[str, str] = field(default_factory=dict)
+    env: Mapping[str, str | SettingRef] = field(default_factory=dict)
     dependencies: tuple[TaskEnvironment, ...] = ()
     dependency_groups: tuple[str, ...] | None = None
     extras: tuple[str, ...] | None = None
@@ -168,7 +195,7 @@ class TaskEnvironment:
             ValueError: If a dependency selector is invalid.
 
         """
-        object.__setattr__(self, "env_vars", MappingProxyType(dict(self.env_vars)))
+        object.__setattr__(self, "env", MappingProxyType(dict(self.env)))
         object.__setattr__(self, "dependencies", tuple(self.dependencies))
         for field_name in ("dependency_groups", "extras"):
             value = getattr(self, field_name)
@@ -202,6 +229,7 @@ class TaskEnvironment:
         max_attempts: int | None = None,
         cache: bool = False,
         version: str | None = None,
+        config: tuple[ConfigBinding, ...] = (),
     ) -> Task[P, R_co]: ...
 
     @overload
@@ -213,9 +241,10 @@ class TaskEnvironment:
         max_attempts: int | None = None,
         cache: bool = False,
         version: str | None = None,
+        config: tuple[ConfigBinding, ...] = (),
     ) -> Callable[[Callable[P, R_co | Awaitable[R_co]]], Task[P, R_co]]: ...
 
-    def task(
+    def task(  # ruff: ignore[too-many-arguments]
         self,
         function: Callable[P, R_co | Awaitable[R_co]] | None = None,
         *,
@@ -223,6 +252,7 @@ class TaskEnvironment:
         max_attempts: int | None = None,
         cache: bool = False,
         version: str | None = None,
+        config: tuple[ConfigBinding, ...] = (),
     ) -> Task[P, R_co] | Callable[[Callable[P, R_co | Awaitable[R_co]]], Task[P, R_co]]:
         """Declare a module-level task.
 
@@ -233,7 +263,13 @@ class TaskEnvironment:
 
         def declare(target: Callable[P, R_co | Awaitable[R_co]]) -> Task[P, R_co]:
             wrapped = Task(
-                self, target, retry=retry, max_attempts=max_attempts, cache=cache, version=version
+                self,
+                target,
+                retry=retry,
+                max_attempts=max_attempts,
+                cache=cache,
+                version=version,
+                config=config,
             )
             self._tasks.append(wrapped)
             return wrapped
@@ -277,6 +313,7 @@ class Task(Generic[P, R_co]):
         max_attempts: int | None = None,
         cache: bool = False,
         version: str | None = None,
+        config: tuple[ConfigBinding, ...] = (),
     ) -> None:
         """Wrap a module-level function.
 
@@ -288,6 +325,7 @@ class Task(Generic[P, R_co]):
             msg = "tasks must be defined at module scope"
             raise ValueError(msg)
         self.environment = environment
+        self.config = tuple(config)
         self.retry, self.max_attempts = normalize_retry(retry, max_attempts)
         if type(cache) is not bool:
             message = "cache must be a boolean"

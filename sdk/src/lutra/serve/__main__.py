@@ -4,25 +4,62 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
+import binascii
 import importlib
 import inspect
 import json
 import os
+import re
 import runpy
+from dataclasses import replace
 from pathlib import Path
+from types import MappingProxyType
 from typing import TYPE_CHECKING
 
+from lutra._context import current_context, task_context
 from lutra._gen.lutra.v1.lutra_pb import EnvironmentIdentifier
 from lutra.runtime import RunContext, run_context
 from lutra.serve import TaskAPIClient, serve
 from lutra.serve._host import _redirect_user_stdout
-from lutra.task import RetryMode, Task
+from lutra.task import ConfigError, RetryMode, Task
 from lutra.value import dumps, loads
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
 
 _ARGUMENT_PARTS = 2
+_MAX_CONFIG_BYTES = 64 << 10
+
+
+async def _load_config() -> dict[str, object]:
+    try:
+        payload = base64.b64decode(os.environ.get("LUTRA_CONFIG_CBOR", "oA=="), validate=True)
+        value = await loads(payload)
+    except (ValueError, TypeError, binascii.Error):
+        raise ConfigError from None
+    if len(payload) > _MAX_CONFIG_BYTES or not isinstance(value, dict) or dumps(value) != payload:
+        raise ConfigError
+    config: dict[str, object] = {}
+    for name, entry in value.items():
+        if not isinstance(name, str) or re.fullmatch(r"[A-Za-z_][A-Za-z_0-9]*", name) is None:
+            raise ConfigError
+        _validate_binding(entry)
+        if entry["present"]:
+            config[name] = entry["value"]
+    return config
+
+
+def _validate_binding(entry: object) -> None:
+    if not isinstance(entry, dict) or set(entry) != {"present", "value", "sensitive", "required"}:
+        raise ConfigError
+    if any(type(entry[key]) is not bool for key in ("present", "sensitive", "required")):
+        raise ConfigError
+    if entry["required"] and not entry["present"]:
+        code = "config.missing"
+        raise ConfigError(code)
+    if not entry["present"] and entry["value"] is not None:
+        raise ConfigError
 
 
 def _load_environments() -> dict[str, EnvironmentIdentifier]:
@@ -72,12 +109,20 @@ def _load_entrypoint(entrypoint: str) -> Task[..., object]:
 def _bundled_handler(
     entrypoint: str,
 ) -> tuple[Callable[..., Awaitable[tuple[str, bytes]]], RetryMode]:
-    target = _load_entrypoint(entrypoint)
     environments = _load_environments()
 
     async def handler(
         run_id: str, content_type: str, payload: bytes, api_client: TaskAPIClient
     ) -> tuple[str, bytes]:
+        config = await _load_config()
+        task_context.set(replace(current_context(), config=MappingProxyType(config)))
+        target = _load_entrypoint(entrypoint)
+        if {binding.name for binding in target.config} != set(config):
+            optional = {binding.name for binding in target.config if not binding.required}
+            required = {binding.name for binding in target.config if binding.required}
+            if not required <= set(config) or not set(config) <= required | optional:
+                raise ConfigError
+        task_context.set(replace(current_context(), retry=target.retry))
         if content_type != "application/cbor":
             message = "expected CBOR input"
             raise ValueError(message)
@@ -106,7 +151,7 @@ def _bundled_handler(
         finally:
             run_context.reset(token)
 
-    return handler, target.retry
+    return handler, RetryMode.NONE
 
 
 def main() -> None:

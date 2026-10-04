@@ -168,9 +168,14 @@ func containerTaskEnv(req *EnvironmentExecution) ([]string, error) {
 		"LUTRA_ATTEMPT": strconv.FormatInt(int64(req.Attempt), 10), "LUTRA_TASK_RUN_ID": req.RunID,
 		"LUTRA_TASK_ACTION_ID": req.ActionID, "LUTRA_BUNDLE_ROOT": "/workspace",
 	}
-	for key, value := range req.Spec.GetImage().GetEnvVars() {
+	resolved, payload, err := executionConfig(req)
+	if err != nil {
+		return nil, err
+	}
+	for key, value := range resolved {
 		values[key] = value
 	}
+	values["LUTRA_CONFIG_CBOR"] = payload
 	keys := make([]string, 0, len(values))
 	for key := range values {
 		keys = append(keys, key)

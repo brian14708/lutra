@@ -114,13 +114,25 @@ func normalizeEnvironment(spec *lutrav1.EnvironmentSpec) (*environmentSpec, erro
 	if cpu > 1_000_000 || memory > 1<<50 {
 		return nil, invalid("resources exceed limits")
 	}
-	variables := make(map[string]string, len(image.GetEnvVars()))
+	variables := make(map[string]*lutrav1.EnvValue, len(image.GetEnv()))
 	var variableSize int
-	for key, value := range image.GetEnvVars() {
-		if !environmentVariablePattern.MatchString(key) || strings.ContainsRune(value, 0) || strings.HasPrefix(key, "LUTRA_") || strings.HasPrefix(key, "UV_") || key == "PATH" || key == "HOME" || key == "PYTHONPATH" {
+	for key, value := range image.GetEnv() {
+		if !environmentVariablePattern.MatchString(key) || strings.ContainsRune(value.GetStaticValue(), 0) || strings.HasPrefix(key, "LUTRA_") || strings.HasPrefix(key, "UV_") || key == "PATH" || key == "HOME" || key == "PYTHONPATH" {
 			return nil, invalid("invalid or reserved environment variable")
 		}
-		variableSize += len(key) + len(value)
+		switch value.GetSource().(type) {
+		case *lutrav1.EnvValue_StaticValue:
+			if value.Sensitive != nil {
+				return nil, invalid("static environment values cannot declare sensitivity")
+			}
+		case *lutrav1.EnvValue_SettingRef:
+			if err := validatePath(value.GetSettingRef()); err != nil {
+				return nil, err
+			}
+		default:
+			return nil, invalid("environment value source is required")
+		}
+		variableSize += len(key) + len(value.GetStaticValue()) + len(value.GetSettingRef())
 		variables[key] = value
 	}
 	if len(variables) > 128 || variableSize > 64<<10 || len(spec.Dependencies) > 128 {
@@ -161,7 +173,7 @@ func normalizeEnvironment(spec *lutrav1.EnvironmentSpec) (*environmentSpec, erro
 		Image: &lutrav1.ImageSpec{
 			Name: image.Name, FromImage: image.FromImage,
 			Resources: &lutrav1.Resources{CpuMillis: cpu, MemoryBytes: memory},
-			EnvVars:   variables, BuildContextUri: image.BuildContextUri, PythonRequires: image.PythonRequires, Platform: imagePlatform(image),
+			Env:       variables, BuildContextUri: image.BuildContextUri, PythonRequires: image.PythonRequires, Platform: imagePlatform(image),
 		},
 		Dependencies:   deps,
 		PrepareCommand: spec.PrepareCommand,
@@ -183,6 +195,19 @@ func validateEntrypoints(entries []*lutrav1.Entrypoint) error {
 	for _, entry := range entries {
 		if entry == nil {
 			return invalid("invalid entrypoint")
+		}
+		if len(entry.Config) > 128 {
+			return invalid("configuration declaration exceeds limits")
+		}
+		names := map[string]bool{}
+		for _, binding := range entry.Config {
+			if binding == nil || !environmentVariablePattern.MatchString(binding.GetName()) || names[binding.GetName()] {
+				return invalid("invalid or duplicate configuration binding")
+			}
+			if err := validatePath(binding.GetSettingRef()); err != nil {
+				return err
+			}
+			names[binding.Name] = true
 		}
 		if entry.GetCache() {
 			if len(entry.GetTaskVersion()) > 200 || (entry.GetTaskVersion() != "" && !semanticVersionPattern.MatchString(entry.GetTaskVersion())) {

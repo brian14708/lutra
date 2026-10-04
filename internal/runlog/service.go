@@ -15,6 +15,7 @@ import (
 	"github.com/brian14708/lutra/internal/blob"
 	"github.com/brian14708/lutra/internal/db"
 	"github.com/brian14708/lutra/internal/multihash"
+	"github.com/brian14708/lutra/internal/redact"
 	"github.com/fxamacker/cbor/v2"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -143,6 +144,29 @@ func (s Service) AppendEntries(ctx context.Context, runID uuid.UUID, stream, app
 
 // AppendTx appends in the caller's transaction; PostgreSQL delivers notifications on commit.
 func (s Service) AppendTx(ctx context.Context, tx pgx.Tx, runID uuid.UUID, stream, appendID string, entries []*lutrav1.LogEntry) (*lutrav1.AppendResponse, error) {
+	settings, err := db.New(tx).ListRunSettings(ctx, runID)
+	if err != nil {
+		return nil, err
+	}
+	var values [][]byte
+	for _, setting := range settings {
+		if setting.Sensitive && len(setting.ValueCbor) != 0 {
+			values = append(values, setting.ValueCbor)
+		}
+	}
+	filter := redact.New(values)
+	if stream == StatusStream {
+		filter = redact.New(nil)
+	}
+	cleaned := make([]*lutrav1.LogEntry, 0, len(entries))
+	for _, entry := range entries {
+		value, err := filter.CBOR(entry.GetValueCbor())
+		if err != nil {
+			return nil, invalid("value is not valid CBOR")
+		}
+		cleaned = append(cleaned, &lutrav1.LogEntry{Key: []byte(filter.String(string(entry.GetKey()))), ValueCbor: value})
+	}
+	entries = cleaned
 	if err := validateStream(stream); err != nil {
 		return nil, err
 	}

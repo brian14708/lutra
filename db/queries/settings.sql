@@ -8,7 +8,7 @@ SELECT * FROM lutra.namespaces ORDER BY slug;
 SELECT * FROM lutra.namespaces WHERE id = $1;
 
 -- name: UpsertSetting :one
-INSERT INTO lutra.settings (namespace_id, path, value) VALUES ($1, $2, $3) ON CONFLICT (namespace_id, path) DO UPDATE SET value = excluded.value, updated_at = now() RETURNING *;
+INSERT INTO lutra.settings (namespace_id, path, value, sensitive) VALUES ($1, $2, $3, $4) ON CONFLICT (namespace_id, path) DO UPDATE SET value = excluded.value, sensitive = excluded.sensitive, updated_at = now() RETURNING *;
 
 -- name: DeleteSetting :execrows
 DELETE FROM lutra.settings WHERE namespace_id = $1 AND path = $2;

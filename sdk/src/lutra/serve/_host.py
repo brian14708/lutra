@@ -25,7 +25,7 @@ from lutra._gen.lutra.v1.blob_pb import GetDownloadRequest
 from lutra._gen.lutra.v1.log_connect import LogServiceClient
 from lutra.blob import BlobStore
 from lutra.checkpoint import CheckpointManager
-from lutra.task import CacheableError, RetryMode
+from lutra.task import CacheableError, ConfigError, RetryMode
 from lutra.value import BlobRef, _parse_blob_name, dumps
 
 if TYPE_CHECKING:
@@ -106,6 +106,8 @@ class _TaskService:
                 result = await result
             content_type, output = await normalize_result(result, self.api_client)
             return ExecuteResponse(content_type=content_type, output=output)
+        except ConfigError as exc:
+            return ExecuteResponse(content_type="", error_code=exc.code)
         except CacheableError as exc:
             return ExecuteResponse(
                 content_type="", error_code=exc.code, error_details=dumps(exc.details)

@@ -131,7 +131,7 @@ func (w *RunWorker) loop(ctx context.Context) {
 	}
 }
 
-func taskNode(row db.LoadRunTasksRow, runtime string) (tasktree.Node, error) {
+func taskNode(row db.LoadRunTasksRow, runtime string, config RunConfigSnapshot) (tasktree.Node, error) {
 	var spec lutrav1.ActionSpec
 	if err := proto.Unmarshal(row.ActionSpec, &spec); err != nil {
 		return tasktree.Node{}, err
@@ -147,7 +147,7 @@ func taskNode(row db.LoadRunTasksRow, runtime string) (tasktree.Node, error) {
 	}
 	key := []byte(nil)
 	if spec.GetCache() {
-		key = cacheKey(row, &spec, runtime)
+		key = cacheKey(row, &spec, runtime, config)
 		if len(key) == 0 {
 			return tasktree.Node{}, errors.New("invalid cached task environment")
 		}
@@ -155,7 +155,7 @@ func taskNode(row db.LoadRunTasksRow, runtime string) (tasktree.Node, error) {
 	return tasktree.Node{ID: row.ID, ParentID: row.CallerActionID, Attempt: row.Attempts, Failures: row.Failures, MaxAttempts: max(spec.MaxAttempts, 1), State: state, ImageKey: row.ImageKey, CacheKey: key, Output: row.OutputCbor, Error: row.Error, NextAttemptAt: row.NextAttemptAt.Time}, nil
 }
 
-func cacheKey(row db.LoadRunTasksRow, spec *lutrav1.ActionSpec, runtime string) []byte {
+func cacheKey(row db.LoadRunTasksRow, spec *lutrav1.ActionSpec, runtime string, config RunConfigSnapshot) []byte {
 	var environment lutrav1.EnvironmentSpec
 	if err := proto.Unmarshal(row.EnvironmentSpec, &environment); err != nil {
 		return nil
@@ -164,11 +164,28 @@ func cacheKey(row db.LoadRunTasksRow, spec *lutrav1.ActionSpec, runtime string) 
 		return nil
 	}
 	entrypoint := environment.Entrypoints[row.EntrypointID-1]
+	req := &EnvironmentExecution{Spec: &environment, EntrypointID: uint32(row.EntrypointID), Config: config}
+	env, projection, err := executionConfig(req)
+	if err != nil {
+		return nil
+	}
+	declaration, err := proto.MarshalOptions{Deterministic: true}.Marshal(entrypoint)
+	if err != nil {
+		return nil
+	}
 	version := spec.GetTaskVersion()
 	if version == "" {
 		version = environment.GetSourceUri()
 	}
 	image := environment.GetImage()
+	imageDeclaration, err := proto.MarshalOptions{Deterministic: true}.Marshal(image)
+	if err != nil {
+		return nil
+	}
+	effective := RunConfigSnapshot{}
+	for _, d := range declarations(&environment) {
+		effective[d.path] = config[d.path]
+	}
 	dependencies := make([]map[string]string, 0, len(environment.GetDependencies()))
 	for _, dependency := range environment.GetDependencies() {
 		dependencies = append(dependencies, map[string]string{
@@ -193,10 +210,14 @@ func cacheKey(row db.LoadRunTasksRow, spec *lutrav1.ActionSpec, runtime string) 
 				"cpu_millis":   uint64(image.GetResources().GetCpuMillis()),
 				"memory_bytes": image.GetResources().GetMemoryBytes(),
 			},
-			"env": image.GetEnvVars(), "build_context_uri": image.GetBuildContextUri(),
+			"declaration": imageDeclaration, "build_context_uri": image.GetBuildContextUri(),
 			"platform": image.GetPlatform(), "python_requires": image.GetPythonRequires(),
 		},
-		"dependencies": dependencies,
+		"dependencies":       dependencies,
+		"config":             projection,
+		"config_declaration": declaration,
+		"effective_env":      env,
+		"effective_config":   effective,
 	}
 	mode, err := cbor.CanonicalEncOptions().EncMode()
 	if err != nil {
@@ -211,7 +232,7 @@ func cacheKey(row db.LoadRunTasksRow, spec *lutrav1.ActionSpec, runtime string) 
 	return h.Sum(nil)
 }
 
-func environmentExecution(row db.LoadRunTasksRow, runID uuid.UUID, attempt int32) (*EnvironmentExecution, error) {
+func environmentExecution(row db.LoadRunTasksRow, runID uuid.UUID, attempt int32, config RunConfigSnapshot) (*EnvironmentExecution, error) {
 	var spec lutrav1.EnvironmentSpec
 	var action lutrav1.ActionSpec
 	if err := proto.Unmarshal(row.EnvironmentSpec, &spec); err != nil {
@@ -224,6 +245,7 @@ func environmentExecution(row db.LoadRunTasksRow, runID uuid.UUID, attempt int32
 		return nil, errors.New("entrypoint is not registered")
 	}
 	task := &EnvironmentExecution{Environment: &lutrav1.EnvironmentIdentifier{NamespaceId: row.NamespaceID.String(), Name: row.EnvironmentName, Version: row.Version}, EntrypointID: uint32(row.EntrypointID), Provider: row.Provider, Spec: &spec, Input: action.InputCbor, RunID: runID.String(), ActionID: row.ID.String(), Attempt: attempt}
+	task.Config = config
 	task.Environments = append([]*lutrav1.EnvironmentIdentifier{task.Environment}, spec.Dependencies...)
 	return task, nil
 }
@@ -270,10 +292,16 @@ func (w *RunWorker) drive(parent context.Context, runID, token uuid.UUID) {
 		slog.Error("select container runtime", "error", err)
 		return
 	}
+	config, err := loadRunConfig(ctx, q, runID)
+	if err != nil {
+		slog.Error("load run configuration", "error", err)
+		return
+	}
 	d := &runDriver{worker: w, ctx: ctx, runtime: runtime, runID: runID, token: token, rows: make(map[uuid.UUID]db.LoadRunTasksRow), images: make(map[string]*imageWait)}
+	d.config = config
 	snapshot := make([]tasktree.Node, 0, len(rows))
 	for _, row := range rows {
-		node, nodeErr := taskNode(row, runtime)
+		node, nodeErr := taskNode(row, runtime, config)
 		if nodeErr != nil {
 			slog.Error("restore task tree", "error", nodeErr)
 			return
@@ -312,6 +340,7 @@ type imageWait struct {
 	err   error
 }
 type runDriver struct {
+	config       RunConfigSnapshot
 	worker       *RunWorker
 	ctx          context.Context
 	runtime      string
@@ -339,7 +368,7 @@ func (d *runDriver) Ensure(ctx context.Context, key []byte) error {
 		go func() {
 			defer d.worker.wg.Done()
 			defer close(wait.done)
-			task, err := environmentExecution(row, d.runID, row.Attempts)
+			task, err := environmentExecution(row, d.runID, row.Attempts, d.config)
 			if err != nil {
 				wait.err = err
 				return
@@ -394,7 +423,7 @@ func (d *runDriver) Run(ctx context.Context, attempt tasktree.Attempt) ([]byte, 
 	if !ok || image == nil {
 		return nil, errors.New("action image unavailable")
 	}
-	task, err := environmentExecution(row, d.runID, attempt.Number)
+	task, err := environmentExecution(row, d.runID, attempt.Number, d.config)
 	if err != nil {
 		return nil, err
 	}
@@ -411,7 +440,7 @@ func (d *runDriver) Run(ctx context.Context, attempt tasktree.Attempt) ([]byte, 
 			if row.ID != child {
 				continue
 			}
-			node, err := taskNode(row, d.runtime)
+			node, err := taskNode(row, d.runtime, d.config)
 			if err != nil {
 				return err
 			}

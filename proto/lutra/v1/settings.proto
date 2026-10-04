@@ -23,6 +23,7 @@ message Setting {
   string path = 2;
   bytes value_cbor = 3;
   string updated_at = 4;
+  bool sensitive = 5;
 }
 message CreateNamespaceRequest {
   string slug = 1;
@@ -39,6 +40,7 @@ message UpsertSettingRequest {
   string namespace_id = 1;
   string path = 2;
   bytes value_cbor = 3;
+  bool sensitive = 4;
 }
 message UpsertSettingResponse {
   Setting setting = 1;

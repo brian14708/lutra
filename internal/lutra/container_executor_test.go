@@ -506,7 +506,7 @@ func TestImageKeySeparatesBuildAndRuntimeInputs(t *testing.T) {
 	}
 	spec.Workdir = "nested directory"
 	spec.PythonPaths = []string{"scripts"}
-	spec.Image.EnvVars = map[string]string{"SETTING": "changed"}
+	spec.Image.Env = map[string]*lutrav1.EnvValue{"SETTING": {Source: &lutrav1.EnvValue_StaticValue{StaticValue: "changed"}}}
 	spec.Image.Resources = &lutrav1.Resources{CpuMillis: 500}
 	unchanged, err := executor.ImageKey(spec)
 	if err != nil || !bytes.Equal(original, unchanged) {

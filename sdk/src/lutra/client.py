@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Generic, Literal, TypeVar
 
 import httpx
 import pyqwest
+from protobuf import Oneof
 
 from lutra._blob import upload_blob
 from lutra._bundle import SOURCE_BUNDLE_MIME, bundle_bytes
@@ -22,6 +23,7 @@ from lutra._gen.lutra.v1.lutra_pb import (
     Entrypoint,
     EnvironmentIdentifier,
     EnvironmentSpec,
+    EnvValue,
     GetRunRequest,
     ImageSpec,
     RegisterEnvironmentRequest,
@@ -31,12 +33,13 @@ from lutra._gen.lutra.v1.lutra_pb import (
     TaskActionStatus,
     WatchRunRequest,
 )
+from lutra._gen.lutra.v1.lutra_pb import ConfigBinding as WireConfigBinding
 from lutra._gen.lutra.v1.settings_connect import SettingsServiceClient
 from lutra._gen.lutra.v1.settings_pb import ListNamespacesRequest
 from lutra._source_bundle import build_source_bundle
 from lutra.blob import BlobStore
-from lutra.task import CacheableError, normalize_retry
-from lutra.value import loads
+from lutra.task import CacheableError, ConfigError, normalize_retry
+from lutra.value import dumps, loads
 
 if TYPE_CHECKING:
     import logging
@@ -408,6 +411,8 @@ class RunHandle(Generic[R]):
             message = "run status stream ended before completion"
             raise RuntimeError(message)
         if terminal.status != "succeeded":
+            if terminal.error in {"config.invalid", "config.missing"}:
+                raise ConfigError(terminal.error)
             if terminal.status == "failed" and terminal.output_cbor:
                 failure = await loads(terminal.output_cbor, self.client.resolve_blob)
                 if (
@@ -553,7 +558,15 @@ class Client:
                                 cpu_millis=current.resources.cpu_millis,
                                 memory_bytes=current.resources.memory_bytes,
                             ),
-                            env_vars=dict(current.env_vars),
+                            env={
+                                key: EnvValue(
+                                    source=Oneof("static_value", value)
+                                    if isinstance(value, str)
+                                    else Oneof("setting_ref", value.path),
+                                    sensitive=None if isinstance(value, str) else value.sensitive,
+                                )
+                                for key, value in current.env.items()
+                            },
                             build_context_uri=build_uri,
                             platform=current.image.platform or "",
                             python_requires=inputs.python_requires,
@@ -566,6 +579,15 @@ class Client:
                             Entrypoint(
                                 command=Command(args=list(inputs.entrypoints[index])),
                                 name=task.qualname,
+                                config=[
+                                    WireConfigBinding(
+                                        name=b.name,
+                                        setting_ref=b.setting_ref,
+                                        required=b.required,
+                                        sensitive=b.sensitive,
+                                    )
+                                    for b in task.config
+                                ],
                                 max_attempts=task.max_attempts,
                                 cache=task.cache,
                                 task_version=task.version or "" if task.cache else "",
@@ -595,6 +617,7 @@ class Client:
         idempotency_key: str = "",
         max_attempts: int | None = None,
         logger: logging.Logger | None = None,
+        config_overrides: dict[str, object] | None = None,
     ) -> RunHandle[R]:
         """Submit an invocation and return a handle for its run.
 
@@ -607,11 +630,14 @@ class Client:
             invocation.task.max_attempts if max_attempts is None else max_attempts,
         )
         environment = await self._prepare(invocation.task.environment, logger)
+        action_spec = invocation.action_spec(attempts)
+        if config_overrides is not None:
+            action_spec.config_overrides_cbor = dumps(config_overrides)
         result = await self.rpc.create_run(
             CreateRunRequest(
                 environment=environment,
                 entrypoint_id=invocation.task.entrypoint_id,
-                action_spec=invocation.action_spec(attempts),
+                action_spec=action_spec,
                 idempotency_key=idempotency_key,
             )
         )
@@ -622,7 +648,7 @@ class Client:
             _entrypoint_names(invocation.task.environment),
         )
 
-    async def run(
+    async def run(  # ruff: ignore[too-many-arguments]
         self,
         invocation: Invocation[R],
         *,
@@ -630,6 +656,7 @@ class Client:
         max_attempts: int | None = None,
         logger: logging.Logger | None = None,
         display: Literal["live"] | None = None,
+        config_overrides: dict[str, object] | None = None,
     ) -> R:
         """Submit an invocation and wait for its decoded result.
 
@@ -669,7 +696,10 @@ class Client:
                 view.prepare(target)
                 try:
                     handle = await self.submit(
-                        invocation, idempotency_key=idempotency_key, max_attempts=max_attempts
+                        invocation,
+                        idempotency_key=idempotency_key,
+                        max_attempts=max_attempts,
+                        config_overrides=config_overrides,
                     )
                     view.run_id = handle.id
                     return await handle._result(view)  # ruff: ignore[private-member-access]
@@ -677,7 +707,11 @@ class Client:
                     view.fail(str(exc))
                     raise
         handle = await self.submit(
-            invocation, idempotency_key=idempotency_key, max_attempts=max_attempts, logger=logger
+            invocation,
+            idempotency_key=idempotency_key,
+            max_attempts=max_attempts,
+            logger=logger,
+            config_overrides=config_overrides,
         )
         return await handle.result(logger=logger)
 

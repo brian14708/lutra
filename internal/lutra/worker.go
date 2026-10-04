@@ -80,11 +80,22 @@ func (w *RunWorker) executeEnvironment(ctx context.Context, image *Image, identi
 	}
 	job, err := executor.Run(ctx, image, task)
 	if err != nil {
-		return nil, err
+		var config *ConfigError
+		if errors.As(err, &config) {
+			return nil, config
+		}
+		return nil, errors.New(task.Config.filter().String(err.Error()))
 	}
 	output, waitErr := job.Wait(ctx)
 	if ctx.Err() != nil {
 		_ = job.Kill(context.Background())
+	}
+	if waitErr != nil {
+		var config *ConfigError
+		var cacheable *CacheableError
+		if !errors.As(waitErr, &config) && !errors.As(waitErr, &cacheable) {
+			waitErr = errors.New(task.Config.filter().String(waitErr.Error()))
+		}
 	}
 	return output, waitErr
 }

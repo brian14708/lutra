@@ -751,7 +751,7 @@ func (e *Coordinator) execute(id uuid.UUID, releaseAdmission func()) {
 	} else {
 		n.Failures++
 		n.Error = err.Error()
-		if !isCacheable(err) && n.Failures < max(n.MaxAttempts, 1) {
+		if isRetryable(err) && !isCacheable(err) && n.Failures < max(n.MaxAttempts, 1) {
 			n.State = Pending
 			n.WaitingOn = WaitingForRetry
 			n.NextAttemptAt = e.opts.Clock.Now().Add(e.opts.RetryBackoff(n.Failures))
@@ -795,7 +795,15 @@ func (e *Coordinator) failBeforeRun(id uuid.UUID, err error) {
 	}
 }
 
-type cacheable interface{ Cacheable() bool }
+type (
+	cacheable interface{ Cacheable() bool }
+	retryable interface{ Retryable() bool }
+)
+
+func isRetryable(err error) bool {
+	var value retryable
+	return !errors.As(err, &value) || value.Retryable()
+}
 
 func isCacheable(err error) bool {
 	var value cacheable

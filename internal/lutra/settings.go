@@ -11,7 +11,6 @@ import (
 	lutrav1 "github.com/brian14708/lutra/gen/lutra/v1"
 	lutrav1connect "github.com/brian14708/lutra/gen/lutra/v1/lutrav1connect"
 	"github.com/brian14708/lutra/internal/db"
-	"github.com/fxamacker/cbor/v2"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -51,17 +50,6 @@ func validatePath(value string) error {
 	return nil
 }
 
-func validateCBOR(value []byte) error {
-	if len(value) == 0 || len(value) > 65536 {
-		return invalid("invalid CBOR value size")
-	}
-	var decoded any
-	if err := cbor.Unmarshal(value, &decoded); err != nil {
-		return invalid("invalid CBOR value")
-	}
-	return nil
-}
-
 func timestamp(t pgtype.Timestamptz) string {
 	if !t.Valid {
 		return ""
@@ -74,7 +62,11 @@ func namespaceMessage(row db.LutraNamespace) *lutrav1.Namespace {
 }
 
 func settingMessage(row db.LutraSetting) *lutrav1.Setting {
-	return &lutrav1.Setting{NamespaceId: row.NamespaceID.String(), Path: row.Path, ValueCbor: row.Value, UpdatedAt: timestamp(row.UpdatedAt)}
+	value := row.Value
+	if row.Sensitive {
+		value = nil
+	}
+	return &lutrav1.Setting{NamespaceId: row.NamespaceID.String(), Path: row.Path, ValueCbor: value, Sensitive: row.Sensitive, UpdatedAt: timestamp(row.UpdatedAt)}
 }
 
 func (s Service) CreateNamespace(ctx context.Context, req *connect.Request[lutrav1.CreateNamespaceRequest]) (*connect.Response[lutrav1.CreateNamespaceResponse], error) {
@@ -120,10 +112,10 @@ func (s Service) UpsertSetting(ctx context.Context, req *connect.Request[lutrav1
 	if err := validatePath(req.Msg.GetPath()); err != nil {
 		return nil, err
 	}
-	if err := validateCBOR(req.Msg.GetValueCbor()); err != nil {
+	if _, err := canonicalConfig(req.Msg.GetValueCbor()); err != nil {
 		return nil, err
 	}
-	row, err := q.UpsertSetting(ctx, db.UpsertSettingParams{NamespaceID: id, Path: req.Msg.GetPath(), Value: req.Msg.GetValueCbor()})
+	row, err := q.UpsertSetting(ctx, db.UpsertSettingParams{NamespaceID: id, Path: req.Msg.GetPath(), Value: req.Msg.GetValueCbor(), Sensitive: req.Msg.GetSensitive()})
 	if err != nil {
 		return nil, connect.NewError(connect.CodeFailedPrecondition, err)
 	}

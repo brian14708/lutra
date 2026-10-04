@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from types import MappingProxyType
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
+
     from lutra.blob import BlobStore
     from lutra.checkpoint import CheckpointManager
     from lutra.task import RetryMode
@@ -22,6 +25,7 @@ class TaskContext:
     retry: RetryMode
     checkpoint: CheckpointManager
     blobs: BlobStore
+    config: Mapping[str, object] = field(default_factory=lambda: MappingProxyType[str, object]({}))
 
 
 task_context: ContextVar[TaskContext] = ContextVar("lutra_task_context")
