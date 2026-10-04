@@ -6,11 +6,26 @@ import logging
 import sys
 from collections import deque
 from dataclasses import dataclass
-from typing import Any, Self
+from typing import TYPE_CHECKING, Self
 
 from lutra._gen.lutra.v1.lutra_pb import Run, TaskActionStatus
 from lutra._result import failure_message
-from lutra.client import LogEvent, _id_suffix, _preview, _RunLogger, _task_display_status
+from lutra.client import (
+    LogEvent,
+    _agent_message,
+    _entrypoint_name,
+    _id_suffix,
+    _preview,
+    _RunLogger,
+    _task_display_status,
+)
+
+if TYPE_CHECKING:
+    from types import TracebackType
+
+    from rich.console import Group, RenderableType
+    from rich.live import Live
+    from rich.tree import Tree
 
 _RECENT_LOGS = 12
 _INSTANCE_COLORS = (
@@ -64,7 +79,7 @@ class LiveDisplay:
         self.tasks: dict[str, _Task] = {}
         self.logs: deque[tuple[str, str, str]] = deque(maxlen=_RECENT_LOGS)
         self._instance_colors: dict[str, str] = {}
-        self._live: Any = None
+        self._live: Live | None = None
         self._plain: _RunLogger | None = None
         self._handler: logging.Handler | None = None
 
@@ -90,9 +105,14 @@ class LiveDisplay:
         self._plain = _RunLogger(logger, self.run_id, self.task_name, self.entrypoint_names)
         return self
 
-    def __exit__(self, *args: object) -> None:
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
         if self._live is not None:
-            self._live.__exit__(*args)
+            self._live.__exit__(exc_type, exc_value, traceback)
         if self._handler is not None and self._plain is not None:
             self._plain.logger.removeHandler(self._handler)
             self._handler.close()
@@ -118,9 +138,7 @@ class LiveDisplay:
             name = (
                 self.task_name
                 if event.action_id == self.root_action_id and self.task_name
-                else self.entrypoint_names.get(
-                    event.entrypoint_id, f"entrypoint #{event.entrypoint_id}"
-                )
+                else _entrypoint_name(self.entrypoint_names, event.entrypoint_id)
             )
             self.tasks[event.action_id] = _Task(
                 name,
@@ -139,7 +157,8 @@ class LiveDisplay:
             label = f"{name} [{_id_suffix(action)}]"
             phase = str(event.event.get("phase", "task"))
             prefix = f"{phase} · " if phase in {"pull", "build"} else ""
-            for line in event.message.splitlines() or [""]:
+            message = _agent_message(event.event) if event.stream == "agent" else event.message
+            for line in message.splitlines() or [""]:
                 self.logs.append((action, label, f"{prefix}{line}"))
         self._refresh()
 
@@ -161,7 +180,7 @@ class LiveDisplay:
         if self._live is not None:
             self._live.update(self._render(), refresh=False)
 
-    def _render(self) -> Any:  # ruff: ignore[any-type, complex-structure]
+    def _render(self) -> Group:  # ruff: ignore[complex-structure]
         from rich.console import Group  # ruff: ignore[import-outside-top-level]
         from rich.panel import Panel  # ruff: ignore[import-outside-top-level]
         from rich.text import Text  # ruff: ignore[import-outside-top-level]
@@ -177,11 +196,7 @@ class LiveDisplay:
             parent = task.parent_id if task.parent_id in self.tasks else ""
             children.setdefault(parent, []).append(action_id)
 
-        def add_tasks(
-            parent: Any,  # ruff: ignore[any-type]
-            parent_id: str,
-            ancestors: set[str],
-        ) -> None:
+        def add_tasks(parent: Tree, parent_id: str, ancestors: set[str]) -> None:
             for action_id in children.get(parent_id, []):
                 if action_id in ancestors:
                     continue
@@ -207,7 +222,7 @@ class LiveDisplay:
             logs.append(f": {message}")
         if not self.logs:
             logs.append("Waiting for task output…")
-        parts: list[Any] = [tree, Panel(logs, title="Recent output", border_style="dim")]
+        parts: list[RenderableType] = [tree, Panel(logs, title="Recent output", border_style="dim")]
         if self.result_text:
             parts.append(Text(f"Result: {self.result_text}", style="green"))
         return Group(*parts)

@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import os
 import re
-import shlex
 import shutil
 import subprocess  # ruff: ignore[suspicious-subprocess-import]
 import tempfile
@@ -144,11 +143,13 @@ class UvSource:
     excluded_roots: tuple[Path, ...] = ()
     dependency_groups: tuple[str, ...] | None = None
     extras: tuple[str, ...] | None = None
+    sync_args: tuple[str, ...] = ()
 
     @property
-    def prepare_command(self) -> tuple[str, ...]:
+    def prepare_args(self) -> tuple[str, ...]:
+        """Structured runtime sync command; empty when nothing installs."""
         if not self.runtime_files:
-            return ("true",)
+            return ()
         args = [
             "uv",
             "sync",
@@ -163,7 +164,7 @@ class UvSource:
             args.extend(arg for group in self.dependency_groups for arg in ("--group", group))
         if self.extras:
             args.extend(arg for extra in self.extras for arg in ("--extra", extra))
-        return ("sh", "-c", shlex.join(args))
+        return tuple(args)
 
     @property
     def required_files(self) -> tuple[Path, ...]:
@@ -209,15 +210,7 @@ def _prepare_lock(root: Path, lock: Path, script: Path | None) -> tuple[bytes, s
     if version != UV_VERSION:
         msg = f"environment preparation requires uv {UV_VERSION}; found {version}"
         raise ValueError(msg)
-    if not lock.exists():
-        _uv(root, "lock", *script_args)
-    else:
-        try:
-            _uv(root, "lock", "--check", "--offline", *script_args)
-        except ValueError as exc:
-            command = f"uv lock --script {script}" if script else f"uv lock --project {root}"
-            msg = f"lock is stale or cannot be checked; run `{command}`: {exc}"
-            raise ValueError(msg) from exc
+    _uv(root, "lock", *script_args)
     original_lock = lock.read_bytes()
     requirement = tomllib.loads(original_lock.decode()).get("requires-python")
     if not isinstance(requirement, str) or not requirement:
@@ -274,9 +267,9 @@ def _selected_requirements(
 ) -> list[dict[str, Any]]:
     manifest = locked.get("manifest", {})
     available = manifest.get("dependency-groups", {})
-    requirements: list[dict[str, Any]] = [{"name": name} for name in names]
-    if extras:
-        requirements = [{"name": name, "extras": list(extras)} for name in names]
+    requirements: list[dict[str, Any]] = [
+        {"name": name, **({"extras": list(extras)} if extras else {})} for name in names
+    ]
     for group in groups:
         entries = available.get(group)
         if entries is None:
@@ -327,7 +320,7 @@ def _sync_inputs(  # ruff: ignore[too-many-arguments]
     dependency_groups: tuple[str, ...] | None,
     extras: tuple[str, ...] | None,
     selected_groups: tuple[str, ...],
-) -> tuple[dict[str, bytes], dict[str, bytes]]:
+) -> tuple[dict[str, bytes], dict[str, bytes], tuple[str, ...]]:
     locations = {location: name for name, location in _local_sources(locked)}
     # These stable image paths have no relationship to the submitter's directory.
     image_paths = {location: "local/" + name for location, name in locations.items()}
@@ -337,28 +330,23 @@ def _sync_inputs(  # ruff: ignore[too-many-arguments]
     selectors.extend(arg for group in selected_groups for arg in ("--group", group))
     if extras:
         selectors.extend(arg for extra in extras for arg in ("--extra", extra))
-    build = {
-        "environment.py": stub,
-        "environment.py.lock": _native_lock(locked, image_paths),
-        "sync.sh": (
-            shlex.join([
-                "uv",
-                "sync",
-                "--frozen",
-                "--active",
-                "--no-config",
-                "--script",
-                "/opt/lutra/dependencies/environment.py",
-                *selectors,
-                *(
-                    arg
-                    for name in sorted(set(locations.values()))
-                    for arg in ("--no-install-package", name)
-                ),
-            ])
-            + "\n"
-        ).encode(),
-    }
+    # Sync arguments stay structured until the manager renders its script.
+    sync_args = (
+        "uv",
+        "sync",
+        "--frozen",
+        "--active",
+        "--no-config",
+        "--script",
+        "/opt/lutra/dependencies/environment.py",
+        *selectors,
+        *(
+            arg
+            for name in sorted(set(locations.values()))
+            for arg in ("--no-install-package", name)
+        ),
+    )
+    build = {"environment.py": stub, "environment.py.lock": _native_lock(locked, image_paths)}
     runtime: dict[str, bytes] = {}
     if installable:
         runtime_paths = {
@@ -369,7 +357,7 @@ def _sync_inputs(  # ruff: ignore[too-many-arguments]
             "lutra-runtime.py": stub,
             "lutra-runtime.py.lock": _native_lock(locked, runtime_paths),
         }
-    return build, runtime
+    return build, runtime, sync_args
 
 
 def _bundle_layout(
@@ -457,7 +445,7 @@ def prepare_source(  # ruff: ignore[too-many-locals]
             if path != script
         }
     bundle_root, includes = _bundle_layout(root, projects, script)
-    build_files, runtime_files = _sync_inputs(
+    build_files, runtime_files, sync_args = _sync_inputs(
         root,
         bundle_root,
         locked,
@@ -495,4 +483,5 @@ def prepare_source(  # ruff: ignore[too-many-locals]
         tuple(sorted(all_local - projects - {root})),
         dependency_groups,
         extras,
+        sync_args,
     )

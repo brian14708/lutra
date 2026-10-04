@@ -13,6 +13,10 @@ if TYPE_CHECKING:
 
 ERROR_TAG = 30001
 
+# Canonical CBOR header of CBORTag(ERROR_TAG, ...); both encoders are canonical,
+# so the success path skips a full decode just to check for the failure tag.
+_FAILURE_PREFIX = b"\xd9\x75\x31"
+
 
 def failure_message(data: bytes) -> str:
     if not data:
@@ -55,6 +59,8 @@ def _failure(data: bytes) -> dict[str, object] | None:
 async def load_result(
     data: bytes, resolver: Callable[[str], Awaitable[bytes]] | None = None
 ) -> object:
+    if not data.startswith(_FAILURE_PREFIX):
+        return await loads(data, resolver)
     fields = _failure(data)
     if fields is None:
         return await loads(data, resolver)

@@ -121,8 +121,7 @@ class Uv:
         if owners:
             env["UV_PYTHON_DOWNLOADS"] = "never"
         files = {"uv/" + name: contents for name, contents in source.build_files.items()}
-        sync = shlex.split(source.build_files["sync.sh"].decode())
-        sync[0] = "/usr/local/bin/uv"
+        sync = ["/usr/local/bin/uv", *source.sync_args[1:]]
         sync[sync.index("--script") + 1] = "/opt/lutra/dependencies/uv/environment.py"
         if owners:
             env["UV_PYTHON"] = python
@@ -135,14 +134,14 @@ class Uv:
             runtime[".lutra/uv/lutra-runtime.py.lock"] = _native_lock(
                 locked, {location: "../../" + location for _, location in _local_sources(locked)}
             )
-        prepare = ("true",)
+        prepare_commands: tuple[tuple[str, ...], ...] = ()
         if runtime:
-            prepare_args = shlex.split(source.prepare_command[2])
+            prepare_args = list(source.prepare_args)
             prepare_args[0] = "/usr/local/bin/uv"
             prepare_args[prepare_args.index("--script") + 1] = (
                 "/workspace/.lutra/uv/lutra-runtime.py"
             )
-            prepare = tuple(prepare_args)
+            prepare_commands = (tuple(prepare_args),)
         commands = (
             ("/usr/local/bin/uv", "venv", "--python", python, "/opt/lutra/venv"),
             ("sh", "/opt/lutra/dependencies/uv/sync.sh"),
@@ -155,7 +154,7 @@ class Uv:
             runtime,
             (OciCopy(UV_IMAGE, "/uv", "/usr/local/bin/uv"),),
             commands,
-            (prepare,),
+            prepare_commands,
             env,
             source=layout,
             entrypoint_prefix=prefix,
@@ -274,17 +273,17 @@ def prepare_managers(
     if len({type(manager) for manager in managers}) != len(managers):
         msg = "duplicate package managers"
         raise ValueError(msg)
-    outputs: tuple[ManagerOutput, ...] = ()
+    outputs: list[ManagerOutput] = []
     files: dict[str, bytes] = {}
     runtime_files: dict[str, bytes] = {}
     env: dict[str, str] = {}
     for manager in managers:
-        output = manager.prepare(task_sources, platform, outputs)
+        output = manager.prepare(task_sources, platform, tuple(outputs))
         _merge(files, output.build_files)
         _merge(runtime_files, output.runtime_files)
         _merge(env, output.build_env)
-        outputs += (output,)
-    return outputs
+        outputs.append(output)
+    return tuple(outputs)
 
 
 V = TypeVar("V")

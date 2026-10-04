@@ -511,7 +511,7 @@ func (s Service) WatchRun(ctx context.Context, req *connect.Request[lutrav1.Watc
 		return invalid("invalid run id")
 	}
 	cursor := req.Msg.GetTaskLogs()
-	if cursor != nil && (cursor.GetStream() != runlog.TaskLogStream || cursor.GetAfterSeq() < 0 || len(cursor.GetKeyPrefix()) > 1024) {
+	if cursor != nil && (cursor.GetStream() != runlog.TaskLogStream && cursor.GetStream() != "agent" || cursor.GetAfterSeq() < 0 || len(cursor.GetKeyPrefix()) > 1024) {
 		return invalid("invalid task log cursor")
 	}
 	return s.watchRun(ctx, id, cursor, stream.Send)
@@ -547,8 +547,12 @@ func (s Service) watchRun(ctx context.Context, id uuid.UUID, taskLogs *lutrav1.S
 		return nil
 	}
 	cursors := []runlog.Cursor{}
+	logStream := runlog.TaskLogStream
+	if taskLogs != nil && taskLogs.GetStream() != "" {
+		logStream = taskLogs.GetStream()
+	}
 	if taskLogs != nil {
-		cursors = append(cursors, runlog.Cursor{Stream: runlog.TaskLogStream, Prefix: taskLogs.GetKeyPrefix(), InspectSeq: taskLogs.GetAfterSeq()})
+		cursors = append(cursors, runlog.Cursor{Stream: logStream, Prefix: taskLogs.GetKeyPrefix(), InspectSeq: taskLogs.GetAfterSeq()})
 	}
 	cursors = append(cursors, runlog.Cursor{Stream: runlog.StatusStream, Prefix: []byte("status"), InspectSeq: end})
 	if taskLogs != nil {
@@ -570,7 +574,7 @@ func (s Service) watchRun(ctx context.Context, id uuid.UUID, taskLogs *lutrav1.S
 	}
 	if !terminal(run.Status) {
 		err = sub.Run(ctx, cursors, func(record *lutrav1.TailResponse) error {
-			if record.Stream == runlog.TaskLogStream {
+			if record.Stream != runlog.StatusStream {
 				return sendLog(record)
 			}
 			if !bytes.Equal(record.GetKey(), []byte("status")) {
@@ -602,7 +606,7 @@ func (s Service) watchRun(ctx context.Context, id uuid.UUID, taskLogs *lutrav1.S
 	if taskLogs == nil {
 		return nil
 	}
-	logEnd, err := db.New(s.DB).LogStreamEnd(ctx, db.LogStreamEndParams{RunID: id, Stream: runlog.TaskLogStream})
+	logEnd, err := db.New(s.DB).LogStreamEnd(ctx, db.LogStreamEndParams{RunID: id, Stream: logStream})
 	if err != nil {
 		return err
 	}

@@ -10,8 +10,10 @@ dependencies = [
     "cbor2>=5.7,<6",
     "httpx>=0.28,<1",
     "pathspec>=1.1,<2",
+    "pydantic>=2.11,<3",
     "zstandard>=0.25,<1",
     "tomli-w>=1.2,<2",
+    "typing-extensions>=4.12,<5",
 ]
 
 [project.optional-dependencies]
@@ -20,6 +22,10 @@ tui = ["rich>=13.7,<15"]
 [dependency-groups]
 dev = [
   "pytest>=8.0.0",
+  "openai-codex==0.160.0",
+  "claude-agent-sdk==0.2.163",
+  "jsonschema==4.26.0",
+  "types-jsonschema>=4.26",
   "pytest-asyncio>=0.24.0",
 ]
 
@@ -41,14 +47,25 @@ addopts = ["-ra"]
 asyncio_mode = "auto"
 markers = ["integration: requires a running Lutra stack"]
 testpaths = ["tests"]
-pythonpath = ["src"]
+pythonpath = ["src", "examples"]
 
 [tool.pyrefly]
-project-includes = ["src", "tests"]
+project-includes = ["src", "tests", "examples"]
 project-excludes = ["src/lutra/_gen"]
 python-version = "3.11"
-search-path = ["src", "."]
+search-path = ["src", "examples", "."]
 preset = "strict"
+strict-callable-subtyping = true
+strict-partial-subtyping = true
+type-ignore-unknown-tag-behavior = "no-effect"
+
+[tool.pyrefly.errors]
+deprecated = "error"
+non-convergent-recursion = "error"
+unnecessary-type-conversion = "error"
+untyped-import = "error"
+unused-ignore = "error"
+unused-type-ignore = "error"
 
 [tool.lutra]
 source-includes = ["src/lutra/_gen"]

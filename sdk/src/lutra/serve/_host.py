@@ -10,7 +10,6 @@ import sys
 from contextvars import ContextVar, Token
 from typing import TYPE_CHECKING, Any
 
-import httpx
 import pyqwest
 from connectrpc.code import Code
 from connectrpc.codec import proto_json_codec
@@ -21,13 +20,12 @@ from lutra._context import TaskContext, task_context
 from lutra._gen.lutra.task.v1.task_connect import TaskService, TaskServiceASGIApplication
 from lutra._gen.lutra.task.v1.task_pb import ExecuteRequest, ExecuteResponse
 from lutra._gen.lutra.v1.blob_connect import BlobServiceClient
-from lutra._gen.lutra.v1.blob_pb import GetDownloadRequest
 from lutra._gen.lutra.v1.log_connect import LogServiceClient
 from lutra._result import encode_failure
 from lutra.blob import BlobStore
 from lutra.checkpoint import CheckpointManager
 from lutra.task import CacheableError, ConfigError, RetryMode
-from lutra.value import BlobRef, _parse_blob_name, dumps
+from lutra.value import BlobRef, dumps
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -59,7 +57,7 @@ class _StderrProxy:
 def _redirect_user_stdout() -> None:
     """Keep user output away from the stdio protocol stream."""
     if not isinstance(sys.stdout, _StderrProxy):
-        sys.stdout = _StderrProxy()  # type: ignore[assignment]
+        sys.stdout = _StderrProxy()
 
 
 def _envelope(value: object) -> bytes:
@@ -95,6 +93,7 @@ class _TaskService:
                 self._retry,
                 CheckpointManager(self.api_client, request.run_id, request.action_id),
                 BlobStore(self.api_client.blob),
+                log=self.api_client.log,
             )
         )
         args = (request.invocation_id, request.content_type, request.input, self.api_client)
@@ -233,12 +232,7 @@ class TaskAPIClient:
                 return response
 
     async def resolve_blob(self, uri: str) -> bytes:
-        _parse_blob_name(uri.removeprefix("blob:"))
-        response = await self.blob.get_download(GetDownloadRequest(uri=uri))
-        async with httpx.AsyncClient() as http:
-            downloaded = await http.get(response.url)
-            downloaded.raise_for_status()
-            return downloaded.content
+        return await BlobStore(self.blob).download_bytes(uri)
 
 
 class StdioTransport:

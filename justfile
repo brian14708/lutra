@@ -20,6 +20,7 @@ lint:
     go tool buf lint
     go tool golangci-lint run
     uv run ruff check
+    uv run ruff format --check
     uv run --all-packages --all-extras --directory sdk pyrefly check
     pnpm --filter @lutra/console lint
 

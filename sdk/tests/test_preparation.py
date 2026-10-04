@@ -122,9 +122,12 @@ def test_missing_stale_locks_and_dependency_identity(tmp_path: Path) -> None:
     second.lock.write_bytes(original + b"\n# lock changed\n")
     assert prepare_source([task]).build_files != first.build_files
     manifest.write_text(manifest.read_text().replace('version="1.2.3"', 'version="1.2.4"'))
-    with pytest.raises(ValueError, match="run `uv lock --project"):
-        prepare_source([task])
-    assert second.lock.read_bytes() == original + b"\n# lock changed\n"
+    refreshed = prepare_source([task])
+    locked = tomllib.loads(refreshed.lock.read_text())
+    assert next(p for p in locked["package"] if p["name"] == "demo")["version"] == "1.2.4"
+    assert refreshed.build_files["uv.lock"] == refreshed.lock.read_bytes()
+    assert refreshed.build_files != second.build_files
+    assert prepare_source([task]).build_files == refreshed.build_files
 
 
 def test_workspace_selection_and_virtual_root(tmp_path: Path) -> None:
@@ -204,6 +207,12 @@ def test_script_local_dependency_and_independent_owners(tmp_path: Path) -> None:
     )
     assert (files / "scripts/asset.txt").exists()
     assert not (files / "scripts/unrelated.txt").exists()
+    manifest = local.parent / "pyproject.toml"
+    manifest.write_text(manifest.read_text().replace('version="1.2.3"', 'version="1.2.4"'))
+    refreshed = prepare_source([script, local])
+    locked = tomllib.loads(refreshed.lock.read_text())
+    assert next(p for p in locked["package"] if p["name"] == "local")["version"] == "1.2.4"
+    assert refreshed.build_files["uv.lock"] == refreshed.lock.read_bytes()
     other = project(tmp_path / "other", "other")
     with pytest.raises(ValueError, match="share one locked"):
         prepare_source([script, other])
@@ -288,7 +297,8 @@ def test_inline_sdk_example(tmp_path: Path) -> None:
     dependencies = selected_names(files / "lutra-runtime.py")
     assert {"rich", "lutra"} <= dependencies
     assert not {"pytest", "ruff"} & dependencies
-    assert "--no-install-package lutra" in prepared.build_files["sync.sh"].decode()
+    pairs = zip(prepared.sync_args, prepared.sync_args[1:], strict=False)
+    assert ("--no-install-package", "lutra") in pairs
     lock = tomllib.loads(prepared.runtime_files["lutra-runtime.py.lock"].decode())
     assert lock["manifest"]["requirements"][0]["editable"] == "."
 

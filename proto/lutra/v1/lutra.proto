@@ -158,7 +158,7 @@ message CancelRunResponse {
 }
 message WatchRunRequest {
   string id = 1;
-  // Optional task_log cursor. Include to receive task logs and child status history.
+  // Optional task_log or agent cursor. Include to receive logs and child status history.
   // Omit for root run status updates only.
   StreamCursor task_logs = 2;
 }

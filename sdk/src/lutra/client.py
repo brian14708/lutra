@@ -2,19 +2,18 @@
 
 from __future__ import annotations
 
+import asyncio
 import shlex
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Generic, Literal, TypeVar
 
-import httpx
 import pyqwest
 from protobuf import Oneof
 
 from lutra._blob import upload_blob
 from lutra._bundle import SOURCE_BUNDLE_MIME, bundle_bytes
 from lutra._gen.lutra.v1.blob_connect import BlobServiceClient
-from lutra._gen.lutra.v1.blob_pb import GetDownloadRequest
 from lutra._gen.lutra.v1.log_pb import StreamCursor
 from lutra._gen.lutra.v1.lutra_connect import LutraServiceClient
 from lutra._gen.lutra.v1.lutra_pb import (
@@ -77,6 +76,23 @@ def _task_display_status(event: TaskActionStatus) -> str:
     return "cached" if event.status == "succeeded" and event.cache_hit else event.status
 
 
+def _check_output_options(logger: logging.Logger | None, display: str | None) -> None:
+    if logger is not None and display is not None:
+        msg = "logger and display cannot be used together"
+        raise ValueError(msg)
+    if display not in {None, "live"}:
+        msg = f"unsupported display: {display!r}"
+        raise ValueError(msg)
+
+
+def _entrypoint_name(names: dict[int, str], entrypoint_id: int) -> str:
+    return names.get(entrypoint_id, f"entrypoint #{entrypoint_id}")
+
+
+def _agent_message(event: dict[str, object]) -> str:
+    return f"{event.get('kind', 'agent')} | {_preview(event.get('data'))}"
+
+
 def _log_message(  # ruff: ignore[too-many-arguments]
     logger: logging.Logger,
     run_id: str,
@@ -132,9 +148,7 @@ class _RunLogger:
         name = (
             self.task_name
             if self.task_name and event.action_id == self.root_action_id
-            else self.entrypoint_names.get(
-                event.entrypoint_id, f"entrypoint #{event.entrypoint_id}"
-            )
+            else _entrypoint_name(self.entrypoint_names, event.entrypoint_id)
         )
         self.action_names[event.action_id] = name
         previous = self.actions.get(event.action_id)
@@ -175,6 +189,9 @@ class _RunLogger:
         if not isinstance(event.event, dict):
             message = "invalid task log event"
             raise TypeError(message)
+        if event.stream == "agent":
+            _log_message(self.logger, self.run_id, "agent", _agent_message(event.event))
+            return
         action = str(event.event.get("action_id", event.key.decode(errors="replace")))
         attempt = event.event.get("attempt", "?")
         attempt_label = f" · attempt {attempt}" if attempt != 1 else ""
@@ -406,16 +423,8 @@ class RunHandle(Generic[R]):
         Returns:
             The decoded task result.
 
-        Raises:
-            ValueError: If both output options are requested.
-
         """
-        if logger is not None and display is not None:
-            msg = "logger and display cannot be used together"
-            raise ValueError(msg)
-        if display not in {None, "live"}:
-            msg = f"unsupported display: {display!r}"
-            raise ValueError(msg)
+        _check_output_options(logger, display)
         if display == "live":
             from lutra._live import LiveDisplay  # ruff: ignore[import-outside-top-level]
 
@@ -434,7 +443,7 @@ class RunHandle(Generic[R]):
 
     async def _result(self, writer: _RunLogger | LiveDisplay | None) -> R:
         terminal: Run | None = None
-        events = self.watch() if writer is None else self.events()
+        events = self.watch() if writer is None else self._live_events()
         async for event in events:
             if writer is not None:
                 writer.event(event)
@@ -455,7 +464,42 @@ class RunHandle(Generic[R]):
             _log_message(writer.logger, self.id, "result", _preview(result))
         elif writer is not None:
             writer.finish(result)
-        return result  # type: ignore[return-value]
+        return result  # pyrefly: ignore[bad-return]
+
+    async def _live_events(self) -> AsyncIterator[Run | LogEvent | TaskActionStatus]:
+        """Merge task and agent streams for the terminal display.
+
+        Yields:
+            Run updates, child status, and records from both log streams.
+
+        """
+        queue: asyncio.Queue[tuple[int, Run | LogEvent | TaskActionStatus | None]] = asyncio.Queue()
+
+        async def forward(stream: str, index: int) -> None:
+            try:
+                async for event in self.events(stream):
+                    await queue.put((index, event))
+            finally:
+                await queue.put((index, None))
+
+        tasks = [
+            asyncio.create_task(forward("task_log", 0)),
+            asyncio.create_task(forward("agent", 1)),
+        ]
+        finished: set[int] = set()
+        try:
+            while len(finished) < len(tasks):
+                index, event = await queue.get()
+                if event is None:
+                    finished.add(index)
+                    tasks[index].result()
+                    continue
+                if index == 0 or isinstance(event, LogEvent):
+                    yield event
+        finally:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     async def cancel(self) -> None:
         """Request cancellation of this run."""
@@ -499,7 +543,7 @@ class RunHandle(Generic[R]):
             yield LogEvent(
                 stream=response.stream,
                 sequence=response.seq,
-                key=bytes(response.key),
+                key=response.key,
                 event=event,
                 created_unix_nanos=response.created_unix_nanos,
             )
@@ -559,7 +603,7 @@ class Client:
         visit(environment)
         identifiers: dict[TaskEnvironment, EnvironmentIdentifier] = {}
         for current in ordered:
-            inputs = _prepare_bundle(current)
+            inputs = await asyncio.to_thread(_prepare_bundle, current)
             if logger is not None:
                 _log_message(
                     logger,
@@ -568,8 +612,10 @@ class Client:
                     f"{current.name} · source {_size(inputs.source)}, "
                     f"build context {_size(inputs.build_context)}",
                 )
-            uri = await upload_blob(self.blob, inputs.source, SOURCE_BUNDLE_MIME)
-            build_uri = await upload_blob(self.blob, inputs.build_context, SOURCE_BUNDLE_MIME)
+            uri, build_uri = await asyncio.gather(
+                upload_blob(self.blob, inputs.source, SOURCE_BUNDLE_MIME),
+                upload_blob(self.blob, inputs.build_context, SOURCE_BUNDLE_MIME),
+            )
             response = await self.rpc.register_environment(
                 RegisterEnvironmentRequest(
                     spec=EnvironmentSpec(
@@ -696,16 +742,8 @@ class Client:
         Returns:
             The decoded task result.
 
-        Raises:
-            ValueError: If both output options are requested.
-
         """
-        if logger is not None and display is not None:
-            msg = "logger and display cannot be used together"
-            raise ValueError(msg)
-        if display not in {None, "live"}:
-            msg = f"unsupported display: {display!r}"
-            raise ValueError(msg)
+        _check_output_options(logger, display)
         arguments = []
         if logger is not None or display == "live":
             if invocation.args:
@@ -750,11 +788,7 @@ class Client:
         """Download and return the contents of a Lutra blob URI.
 
         Returns:
-            The blob contents.
+            The verified blob contents.
 
         """
-        response = await self.blob.get_download(GetDownloadRequest(uri=uri))
-        async with httpx.AsyncClient() as http:
-            downloaded = await http.get(response.url)
-            downloaded.raise_for_status()
-            return downloaded.content
+        return await self.blobs.download_bytes(uri)

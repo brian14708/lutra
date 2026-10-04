@@ -85,7 +85,7 @@ def _tar_info(name: str, mode: int) -> tarfile.TarInfo:
 
 
 def _write_tar(
-    source: Path, target: BinaryIO, *, prefix: str = ""
+    source: Path, target: BinaryIO, *, prefix: str = "", allow_symlinks: bool = True
 ) -> list[tuple[tarfile.TarInfo, int]]:
     members: list[tuple[tarfile.TarInfo, int]] = []
     with tarfile.open(fileobj=target, mode="w", format=tarfile.PAX_FORMAT) as archive:
@@ -112,6 +112,9 @@ def _write_tar(
                 with path.open("rb") as contents:
                     archive.addfile(entry, contents)
             elif stat.S_ISLNK(info.st_mode):
+                if not allow_symlinks:
+                    msg = f"symlinks are not allowed in snapshots: {arcname}"
+                    raise ArchiveError(msg)
                 entry = _tar_info(arcname, _REGULAR_MODE)
                 entry.type = tarfile.SYMTYPE
                 entry.linkname = str(path.readlink())
@@ -199,7 +202,9 @@ def _write_archive(
         raise ArchiveError(msg)
 
 
-def create_archive(source: Path, output: Path, *, prefix: str = "") -> None:
+def create_archive(
+    source: Path, output: Path, *, prefix: str = "", allow_symlinks: bool = True
+) -> None:
     """Write a sorted zstd:chunked tar archive with normalized tar metadata.
 
     Raises:
@@ -211,7 +216,7 @@ def create_archive(source: Path, output: Path, *, prefix: str = "") -> None:
     if prefix:
         _safe_name(prefix)
     with tempfile.TemporaryFile() as raw:
-        members = _write_tar(source, raw, prefix=prefix)
+        members = _write_tar(source, raw, prefix=prefix, allow_symlinks=allow_symlinks)
         tar_length = raw.tell()
         if tar_length > _MAX_ARCHIVE_SIZE:
             msg = "archive exceeds size or entry limit"
@@ -528,23 +533,34 @@ def _extract_member(tar: tarfile.TarFile, member: tarfile.TarInfo, root: Path) -
         raise ArchiveError(msg)
 
 
-def extract_archive(archive: Path, destination: Path) -> None:
+def extract_archive(archive: Path, destination: Path, *, allow_symlinks: bool = True) -> None:
     """Extract files, directories, and symlinks from the tar stream.
 
     Raises:
         ArchiveError: If the archive is malformed or contains an unsafe path.
 
     """
+    if Path(archive).stat().st_size > _MAX_ARCHIVE_SIZE:
+        msg = "archive exceeds size limit"
+        raise ArchiveError(msg)
     destination = Path(destination)
     destination.mkdir(parents=True, exist_ok=True)
     root = destination.resolve()
-    try:
+    try:  # ruff: ignore[too-many-statements-in-try-clause]
         with (
             Path(archive).open("rb") as source,
             zstandard.ZstdDecompressor().stream_reader(source, read_across_frames=True) as reader,
             tarfile.open(fileobj=reader, mode="r|") as tar,
         ):
-            for member in tar:
+            size = 0
+            for count, member in enumerate(tar, 1):
+                size += member.size
+                if size > _MAX_ARCHIVE_SIZE or count > _MAX_ARCHIVE_ENTRIES:
+                    msg = "archive exceeds size or entry limit"
+                    raise ArchiveError(msg)
+                if member.issym() and not allow_symlinks:
+                    msg = f"symlinks are not allowed in snapshots: {member.name}"
+                    raise ArchiveError(msg)
                 _extract_member(tar, member, root)
     except (tarfile.TarError, zstandard.ZstdError) as error:
         msg = "invalid compressed tar archive"

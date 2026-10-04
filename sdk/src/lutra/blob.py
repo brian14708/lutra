@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import base64
 import hashlib
 import tempfile
 from pathlib import Path
@@ -11,8 +10,8 @@ from typing import TYPE_CHECKING
 
 import httpx
 
-from lutra._blob import _upload
-from lutra._gen.lutra.v1.blob_pb import CreateUploadRequest, GetDownloadRequest
+from lutra._blob import upload_blob, upload_stream
+from lutra._gen.lutra.v1.blob_pb import GetDownloadRequest
 from lutra.value import BlobRef, _parse_blob_name
 
 if TYPE_CHECKING:
@@ -38,6 +37,18 @@ class BlobStore:
         """Use the RPC channel for authorization and presigning."""
         self._client = client
 
+    async def upload_bytes(
+        self, contents: bytes, mime_type: str, *, metadata: Mapping[str, str] | None = None
+    ) -> BlobRef:
+        """Hash and upload in-memory bytes, returning a durable reference.
+
+        Returns:
+            An unresolved, content-addressed reference.
+
+        """
+        uri = await upload_blob(self._client, contents, mime_type, metadata=dict(metadata or {}))
+        return BlobRef(uri)
+
     async def upload_file(
         self, path: Path, mime_type: str, *, metadata: Mapping[str, str] | None = None
     ) -> BlobRef:
@@ -49,9 +60,6 @@ class BlobStore:
         Returns:
             An unresolved, content-addressed reference.
 
-        Raises:
-            ValueError: If the service returns a different content reference.
-
         """
         with await asyncio.to_thread(Path(path).open, "rb") as source:
             digest = hashlib.sha256()
@@ -60,25 +68,11 @@ class BlobStore:
                 digest.update(chunk)
                 size += len(chunk)
             checksum = digest.digest()
-            ref = BlobRef(f"blob:{mime_type},{base64.b64encode(checksum).decode('ascii')}")
-            created = await self._client.create_upload(
-                CreateUploadRequest(
-                    content_sha256=checksum,
-                    size=size,
-                    mime_type=mime_type,
-                    metadata=dict(metadata or {}),
-                )
+            await asyncio.to_thread(source.seek, 0)
+            uri = await upload_stream(
+                self._client, source, checksum, size, mime_type, dict(metadata or {})
             )
-            if created.already_exists:
-                return ref
-            source.seek(0)
-            uri = await _upload(
-                self._client, created.session_id, source, created.part_size, created.part_count
-            )
-        if uri != ref.uri:
-            message = "blob service returned a different URI"
-            raise ValueError(message)
-        return ref
+        return BlobRef(uri)
 
     async def presigned_get(self, ref: BlobRef | str) -> str:
         """Return an object-scoped GET URL valid for 24 hours.
@@ -91,6 +85,31 @@ class BlobStore:
         """
         response = await self._client.get_download(GetDownloadRequest(uri=_stored_ref(ref).uri))
         return response.url
+
+    async def download_bytes(self, ref: BlobRef | str) -> bytes:
+        """Download and verify blob contents.
+
+        Returns:
+            The blob contents.
+
+        Raises:
+            ValueError: If the downloaded content has a different digest.
+
+        """
+        stored = _stored_ref(ref)
+        expected = _parse_blob_name(stored.uri[5:])
+        url = await self.presigned_get(stored)
+        digest = hashlib.sha256()
+        chunks: list[bytes] = []
+        async with httpx.AsyncClient() as http, http.stream("GET", url) as response:
+            response.raise_for_status()
+            async for chunk in response.aiter_bytes(_CHUNK_SIZE):
+                chunks.append(chunk)
+                digest.update(chunk)
+        if digest.digest() != expected:
+            message = "blob content digest mismatch"
+            raise ValueError(message)
+        return b"".join(chunks)
 
     async def download_file(self, ref: BlobRef | str, path: Path) -> None:
         """Stream and verify a file, then atomically replace the destination.

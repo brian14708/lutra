@@ -69,6 +69,40 @@ async def _upload(
         return completed.uri
 
 
+async def upload_stream(  # ruff: ignore[too-many-arguments,too-many-positional-arguments]
+    client: BlobServiceClient,
+    contents: BinaryIO,
+    digest: bytes,
+    size: int,
+    mime_type: str,
+    metadata: dict[str, str] | None,
+) -> str:
+    """Create an upload session for pre-hashed content and transfer it.
+
+    Returns:
+        The content-addressed blob URI.
+
+    Raises:
+        ValueError: If the service returns a different content reference.
+
+    """
+    uri = f"blob:{mime_type},{base64.b64encode(digest).decode('ascii')}"
+    created = await client.create_upload(
+        CreateUploadRequest(
+            content_sha256=digest, size=size, mime_type=mime_type, metadata=metadata or {}
+        )
+    )
+    if created.already_exists:
+        return uri
+    returned_uri = await _upload(
+        client, created.session_id, contents, created.part_size, created.part_count
+    )
+    if returned_uri != uri:
+        msg = "blob service returned a different URI"
+        raise ValueError(msg)
+    return uri
+
+
 async def upload_blob(
     client: BlobServiceClient,
     contents: bytes,
@@ -77,21 +111,9 @@ async def upload_blob(
     metadata: dict[str, str] | None = None,
 ) -> str:
     digest = hashlib.sha256(contents).digest()
-    uri = f"blob:{mime_type},{base64.b64encode(digest).decode('ascii')}"
-    created = await client.create_upload(
-        CreateUploadRequest(
-            content_sha256=digest, size=len(contents), mime_type=mime_type, metadata=metadata or {}
-        )
+    return await upload_stream(
+        client, io.BytesIO(contents), digest, len(contents), mime_type, metadata
     )
-    if created.already_exists:
-        return uri
-    returned_uri = await _upload(
-        client, created.session_id, io.BytesIO(contents), created.part_size, created.part_count
-    )
-    if returned_uri != uri:
-        msg = "blob service returned a different URI"
-        raise ValueError(msg)
-    return uri
 
 
 async def upload_directory(client: BlobServiceClient, directory: Path, *, prefix: str = "") -> str:

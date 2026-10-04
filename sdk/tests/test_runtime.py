@@ -1,5 +1,7 @@
 """Child submission and independent result waits."""
 
+from __future__ import annotations
+
 import asyncio
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, cast
@@ -11,6 +13,7 @@ from lutra.runtime import RunContext, run_context, spawn
 from lutra.value import dumps
 
 if TYPE_CHECKING:
+    from lutra._gen.lutra.v1.lutra_pb import CreateTaskActionRequest, GetTaskActionRequest
     from lutra.serve import TaskAPIClient
     from lutra.task import Invocation
 
@@ -50,8 +53,8 @@ async def test_reordered_spawns_keep_stable_keys_and_independent_results(
             pass
 
         @staticmethod
-        async def create_task_action(request: object) -> object:
-            key = request.idempotency_key  # type: ignore[missing-attribute]
+        async def create_task_action(request: CreateTaskActionRequest) -> object:
+            key = request.idempotency_key
             created.append(key)
             if key == "first":
                 await release_create.wait()
@@ -60,8 +63,8 @@ async def test_reordered_spawns_keep_stable_keys_and_independent_results(
             return SimpleNamespace(action=TaskAction(id=key))
 
         @staticmethod
-        async def get_task_action(request: object) -> object:
-            key = request.id  # type: ignore[missing-attribute]
+        async def get_task_action(request: GetTaskActionRequest) -> object:
+            key = request.id
             if key == "second":
                 await release_second.wait()
             return SimpleNamespace(

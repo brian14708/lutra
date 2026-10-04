@@ -18,6 +18,7 @@ from lutra.task import (
     TaskEnvironment,
     TaskImage,
 )
+from lutra.tools import ToolSchema
 from lutra.value import BlobRef
 
 __all__ = [
@@ -43,6 +44,7 @@ __all__ = [
     "TaskContext",
     "TaskEnvironment",
     "TaskImage",
+    "ToolSchema",
     "Uv",
     "current_context",
     "run",

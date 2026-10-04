@@ -4,12 +4,14 @@ from __future__ import annotations
 
 from contextvars import ContextVar
 from dataclasses import dataclass, field
+from pathlib import Path
 from types import MappingProxyType
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
 
+    from lutra._gen.lutra.v1.log_connect import LogServiceClient
     from lutra.blob import BlobStore
     from lutra.checkpoint import CheckpointManager
     from lutra.task import RetryMode
@@ -26,6 +28,9 @@ class TaskContext:
     checkpoint: CheckpointManager
     blobs: BlobStore
     config: Mapping[str, object] = field(default_factory=lambda: MappingProxyType[str, object]({}))
+
+    workspace: Path = field(default_factory=Path.cwd)
+    log: LogServiceClient | None = None
 
 
 task_context: ContextVar[TaskContext] = ContextVar("lutra_task_context")

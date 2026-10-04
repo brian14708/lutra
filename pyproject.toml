@@ -3,8 +3,9 @@ members = ["sdk"]
 
 [tool.pytest.ini_options]
 addopts = "-ra"
+markers = ["integration: requires a running Lutra stack"]
 testpaths = ["sdk/tests"]
-pythonpath = ["sdk/src"]
+pythonpath = ["sdk/src", "sdk/examples"]
 
 [dependency-groups]
 dev = [
@@ -19,20 +20,40 @@ target-version = "py311"
 line-length = 100
 preview = true
 extend-exclude = ["sdk/src/lutra/_gen"]
+force-exclude = true
 
 [tool.ruff.lint]
 select = ["ALL"]
 ignore = [
+  # The formatter owns trailing commas.
   "missing-trailing-comma",
-  "missing-copyright-notice",
+  # Avoid conflicts with the selected first-line, no-blank-line docstring style.
   "incorrect-blank-line-before-class",
   "multi-line-summary-second-line",
+  "missing-copyright-notice",
 ]
 extend-safe-fixes = ["TC", "unused-import"]
 
 [tool.ruff.lint.per-file-ignores]
-"sdk/tests/**/*.py" = ["assert", "D", "import-private-name", "magic-value-comparison"]
-"sdk/examples/**/*.py" = ["D", "print", "implicit-namespace-package"]
+"sdk/tests/**/*.py" = [
+  "assert",
+  "undocumented-public-module",
+  "undocumented-public-class",
+  "undocumented-public-method",
+  "undocumented-public-function",
+  "undocumented-public-package",
+  "undocumented-public-init",
+  "import-private-name",
+  "magic-value-comparison",
+]
+"sdk/examples/**/*.py" = [
+  "undocumented-public-class",
+  "undocumented-public-function",
+  "print",
+  "implicit-namespace-package",
+]
+# AgentSession shares Agent configuration and narrows state after lifecycle guards.
+"sdk/src/lutra/agent.py" = ["private-member-access", "assert"]
 
 [tool.ruff.lint.isort]
 extra-standard-library = ["typing_extensions"]

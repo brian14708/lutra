@@ -23,6 +23,7 @@ if TYPE_CHECKING:
     from types import FunctionType
 
     from lutra._source_bundle import PreparedSource
+    from lutra.tools import ToolSchema
 P = ParamSpec("P")
 R_co = TypeVar("R_co", covariant=True)
 _MAX_ATTEMPTS = 100
@@ -354,6 +355,17 @@ class Task(Generic[P, R_co]):
         """
         inspect.signature(self.function).bind(*args, **kwargs)
         return Invocation(self, args, kwargs)
+
+    def tool_schema(self) -> ToolSchema:
+        """Export this task as a tool.
+
+        Returns:
+            The name, docstring, and JSON Schema for keyword arguments.
+
+        """
+        from lutra._tool_schema import tool_schema  # ruff: ignore[import-outside-top-level]
+
+        return tool_schema(self.function)
 
     def entrypoint(self, source: PreparedSource) -> str:
         """Return the server registration declaration.
