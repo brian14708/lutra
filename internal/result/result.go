@@ -60,10 +60,6 @@ func DecodeFailure(encoded []byte) (Failure, bool, error) {
 		return Failure{}, true, errors.New("invalid result failure")
 	}
 	var f Failure
-	flag := fields["cacheable"]
-	if len(flag) != 1 || (flag[0] != 0xf4 && flag[0] != 0xf5) {
-		return Failure{}, true, errors.New("invalid result failure cacheability")
-	}
 	if err := cbor.Unmarshal(fields["cacheable"], &f.Cacheable); err != nil {
 		return Failure{}, true, errors.New("invalid result failure cacheability")
 	}
@@ -80,18 +76,14 @@ func DecodeFailure(encoded []byte) (Failure, bool, error) {
 	return f, true, nil
 }
 
-func Validate(encoded []byte) error {
+// Validate checks size bounds and CBOR wellformedness, returning the decoded
+// failure when the value carries the error tag.
+func Validate(encoded []byte) (Failure, bool, error) {
 	if len(encoded) == 0 || len(encoded) > MaxResultSize {
-		return errors.New("result CBOR size is out of bounds")
+		return Failure{}, false, errors.New("result CBOR size is out of bounds")
 	}
-	var value any
-	if err := cbor.Unmarshal(encoded, &value); err != nil {
-		return fmt.Errorf("invalid result CBOR: %w", err)
+	if err := cbor.Wellformed(encoded); err != nil {
+		return Failure{}, false, fmt.Errorf("invalid result CBOR: %w", err)
 	}
-	if _, tagged, err := DecodeFailure(encoded); err != nil {
-		return err
-	} else if tagged {
-		return nil
-	}
-	return nil
+	return DecodeFailure(encoded)
 }

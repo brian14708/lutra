@@ -103,13 +103,7 @@ func dockerfile(image *lutrav1.ImageSpec) (string, error) {
 		fmt.Fprintf(&b, "ENV %s=\"%s\"\n", key, value)
 	}
 	fmt.Fprint(&b, "COPY [\".\", \"/opt/lutra/dependencies/\"]\n")
-	seen := make(map[string]bool)
-	for _, copy := range image.GetOciCopies() {
-		key := copy.GetImage() + "\x00" + copy.GetSource() + "\x00" + copy.GetDestination()
-		if seen[key] {
-			continue
-		}
-		seen[key] = true
+	for _, copy := range deduplicateCopies(image.GetOciCopies()) {
 		paths, err := json.Marshal([]string{copy.GetSource(), copy.GetDestination()})
 		if err != nil {
 			return "", err
@@ -127,12 +121,15 @@ func dockerfile(image *lutrav1.ImageSpec) (string, error) {
 	return b.String(), nil
 }
 
+// imageTag names the locally built image for an environment key.
+func imageTag(key []byte) string { return "lutra:sha-" + hex.EncodeToString(key) }
+
 func (e *ContainerExecutor) Build(ctx context.Context, req *EnvironmentExecution) (*Image, error) {
 	key, err := e.ImageKey(req.Spec)
 	if err != nil {
 		return nil, err
 	}
-	tag := "lutra:sha-" + hex.EncodeToString(key)
+	tag := imageTag(key)
 	if err := exec.CommandContext(ctx, e.Runtime, "image", "inspect", tag).Run(); err == nil {
 		return &Image{ArtifactURI: "container://" + tag}, nil
 	}

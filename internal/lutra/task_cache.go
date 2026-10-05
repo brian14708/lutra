@@ -16,6 +16,9 @@ func (d *runDriver) Acquire(ctx context.Context, key []byte) ([]byte, error, tas
 	}
 	copy(digest[:], key)
 	task, lease, err := d.worker.cache.Acquire(ctx, digest)
+	if errors.Is(err, cache.ErrBusy) {
+		return nil, nil, nil, tasktree.ErrCacheBusy
+	}
 	if err != nil {
 		return nil, nil, nil, err
 	}
@@ -37,7 +40,7 @@ func (l taskLease) Finish(ctx context.Context, output []byte, taskErr error) err
 		return l.Release(ctx)
 	}
 	if failure != nil {
-		encoded, err := result.EncodeFailure(result.Failure{Cacheable: true, Message: failure.Code, Details: failure.Details})
+		encoded, err := failure.output()
 		if err != nil {
 			return err
 		}

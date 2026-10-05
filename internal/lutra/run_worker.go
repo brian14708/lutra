@@ -39,6 +39,7 @@ type RunWorker struct {
 	slots                         tasktree.Slots
 	processes                     *tasktree.ProcessPool
 	cache                         *cache.Service
+	runtime                       func() (string, error)
 	cancelMu                      sync.Mutex
 	owners                        map[uuid.UUID]context.CancelFunc
 	wg                            sync.WaitGroup
@@ -53,6 +54,7 @@ func (w *RunWorker) Start(ctx context.Context) {
 	}
 	w.owners = make(map[uuid.UUID]context.CancelFunc)
 	w.slots = tasktree.NewSlots(w.Capacity)
+	w.runtime = sync.OnceValues(containerRuntime)
 	if w.ProcessTarget < 1 {
 		w.ProcessTarget, _ = strconv.Atoi(os.Getenv("LUTRA_WORKER_PROCESS_TARGET"))
 	}
@@ -158,7 +160,7 @@ func taskNode(row db.LoadRunTasksRow, runtime string, config RunConfigSnapshot) 
 	if err != nil {
 		return tasktree.Node{}, err
 	}
-	return tasktree.Node{ID: row.ID, ParentID: row.CallerActionID, Attempt: row.Attempts, Failures: row.Failures, MaxAttempts: max(spec.MaxAttempts, 1), State: state, ImageKey: row.ImageKey, CacheKey: key, Output: row.ResultCbor, Error: failure.Message, NextAttemptAt: row.NextAttemptAt.Time}, nil
+	return tasktree.Node{ID: row.ID, ParentID: row.CallerActionID, Attempt: row.Attempts, MaxAttempts: max(spec.MaxAttempts, 1), State: state, ImageKey: row.ImageKey, CacheKey: key, Output: row.ResultCbor, Error: failure.Message, NextAttemptAt: row.NextAttemptAt.Time}, nil
 }
 
 func cacheKey(row db.LoadRunTasksRow, spec *lutrav1.ActionSpec, runtime string, config RunConfigSnapshot) []byte {
@@ -292,7 +294,7 @@ func (w *RunWorker) drive(parent context.Context, runID, token uuid.UUID) {
 	if err = tx.Commit(ctx); err != nil {
 		return
 	}
-	runtime, err := containerRuntime()
+	runtime, err := w.runtime()
 	if err != nil {
 		slog.Error("select container runtime", "error", err)
 		return
@@ -302,8 +304,7 @@ func (w *RunWorker) drive(parent context.Context, runID, token uuid.UUID) {
 		slog.Error("load run configuration", "error", err)
 		return
 	}
-	d := &runDriver{worker: w, ctx: ctx, runtime: runtime, runID: runID, token: token, rows: make(map[uuid.UUID]db.LoadRunTasksRow), images: make(map[string]*imageWait)}
-	d.config = config
+	d := &runDriver{worker: w, ctx: ctx, config: config, runtime: runtime, runID: runID, token: token, rows: make(map[uuid.UUID]db.LoadRunTasksRow), images: make(map[string]*imageWait)}
 	snapshot := make([]tasktree.Node, 0, len(rows))
 	for _, row := range rows {
 		node, nodeErr := taskNode(row, runtime, config)
@@ -383,20 +384,15 @@ func (d *runDriver) Ensure(ctx context.Context, key []byte) error {
 				wait.err = err
 				return
 			}
-			runtime, err := containerRuntime()
-			if err != nil {
-				wait.err = err
-				return
-			}
 			for _, phase := range []string{"pull", "build"} {
 				reader, writer := io.Pipe()
 				image := task.Spec.GetImage().GetFromImage()
 				if phase == "build" {
-					image = fmt.Sprintf("lutra:sha-%x", key)
+					image = imageTag(key)
 				}
 				logDone := d.worker.collectTaskLogs(runlog.TaskLogEvent{
 					ActionID: row.ID.String(), Attempt: max(row.Attempts, 1),
-					Phase: phase, Runtime: runtime, Image: image,
+					Phase: phase, Runtime: d.runtime, Image: image,
 				}, d.runID, reader)
 				defer func() {
 					_ = writer.Close()

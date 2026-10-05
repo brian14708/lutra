@@ -35,16 +35,16 @@ const (
 )
 
 type Node struct {
-	ID                             uuid.UUID
-	ParentID                       *uuid.UUID
-	Attempt, Failures, MaxAttempts int32
-	State                          State
-	WaitingOn                      WaitReason
-	ImageKey, Output               []byte
-	CacheKey                       []byte
-	CacheHit                       bool
-	Error                          string
-	NextAttemptAt                  time.Time
+	ID                   uuid.UUID
+	ParentID             *uuid.UUID
+	Attempt, MaxAttempts int32
+	State                State
+	WaitingOn            WaitReason
+	ImageKey, Output     []byte
+	CacheKey             []byte
+	CacheHit             bool
+	Error                string
+	NextAttemptAt        time.Time
 }
 
 type Attempt struct {
@@ -53,14 +53,14 @@ type Attempt struct {
 }
 
 type Transition struct {
-	RunID, ClaimToken, NodeID          uuid.UUID
-	From, State                        State
-	WaitingOn                          WaitReason
-	Attempt, Failures, ExpectedAttempt int32
-	Output                             []byte
-	Error                              string
-	At, NextAttemptAt                  time.Time
-	CacheHit                           bool
+	RunID, ClaimToken, NodeID uuid.UUID
+	From, State               State
+	WaitingOn                 WaitReason
+	Attempt, ExpectedAttempt  int32
+	Output                    []byte
+	Error                     string
+	At, NextAttemptAt         time.Time
+	CacheHit                  bool
 }
 
 type Store interface {
@@ -75,6 +75,9 @@ type Images interface {
 type Cache interface {
 	Acquire(context.Context, []byte) ([]byte, error, CacheLease, error)
 }
+
+var ErrCacheBusy = errors.New("cache entry is being built")
+
 type CacheLease interface {
 	Context() context.Context
 	Finish(context.Context, []byte, error) error
@@ -298,7 +301,7 @@ func (e *Coordinator) commitLocked(ctx context.Context, next Node) error {
 		committed := make(chan struct{})
 		e.committing[next.ID] = committed
 		e.mu.Unlock()
-		err := e.opts.Store.Transition(ctx, Transition{RunID: e.opts.RunID, ClaimToken: e.opts.ClaimToken, NodeID: next.ID, From: old.State, State: next.State, WaitingOn: next.WaitingOn, Attempt: next.Attempt, Failures: next.Failures, ExpectedAttempt: old.Attempt, Output: next.Output, Error: next.Error, At: e.opts.Clock.Now(), NextAttemptAt: next.NextAttemptAt, CacheHit: next.CacheHit})
+		err := e.opts.Store.Transition(ctx, Transition{RunID: e.opts.RunID, ClaimToken: e.opts.ClaimToken, NodeID: next.ID, From: old.State, State: next.State, WaitingOn: next.WaitingOn, Attempt: next.Attempt, ExpectedAttempt: old.Attempt, Output: next.Output, Error: next.Error, At: e.opts.Clock.Now(), NextAttemptAt: next.NextAttemptAt, CacheHit: next.CacheHit})
 		e.mu.Lock()
 		delete(e.committing, next.ID)
 		close(committed)
@@ -321,16 +324,28 @@ func (e *Coordinator) validateLocked() error {
 	if e.err != nil {
 		return e.err
 	}
+	verified := make(map[uuid.UUID]bool, len(e.nodes))
 	for id := range e.nodes {
-		ancestors := make(map[uuid.UUID]bool)
-		for current := e.nodes[id]; current.ParentID != nil; current = e.nodes[*current.ParentID] {
-			if e.nodes[*current.ParentID] == nil {
-				return errors.New("task tree references a missing parent")
-			}
-			if ancestors[current.ID] {
+		if verified[id] {
+			continue
+		}
+		path := make(map[uuid.UUID]bool)
+		for current := e.nodes[id]; current != nil && !verified[current.ID]; {
+			if path[current.ID] {
 				return errors.New("task tree contains a parent cycle")
 			}
-			ancestors[current.ID] = true
+			path[current.ID] = true
+			if current.ParentID == nil {
+				break
+			}
+			next := e.nodes[*current.ParentID]
+			if next == nil {
+				return errors.New("task tree references a missing parent")
+			}
+			current = next
+		}
+		for nodeID := range path {
+			verified[nodeID] = true
 		}
 	}
 	return nil
@@ -367,13 +382,17 @@ func (e *Coordinator) Run(ctx context.Context) error {
 		return errors.New("task tree has no root")
 	}
 	// Recovery can observe a parent completion before descendant cleanup.
+	terminal := make([]uuid.UUID, 0, len(e.nodes))
 	for id, node := range e.nodes {
 		if node.State.Terminal() {
-			if err := e.closeLocked(e.ctx, id, "ancestor completed"); err != nil {
-				e.mu.Unlock()
-				e.cancel()
-				return err
-			}
+			terminal = append(terminal, id)
+		}
+	}
+	if len(terminal) > 0 {
+		if err := e.closeSubtreesLocked(e.ctx, terminal, "ancestor completed"); err != nil {
+			e.mu.Unlock()
+			e.cancel()
+			return err
 		}
 	}
 	e.mu.Unlock()
@@ -568,12 +587,12 @@ func (e *Coordinator) execute(id uuid.UUID, releaseAdmission func()) {
 			e.abortOwner(errors.New("cache lease lost"))
 			return
 		}
-		if acquireErr != nil {
+		if acquireErr != nil && !errors.Is(acquireErr, ErrCacheBusy) {
 			e.mu.Unlock()
 			e.abortOwner(acquireErr)
 			return
 		}
-		if lease == nil {
+		if lease == nil && !errors.Is(acquireErr, ErrCacheBusy) {
 			n.CacheHit = true
 			n.Output = output
 			if taskErr != nil {
@@ -663,19 +682,22 @@ func (e *Coordinator) execute(id uuid.UUID, releaseAdmission func()) {
 		e.opts.SlotPool.Release()
 		return
 	}
-	e.waitStableLocked(id)
-	n = clone(*e.nodes[id])
-	if n.State != Ready || e.ctx.Err() != nil {
-		e.mu.Unlock()
-		cancel()
-		e.opts.SlotPool.Release()
-		return
-	}
 	if workCtx.Err() != nil {
 		e.mu.Unlock()
 		cancel()
 		e.opts.SlotPool.Release()
 		e.abortOwner(errors.New("cache lease lost"))
+		return
+	}
+	if n.Attempt >= max(n.MaxAttempts, 1) {
+		n.State = Failed
+		n.Error = "maximum attempts exhausted"
+		if e.commitLocked(e.ctx, n) == nil {
+			_ = e.closeLocked(e.ctx, id, "parent action failed")
+		}
+		e.mu.Unlock()
+		cancel()
+		e.opts.SlotPool.Release()
 		return
 	}
 	n.State = Running
@@ -749,12 +771,11 @@ func (e *Coordinator) execute(id uuid.UUID, releaseAdmission func()) {
 		n.State = Done
 		n.Error = ""
 	} else {
-		n.Failures++
 		n.Error = err.Error()
-		if isRetryable(err) && !isCacheable(err) && n.Failures < max(n.MaxAttempts, 1) {
+		if isRetryable(err) && !isCacheable(err) && n.Attempt < max(n.MaxAttempts, 1) {
 			n.State = Pending
 			n.WaitingOn = WaitingForRetry
-			n.NextAttemptAt = e.opts.Clock.Now().Add(e.opts.RetryBackoff(n.Failures))
+			n.NextAttemptAt = e.opts.Clock.Now().Add(e.opts.RetryBackoff(n.Attempt))
 		} else {
 			n.State = Failed
 		}
@@ -980,16 +1001,38 @@ func result(n Node) (Node, error) {
 }
 
 func (e *Coordinator) closeLocked(ctx context.Context, parent uuid.UUID, reason string) error {
-	ids := make(map[uuid.UUID]bool)
-	queue := make([]uuid.UUID, 0, len(e.nodes))
+	roots := make([]uuid.UUID, 0, len(e.nodes))
 	if parent == uuid.Nil {
 		for id := range e.nodes {
-			queue = append(queue, id)
+			roots = append(roots, id)
 		}
 	} else {
-		queue = append(queue, parent)
+		roots = append(roots, parent)
 	}
+	return e.closeSubtreesLocked(ctx, roots, reason)
+}
+
+func (e *Coordinator) closeSubtreesLocked(ctx context.Context, roots []uuid.UUID, reason string) error {
+	children := make(map[uuid.UUID][]uuid.UUID, len(e.nodes))
+	indexed := -1
+	index := func() {
+		// Commits release the lock, so children added mid-close (e.g. by Add)
+		// must be picked up on the next dequeue.
+		if indexed == len(e.nodes) {
+			return
+		}
+		clear(children)
+		for id, n := range e.nodes {
+			if n.ParentID != nil {
+				children[*n.ParentID] = append(children[*n.ParentID], id)
+			}
+		}
+		indexed = len(e.nodes)
+	}
+	ids := make(map[uuid.UUID]bool, len(e.nodes))
+	queue := append([]uuid.UUID(nil), roots...)
 	for len(queue) > 0 {
+		index()
 		id := queue[0]
 		queue = queue[1:]
 		if ids[id] {
@@ -997,11 +1040,8 @@ func (e *Coordinator) closeLocked(ctx context.Context, parent uuid.UUID, reason 
 		}
 		ids[id] = true
 		e.waitStableLocked(id)
-		for child, n := range e.nodes {
-			if n.ParentID != nil && *n.ParentID == id && !ids[child] {
-				queue = append(queue, child)
-			}
-		}
+		index()
+		queue = append(queue, children[id]...)
 		n := clone(*e.nodes[id])
 		if n.State.Terminal() {
 			continue

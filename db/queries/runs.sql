@@ -75,7 +75,6 @@ SELECT
   a.status,
   a.attempts,
   a.next_attempt_at,
-  a.failures,
   a.environment_id,
   a.entrypoint_id,
   e.namespace_id,
@@ -177,7 +176,6 @@ WITH RECURSIVE ancestors AS (
 UPDATE lutra.task_actions AS a
 SET status = sqlc.arg(status)::lutra.task_action_status,
   attempts = sqlc.arg(attempt)::integer,
-  failures = sqlc.arg(failures)::integer,
   result_cbor = sqlc.narg(result_cbor)::bytea,
   next_attempt_at = sqlc.narg(next_attempt_at)::timestamptz,
   updated_at = now()

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -76,6 +77,52 @@ type failingCache struct{ err error }
 
 func (c failingCache) Acquire(context.Context, []byte) ([]byte, error, CacheLease, error) {
 	return nil, nil, nil, c.err
+}
+
+type busyCache struct {
+	claimed atomic.Bool
+	lease   recordingLease
+}
+
+func (c *busyCache) Acquire(ctx context.Context, _ []byte) ([]byte, error, CacheLease, error) {
+	if !c.claimed.CompareAndSwap(false, true) {
+		return nil, nil, nil, ErrCacheBusy
+	}
+	c.lease.ctx = ctx
+	return nil, nil, &c.lease, nil
+}
+
+func TestCachedParentCanAwaitChildWithSameCacheKey(t *testing.T) {
+	root, child := id(), id()
+	cache := &busyCache{}
+	var executor *Coordinator
+	executor = New([]Node{{ID: root, CacheKey: []byte{1}, MaxAttempts: 1}}, Options{
+		Slots: 1, ReadyQueue: 1, Cache: cache,
+		Runner: runnerFunc(func(ctx context.Context, attempt Attempt) ([]byte, error) {
+			if attempt.NodeID == child {
+				return []byte{0x03}, nil
+			}
+			if err := executor.Add(ctx, root, attempt.Number, Node{ID: child, CacheKey: []byte{1}, MaxAttempts: 1}); err != nil {
+				return nil, err
+			}
+			node, err := executor.Wait(ctx, root, attempt.Number, child)
+			if err != nil {
+				return nil, err
+			}
+			if node.State != Done || node.CacheHit || string(node.Output) != string([]byte{0x03}) {
+				return nil, errors.New("busy child did not execute")
+			}
+			return []byte{0x02}, nil
+		}),
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := executor.Run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if !cache.lease.finished {
+		t.Fatal("parent did not publish its result")
+	}
 }
 
 func TestCacheLookupFailureLeavesActionForReplay(t *testing.T) {

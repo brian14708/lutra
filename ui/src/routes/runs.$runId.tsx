@@ -86,6 +86,7 @@ function RunDetail() {
   }, [runId, filter]);
 
   const visible = filter ? rows.filter((row) => row.event.action_id.startsWith(filter)) : rows;
+  const failure = run ? failureMessage(run.resultCbor) : "";
   return (
     <main className="mx-auto max-w-[1050px] px-5 py-8 md:px-10 md:py-11">
       <Link to="/" className="text-[13px] font-semibold text-teal-700 hover:underline">
@@ -98,9 +99,7 @@ function RunDetail() {
       <section className="rounded-lg border border-slate-200 bg-white p-5">
         <h2 className="text-base font-semibold">Status</h2>
         <p className="mt-2 text-[13px] text-slate-600">{run?.status ?? "Loading..."}</p>
-        {run && failureMessage(run.resultCbor) && (
-          <p className="mt-2 text-[13px] text-rose-700">{failureMessage(run.resultCbor)}</p>
-        )}
+        {failure && <p className="mt-2 text-[13px] text-rose-700">{failure}</p>}
       </section>
       <section className="mt-5 rounded-lg border border-slate-200 bg-white p-5">
         <div className="flex flex-wrap items-center justify-between gap-3">

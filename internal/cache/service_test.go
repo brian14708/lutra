@@ -94,7 +94,7 @@ func TestTaskCacheLifecycle(t *testing.T) {
 		waiting, stop := context.WithTimeout(ctx, 20*time.Millisecond)
 		_, _, err = service.Acquire(waiting, key)
 		stop()
-		if !errors.Is(err, context.DeadlineExceeded) {
+		if !errors.Is(err, ErrBusy) {
 			t.Fatalf("waiting on owner: %v", err)
 		}
 		if err := lease.Complete(ctx, want); err != nil {

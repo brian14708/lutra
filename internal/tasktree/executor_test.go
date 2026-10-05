@@ -3,6 +3,7 @@ package tasktree
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -486,10 +487,14 @@ func TestStoreFailureStopsRun(t *testing.T) {
 
 func TestRetryUsesInjectedClock(t *testing.T) {
 	clock := newTestClock()
-	root := Node{ID: id(), MaxAttempts: 2}
+	root := Node{ID: id(), Attempt: 1, MaxAttempts: 3}
 	firstAttempt := make(chan struct{})
+	backoffAttempt := make(chan int32, 1)
 	calls := 0
-	e := New([]Node{root}, Options{Clock: clock, RetryBackoff: func(int32) time.Duration { return 5 * time.Second }, Runner: runnerFunc(func(context.Context, Attempt) ([]byte, error) {
+	e := New([]Node{root}, Options{Clock: clock, RetryBackoff: func(attempt int32) time.Duration {
+		backoffAttempt <- attempt
+		return 5 * time.Second
+	}, Runner: runnerFunc(func(context.Context, Attempt) ([]byte, error) {
 		calls++
 		if calls == 1 {
 			close(firstAttempt)
@@ -510,6 +515,9 @@ func TestRetryUsesInjectedClock(t *testing.T) {
 	case <-clock.timerCreated:
 	case <-ctx.Done():
 		t.Fatal("retry timer was not registered")
+	}
+	if attempt := <-backoffAttempt; attempt != 2 {
+		t.Fatalf("backoff attempt=%d, want 2", attempt)
 	}
 	clock.advance(5 * time.Second)
 	select {
@@ -580,10 +588,41 @@ func TestRejectInvalidSnapshots(t *testing.T) {
 	}
 }
 
-func TestRecoveryReusesCompletedChildAndPreservesFailures(t *testing.T) {
+func TestRecoveryEnforcesAttemptLimit(t *testing.T) {
+	for _, limits := range []struct{ previous, maximum int32 }{{0, 1}, {1, 1}, {1, 2}} {
+		t.Run(fmt.Sprintf("%d_of_%d", limits.previous, limits.maximum), func(t *testing.T) {
+			root := Node{ID: id(), Attempt: limits.previous, MaxAttempts: limits.maximum}
+			calls := 0
+			e := New([]Node{root}, Options{Slots: 1, Runner: runnerFunc(func(context.Context, Attempt) ([]byte, error) {
+				calls++
+				return nil, errors.New("retryable failure")
+			})})
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			runErr := e.Run(ctx)
+			node, err := e.Get(ctx, root.ID)
+			if err != nil || node.State != Failed || node.Attempt != limits.maximum || calls != int(limits.maximum-limits.previous) || runErr == nil || !node.NextAttemptAt.IsZero() {
+				t.Fatalf("node=%+v, calls=%d, get error=%v, run error=%v", node, calls, err, runErr)
+			}
+			if limits.previous == limits.maximum && node.Error != "maximum attempts exhausted" {
+				t.Fatalf("error=%q", node.Error)
+			}
+			if err := e.opts.SlotPool.Acquire(ctx); err != nil {
+				t.Fatal(err)
+			}
+			e.opts.SlotPool.Release()
+			if err := e.opts.ProcessPool.Acquire(ctx); err != nil {
+				t.Fatal(err)
+			}
+			e.opts.ProcessPool.Release()
+		})
+	}
+}
+
+func TestRecoveryReusesCompletedChild(t *testing.T) {
 	root, child := id(), id()
 	var e *Coordinator
-	e = New([]Node{{ID: root, Attempt: 4, Failures: 1, MaxAttempts: 2}, {ID: child, ParentID: &root, State: Done, Output: []byte("stored")}}, Options{Slots: 1, Runner: runnerFunc(func(ctx context.Context, attempt Attempt) ([]byte, error) {
+	e = New([]Node{{ID: root, Attempt: 4, MaxAttempts: 5}, {ID: child, ParentID: &root, State: Done, Output: []byte("stored")}}, Options{Slots: 1, Runner: runnerFunc(func(ctx context.Context, attempt Attempt) ([]byte, error) {
 		if attempt.NodeID != root || attempt.Number != 5 {
 			return nil, errors.New("completed child executed or replay attempt incorrect")
 		}
@@ -599,7 +638,7 @@ func TestRecoveryReusesCompletedChildAndPreservesFailures(t *testing.T) {
 		t.Fatal(err)
 	}
 	node, _ := e.Get(ctx, root)
-	if node.Failures != 1 || node.Attempt != 5 || string(node.Output) != "stored" {
+	if node.Attempt != 5 || string(node.Output) != "stored" {
 		t.Fatalf("replayed root: %+v", node)
 	}
 }
@@ -633,7 +672,7 @@ func TestWorkerLossLeavesNodesRecoverable(t *testing.T) {
 		t.Fatalf("shutdown: %v", err)
 	}
 	node, _ := e.Get(context.Background(), root)
-	if node.State != Running || node.Failures != 0 {
+	if node.State != Running || node.Attempt != 1 {
 		t.Fatalf("worker loss consumed retry or terminalized action: %+v", node)
 	}
 	store.mu.Lock()
@@ -743,7 +782,7 @@ func TestFirstChildWaitReturnsWhileSecondIsRunning(t *testing.T) {
 func TestRestoreRetryDeadline(t *testing.T) {
 	clock := newTestClock()
 	started := make(chan struct{})
-	root := Node{ID: id(), Attempt: 2, Failures: 1, MaxAttempts: 3, NextAttemptAt: clock.Now().Add(10 * time.Second)}
+	root := Node{ID: id(), Attempt: 2, MaxAttempts: 3, NextAttemptAt: clock.Now().Add(10 * time.Second)}
 	e := New([]Node{root}, Options{Clock: clock, Runner: runnerFunc(func(context.Context, Attempt) ([]byte, error) {
 		close(started)
 		return nil, nil

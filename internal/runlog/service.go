@@ -144,19 +144,21 @@ func (s Service) AppendEntries(ctx context.Context, runID uuid.UUID, stream, app
 
 // AppendTx appends in the caller's transaction; PostgreSQL delivers notifications on commit.
 func (s Service) AppendTx(ctx context.Context, tx pgx.Tx, runID uuid.UUID, stream, appendID string, entries []*lutrav1.LogEntry) (*lutrav1.AppendResponse, error) {
-	settings, err := db.New(tx).ListRunSettings(ctx, runID)
-	if err != nil {
-		return nil, err
-	}
-	var values [][]byte
-	for _, setting := range settings {
-		if setting.Sensitive && len(setting.ValueCbor) != 0 {
-			values = append(values, setting.ValueCbor)
+	// Status entries never contain user data, so skip loading the run's
+	// sensitive settings on that stream.
+	filter := redact.New(nil)
+	if stream != StatusStream {
+		settings, err := db.New(tx).ListRunSettings(ctx, runID)
+		if err != nil {
+			return nil, err
 		}
-	}
-	filter := redact.New(values)
-	if stream == StatusStream {
-		filter = redact.New(nil)
+		var values [][]byte
+		for _, setting := range settings {
+			if setting.Sensitive && len(setting.ValueCbor) != 0 {
+				values = append(values, setting.ValueCbor)
+			}
+		}
+		filter = redact.New(values)
 	}
 	cleaned := make([]*lutrav1.LogEntry, 0, len(entries))
 	for _, entry := range entries {

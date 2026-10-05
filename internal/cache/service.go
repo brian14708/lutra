@@ -16,13 +16,14 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-const maxResultCBOR = 1 << 20
-
 type Result struct {
 	ResultCBOR []byte
 }
 
-var ErrLeaseLost = errors.New("cache lease lost")
+var (
+	ErrLeaseLost = errors.New("cache lease lost")
+	ErrBusy      = errors.New("cache entry is being built")
+)
 
 type Service struct {
 	pool       *pgxpool.Pool
@@ -40,31 +41,22 @@ func storedDigest(key [32]byte) [32]byte {
 }
 
 func validateCBOR(encoded []byte) error {
-	if len(encoded) == 0 || len(encoded) > maxResultCBOR {
-		return errors.New("cache CBOR size is out of bounds")
-	}
-	if err := result.Validate(encoded); err != nil {
-		return err
-	}
-	failure, tagged, err := result.DecodeFailure(encoded)
+	failure, tagged, err := result.Validate(encoded)
 	if err != nil {
 		return err
 	}
-	if tagged && (!failure.Cacheable || len(failure.Details) > 64<<10) {
+	if tagged && !failure.Cacheable {
 		return errors.New("invalid cached failure")
 	}
 	return nil
 }
 
-// Acquire waits for a cached result or claims the task for its caller.
+// Acquire returns a cached result, claims an absent entry, or reports a busy entry.
 func (s *Service) Acquire(ctx context.Context, key [32]byte) (Result, *Lease, error) {
 	stored := storedDigest(key)
 	q := db.New(s.pool)
 	for {
 		if err := ctx.Err(); err != nil {
-			return Result{}, nil, err
-		}
-		if err := q.DeleteExpiredTaskClaim(ctx, stored[:]); err != nil {
 			return Result{}, nil, err
 		}
 		entry, err := q.ActiveCacheEntry(ctx, stored[:])
@@ -92,14 +84,17 @@ func (s *Service) Acquire(ctx context.Context, key [32]byte) (Result, *Lease, er
 			}
 			return Result{ResultCBOR: entry.ResultCbor}, nil, nil
 		case db.LutraCacheStatusBuilding:
-			// Wait for the owner to complete or release its claim.
+			// Wait for the owner to complete or release its claim, sweeping
+			// the entry only once its lease has actually lapsed.
+			if entry.LeaseUntil.Valid && !entry.LeaseUntil.Time.After(time.Now()) {
+				if err := q.DeleteExpiredTaskClaim(ctx, stored[:]); err != nil {
+					return Result{}, nil, err
+				}
+				continue
+			}
+			return Result{}, nil, ErrBusy
 		default:
 			return Result{}, nil, fmt.Errorf("invalid cache status %q", entry.Status)
-		}
-		select {
-		case <-ctx.Done():
-			return Result{}, nil, ctx.Err()
-		case <-time.After(100 * time.Millisecond):
 		}
 	}
 }

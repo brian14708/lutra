@@ -67,7 +67,7 @@ func (s taskStore) Transition(ctx context.Context, t tasktree.Transition) error 
 		next = pgtype.Timestamptz{Time: t.NextAttemptAt, Valid: true}
 	}
 	rows, err := q.TransitionRunTaskAction(ctx, db.TransitionRunTaskActionParams{
-		Status: taskStatus(t.State), Attempt: t.Attempt, Failures: t.Failures,
+		Status: taskStatus(t.State), Attempt: t.Attempt,
 		ResultCbor: encoded, NextAttemptAt: next,
 		ActionID: t.NodeID, RunID: t.RunID, ClaimToken: t.ClaimToken,
 		ExpectedAttempt: t.ExpectedAttempt,

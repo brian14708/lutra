@@ -41,6 +41,17 @@ func (s RunConfigSnapshot) filter() *redact.Filter {
 	return redact.New(values)
 }
 
+// redactError passes structured worker errors through unchanged and rewrites
+// any other error message through the sensitive-value filter.
+func (s RunConfigSnapshot) redactError(err error) error {
+	var config *ConfigError
+	var cacheable *CacheableError
+	if errors.As(err, &config) || errors.As(err, &cacheable) {
+		return err
+	}
+	return errors.New(s.filter().String(err.Error()))
+}
+
 func (e *ConfigError) Error() string { return e.Code }
 func (*ConfigError) Retryable() bool { return false }
 

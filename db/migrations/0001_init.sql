@@ -95,7 +95,6 @@ CREATE TABLE lutra.task_actions (
     result_cbor bytea,
     status lutra.task_action_status NOT NULL DEFAULT 'queued',
     attempts integer NOT NULL DEFAULT 0,
-    failures integer NOT NULL DEFAULT 0,
     next_attempt_at timestamptz,
     idempotency_key text,
     created_at timestamptz NOT NULL DEFAULT now(),
