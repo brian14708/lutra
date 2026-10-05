@@ -75,7 +75,7 @@ func validateIdempotency(key string, required bool) error {
 }
 
 func (s Service) CreateRun(ctx context.Context, req *connect.Request[lutrav1.CreateRunRequest]) (*connect.Response[lutrav1.CreateRunResponse], error) {
-	if s.DB == nil {
+	if s.DB == nil || s.Durable == nil {
 		return nil, connect.NewError(connect.CodeUnavailable, errors.New("worker unavailable"))
 	}
 	actionSpec := req.Msg.GetActionSpec()
@@ -141,6 +141,9 @@ func (s Service) CreateRun(ctx context.Context, req *connect.Request[lutrav1.Cre
 		if err := q.UpdateRunRootAction(ctx, db.UpdateRunRootActionParams{RootActionID: &rootID, ID: inserted}); err != nil {
 			return nil, err
 		}
+		if err := q.EnqueueActionDispatch(ctx, rootID); err != nil {
+			return nil, err
+		}
 		if err := s.Logs.AppendStatus(ctx, tx, runID); err != nil {
 			return nil, err
 		}
@@ -155,16 +158,43 @@ func (s Service) CreateRun(ctx context.Context, req *connect.Request[lutrav1.Cre
 	if err != nil {
 		return nil, err
 	}
+	if !terminal(run.Status) {
+		if _, err := s.Durable.Dispatch.submit(ctx, uuid.MustParse(run.RootActionId)); err != nil {
+			return nil, dispatchFailure(run.Id, err)
+		}
+		// Acceptance is durable; a failed acknowledgement only causes a safe resend.
+		_ = db.New(s.DB).CompleteActionDispatch(ctx, uuid.MustParse(run.RootActionId))
+	}
 	return connect.NewResponse(&lutrav1.CreateRunResponse{Run: run}), nil
 }
 
+func (s Service) RetryRun(ctx context.Context, req *connect.Request[lutrav1.RetryRunRequest]) (*connect.Response[lutrav1.RetryRunResponse], error) {
+	id, err := uuid.Parse(req.Msg.Id)
+	if err != nil {
+		return nil, invalid("invalid run id")
+	}
+	run, err := s.readRun(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	if s.Durable == nil {
+		return nil, dispatchFailure(run.Id, errors.New("execution backend unavailable"))
+	}
+	if !terminal(run.Status) {
+		if _, err := s.Durable.Dispatch.submit(ctx, uuid.MustParse(run.RootActionId)); err != nil {
+			return nil, dispatchFailure(run.Id, err)
+		}
+	}
+	return connect.NewResponse(&lutrav1.RetryRunResponse{Run: run}), nil
+}
+
 func (s Service) CreateTaskAction(ctx context.Context, req *connect.Request[lutrav1.CreateTaskActionRequest]) (*connect.Response[lutrav1.CreateTaskActionResponse], error) {
+	active, ok := TaskIdentityFromContext(ctx)
+	if !ok {
+		return nil, connect.NewError(connect.CodePermissionDenied, errors.New("child actions are only available inside a workflow"))
+	}
 	if len(req.Msg.GetActionSpec().GetConfigOverridesCbor()) != 0 {
 		return nil, configFailure("config.invalid")
-	}
-	active, ok := taskContextFromContext(ctx)
-	if !ok {
-		return nil, connect.NewError(connect.CodePermissionDenied, errors.New("task actions are only available inside a task"))
 	}
 	actionSpec := req.Msg.GetActionSpec()
 	if actionSpec == nil {
@@ -189,10 +219,6 @@ func (s Service) CreateTaskAction(ctx context.Context, req *connect.Request[lutr
 	if err != nil {
 		return nil, err
 	}
-	storedSpec, err := resolvedActionSpec(entrypoint, actionSpec)
-	if err != nil {
-		return nil, err
-	}
 	locked, err := q.LockRun(ctx, active.RunID)
 	if err != nil || locked.RootActionID == nil {
 		return nil, invalid("run is not active")
@@ -205,11 +231,18 @@ func (s Service) CreateTaskAction(ctx context.Context, req *connect.Request[lutr
 		return nil, invalid("run is not active")
 	}
 	caller, err := q.GetActiveCaller(ctx, active.ActionID)
-	if err != nil || caller.RunID != active.RunID || caller.ClaimToken == nil || *caller.ClaimToken != active.ClaimToken || caller.Attempts != active.Attempt {
+	if err != nil || caller.RunID != active.RunID || caller.Attempts != active.Attempt {
 		return nil, invalid("caller action is not active")
 	}
 	var callerSpec lutrav1.EnvironmentSpec
 	if err := proto.Unmarshal(caller.EnvironmentSpec, &callerSpec); err != nil {
+		return nil, err
+	}
+	if !callerSpec.Entrypoints[caller.EntrypointID-1].GetWorkflow() {
+		return nil, connect.NewError(connect.CodePermissionDenied, errors.New("tasks are leaf-only; use a workflow to create children"))
+	}
+	storedSpec, err := resolvedActionSpec(entrypoint, actionSpec)
+	if err != nil {
 		return nil, err
 	}
 	allowed := caller.EnvironmentID == environment.ID
@@ -255,12 +288,6 @@ func (s Service) CreateTaskAction(ctx context.Context, req *connect.Request[lutr
 		}
 	}
 	if err := tx.Commit(ctx); err != nil {
-		return nil, err
-	}
-	if active.add == nil {
-		return nil, invalid("run coordinator is unavailable")
-	}
-	if err := active.add(ctx, actionID); err != nil {
 		return nil, err
 	}
 	action, err := s.readTaskAction(ctx, actionID)
@@ -372,25 +399,11 @@ func (s Service) GetTaskAction(ctx context.Context, req *connect.Request[lutrav1
 	}
 	if active, ok := TaskIdentityFromContext(ctx); ok {
 		caller, lookupErr := db.New(s.DB).GetTaskActionCaller(ctx, id)
-		if lookupErr != nil || caller.RunID != active.RunID || caller.CallerActionID == nil || *caller.CallerActionID != active.ActionID {
+		if lookupErr != nil || caller.RunID != active.RunID || caller.CallerActionID == nil || *caller.CallerActionID != active.ActionID || caller.CallerAttempts != active.Attempt {
 			return nil, invalid("task action is not a child of this task")
 		}
 	}
-	if req.Msg.GetWait() {
-		active, ok := taskContextFromContext(ctx)
-		if !ok {
-			return nil, invalid("waiting is only available inside a task")
-		}
-		if active.coordinator == nil {
-			return nil, invalid("run coordinator is unavailable")
-		}
-		if _, err := active.coordinator.Wait(ctx, active.ActionID, active.Attempt, id); err != nil {
-			node, lookupErr := active.coordinator.Get(ctx, id)
-			if lookupErr != nil || !node.State.Terminal() {
-				return nil, err
-			}
-		}
-	}
+
 	action, err := s.readTaskAction(ctx, id)
 	if err != nil {
 		return nil, err
@@ -458,6 +471,9 @@ func (s Service) ListTaskActions(ctx context.Context, req *connect.Request[lutra
 }
 
 func (s Service) CancelRun(ctx context.Context, req *connect.Request[lutrav1.CancelRunRequest]) (*connect.Response[lutrav1.CancelRunResponse], error) {
+	if s.Durable == nil {
+		return nil, connect.NewError(connect.CodeUnavailable, errors.New("execution backend unavailable"))
+	}
 	id, err := uuid.Parse(req.Msg.GetId())
 	if err != nil {
 		return nil, invalid("invalid run id")
@@ -489,14 +505,11 @@ func (s Service) CancelRun(ctx context.Context, req *connect.Request[lutrav1.Can
 			return nil, err
 		}
 	}
-	if _, err := q.ClearRunClaim(ctx, id); err != nil {
-		return nil, err
-	}
-	if _, err := tx.Exec(ctx, "SELECT pg_notify('lutra_run_cancel', $1)", id.String()); err != nil {
-		return nil, err
-	}
 	if err := tx.Commit(ctx); err != nil {
 		return nil, err
+	}
+	if err := s.Durable.cancelCanceled(ctx, id); err != nil {
+		return nil, connect.NewError(connect.CodeUnavailable, fmt.Errorf("run %s cancellation committed; retry CancelRun: %w", id, err))
 	}
 	run, err := s.readRun(ctx, id)
 	if err != nil {

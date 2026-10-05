@@ -1,19 +1,24 @@
-"""Child submission and independent result waits."""
+"""Workflow child submission and result decoding."""
 
 from __future__ import annotations
 
-import asyncio
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, cast
 
 import pytest
 from lutra import RetryMode
-from lutra._gen.lutra.v1.lutra_pb import ActionSpec, EnvironmentIdentifier, TaskAction
+from lutra._gen.lutra.v1.lutra_pb import (
+    ActionSpec,
+    EnvironmentIdentifier,
+    TaskAction,
+    WorkflowCompletion,
+    WorkflowWaitResponse,
+)
 from lutra.runtime import RunContext, run_context, spawn
 from lutra.value import dumps
 
 if TYPE_CHECKING:
-    from lutra._gen.lutra.v1.lutra_pb import CreateTaskActionRequest, GetTaskActionRequest
+    from lutra._gen.lutra.v1.lutra_pb import CreateTaskActionRequest, WorkflowWaitRequest
     from lutra.serve import TaskAPIClient
     from lutra.task import Invocation
 
@@ -41,12 +46,9 @@ class FakeInvocation:
 
 
 @pytest.mark.asyncio
-async def test_reordered_spawns_keep_stable_keys_and_independent_results(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    release_create = asyncio.Event()
-    release_second = asyncio.Event()
-    created: list[str] = []
+async def test_spawn_all_children_before_awaiting_results(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[tuple[str, str]] = []
+    submissions: list[CreateTaskActionRequest] = []
 
     class FakeRPC:
         def __init__(self, *_args: object, **_kwargs: object) -> None:
@@ -54,39 +56,52 @@ async def test_reordered_spawns_keep_stable_keys_and_independent_results(
 
         @staticmethod
         async def create_task_action(request: CreateTaskActionRequest) -> object:
-            key = request.idempotency_key
-            created.append(key)
-            if key == "first":
-                await release_create.wait()
-            else:
-                release_create.set()
-            return SimpleNamespace(action=TaskAction(id=key))
+            submissions.append(request)
+            calls.append(("spawn", request.idempotency_key))
+            return SimpleNamespace(action=TaskAction(id=request.idempotency_key))
 
         @staticmethod
-        async def get_task_action(request: GetTaskActionRequest) -> object:
-            key = request.id
-            if key == "second":
-                await release_second.wait()
-            return SimpleNamespace(
-                action=TaskAction(id=key, status="succeeded", result_cbor=dumps(key))
+        async def workflow_wait(request: WorkflowWaitRequest) -> WorkflowWaitResponse:
+            ref = request.futures[0]
+            calls.append(("await", ref.id))
+            return WorkflowWaitResponse(
+                completions=[WorkflowCompletion(future=ref, value_cbor=dumps(ref.id))]
             )
 
     monkeypatch.setattr("lutra.runtime.LutraServiceClient", FakeRPC)
     api = cast("TaskAPIClient", FakeAPI())
     token = run_context.set(
-        RunContext(api, {"env": EnvironmentIdentifier(name="env")}, "run", "parent")
+        RunContext(api, {"env": EnvironmentIdentifier(name="env")}, "run", "parent", workflow=True)
     )
     try:
         invocation = cast("Invocation[str]", FakeInvocation())
-        first, second = await asyncio.gather(
-            spawn(invocation, key="first"), spawn(invocation, key="second")
-        )
-        assert created == ["first", "second"]
+        first = await spawn(invocation, key="first", metadata={"stage": "review"})
+        second = await spawn(invocation, key="second")
         assert (first.id, second.id) == ("first", "second")
-        second_result = asyncio.create_task(second.result())
+        assert submissions[0].metadata == {"stage": "review"}
+        assert submissions[1].metadata == {}
+        with pytest.raises(ValueError, match="metadata"):
+            await spawn(invocation, key="invalid", metadata={"stage": "x" * 1025})
+        assert await second.result() == "second"
         assert await first.result() == "first"
-        assert not second_result.done()
-        release_second.set()
-        assert await second_result == "second"
+        assert calls == [
+            ("spawn", "first"),
+            ("spawn", "second"),
+            ("await", "second"),
+            ("await", "first"),
+        ]
+    finally:
+        run_context.reset(token)
+
+
+@pytest.mark.asyncio
+async def test_leaf_task_cannot_submit_children() -> None:
+    api = cast("TaskAPIClient", FakeAPI())
+    token = run_context.set(
+        RunContext(api, {"env": EnvironmentIdentifier(name="env")}, "run", "parent")
+    )
+    try:
+        with pytest.raises(RuntimeError, match="tasks are leaf-only"):
+            await spawn(cast("Invocation[str]", FakeInvocation()), key="child")
     finally:
         run_context.reset(token)

@@ -44,7 +44,11 @@ async def test_config_import_context(tmp_path: Path, monkeypatch: pytest.MonkeyP
     ctx = cast("RequestContext[ExecuteRequest, ExecuteResponse]", None)
     response = await service.execute(
         ExecuteRequest(
-            invocation_id="test", content_type="application/cbor", input=dumps([[], {}])
+            invocation_id="test",
+            run_id="run",
+            action_id="test",
+            content_type="application/cbor",
+            input=dumps([[], {}]),
         ),
         ctx,
     )
@@ -86,7 +90,9 @@ async def test_missing_config_prevents_import(
     service = _TaskService(handler, retry)
     service.api_client = TaskAPIClient(cast("_Host", object()))
     ctx = cast("RequestContext[ExecuteRequest, ExecuteResponse]", None)
-    response = await service.execute(ExecuteRequest(invocation_id="test"), ctx)
+    response = await service.execute(
+        ExecuteRequest(invocation_id="test", run_id="run", action_id="test"), ctx
+    )
     assert cbor2.loads(response.result_cbor).value["message"] == "config.missing"
     assert cbor2.loads(response.result_cbor).value["cacheable"] is False
     assert cbor2.loads(response.result_cbor).value["details"] is None

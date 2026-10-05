@@ -48,22 +48,6 @@ CREATE TABLE lutra.task_environments (
     UNIQUE (namespace_id, name, version)
 );
 
--- Cache generations are independent of runs and namespaces.
-CREATE TYPE lutra.cache_status AS ENUM ('building', 'ready', 'failed');
-CREATE TABLE lutra.cache_entries (
-    id uuid PRIMARY KEY,
-    key bytea NOT NULL CHECK (length(key) = 32),
-    status lutra.cache_status NOT NULL,
-    claim_token uuid NOT NULL,
-    lease_until timestamptz NOT NULL,
-    result_cbor bytea,
-    CHECK (
-        (status = 'building' AND result_cbor IS NULL)
-        OR (status IN ('ready', 'failed') AND result_cbor IS NOT NULL)
-    )
-);
-CREATE UNIQUE INDEX cache_active_idx ON lutra.cache_entries (key) WHERE status IN ('building', 'ready');
-
 CREATE TYPE lutra.task_action_status AS ENUM ('queued', 'building', 'running', 'waiting', 'succeeded', 'failed', 'canceled');
 
 
@@ -71,8 +55,6 @@ CREATE TABLE lutra.runs (
     id uuid PRIMARY KEY,
     namespace_id uuid NOT NULL REFERENCES lutra.namespaces(id),
     root_idempotency_key text,
-    claim_token uuid,
-    lease_until timestamptz,
     created_at timestamptz NOT NULL DEFAULT now()
 );
 CREATE UNIQUE INDEX runs_idempotency_idx ON lutra.runs (namespace_id, root_idempotency_key) WHERE root_idempotency_key IS NOT NULL;
@@ -95,7 +77,6 @@ CREATE TABLE lutra.task_actions (
     result_cbor bytea,
     status lutra.task_action_status NOT NULL DEFAULT 'queued',
     attempts integer NOT NULL DEFAULT 0,
-    next_attempt_at timestamptz,
     idempotency_key text,
     created_at timestamptz NOT NULL DEFAULT now(),
     updated_at timestamptz NOT NULL DEFAULT now(),
@@ -107,6 +88,12 @@ CREATE UNIQUE INDEX task_actions_idempotency_idx ON lutra.task_actions (run_id, 
 CREATE INDEX task_actions_run_order_idx ON lutra.task_actions (run_id, created_at, id);
 CREATE INDEX task_actions_active_idx ON lutra.task_actions (run_id)
     WHERE status NOT IN ('succeeded', 'failed', 'canceled');
+
+CREATE TABLE lutra.dispatch_outbox (
+    action_id uuid PRIMARY KEY REFERENCES lutra.task_actions(id) ON DELETE CASCADE,
+    next_attempt_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX dispatch_outbox_due_idx ON lutra.dispatch_outbox (next_attempt_at, action_id);
 
 ALTER TABLE lutra.runs
     ADD COLUMN root_action_id uuid,
@@ -147,12 +134,11 @@ DROP TABLE IF EXISTS lutra.run_log_records;
 DROP TABLE IF EXISTS lutra.run_log_appends;
 DROP TABLE IF EXISTS lutra.run_log_streams;
 ALTER TABLE IF EXISTS lutra.runs DROP CONSTRAINT IF EXISTS runs_root_action_fk;
+DROP TABLE IF EXISTS lutra.dispatch_outbox;
 DROP TABLE IF EXISTS lutra.task_actions;
 DROP TABLE IF EXISTS lutra.run_settings;
 DROP TABLE IF EXISTS lutra.runs;
-DROP TABLE IF EXISTS lutra.cache_entries;
 DROP TABLE IF EXISTS lutra.task_environments;
-DROP TYPE IF EXISTS lutra.cache_status;
 DROP TYPE IF EXISTS lutra.task_action_status;
 DROP TABLE IF EXISTS lutra.blob_uploads;
 DROP TABLE IF EXISTS lutra.blobs;

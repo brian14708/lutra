@@ -138,7 +138,8 @@ class LiveDisplay:
             name = (
                 self.task_name
                 if event.action_id == self.root_action_id and self.task_name
-                else _entrypoint_name(self.entrypoint_names, event.entrypoint_id)
+                else event.entrypoint_name
+                or _entrypoint_name(self.entrypoint_names, event.entrypoint_id)
             )
             self.tasks[event.action_id] = _Task(
                 name,

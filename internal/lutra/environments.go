@@ -268,6 +268,9 @@ func validateEntrypoints(entries []*lutrav1.Entrypoint) error {
 			}
 			names[binding.Name] = true
 		}
+		if entry.GetWorkflow() && (entry.GetCache() || entry.GetTaskVersion() != "") {
+			return invalid("workflows cannot be cached")
+		}
 		if entry.GetCache() {
 			if len(entry.GetTaskVersion()) > 200 || (entry.GetTaskVersion() != "" && !semanticVersionPattern.MatchString(entry.GetTaskVersion())) {
 				return invalid("cached tasks require a semantic or source-derived task version")

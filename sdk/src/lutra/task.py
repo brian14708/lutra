@@ -59,10 +59,20 @@ class CacheableError(Exception):
 
 
 class RetryMode(StrEnum):
-    """Python task retry policy."""
+    """Policy for retrying reported user-code failures.
+
+    Infrastructure recovery can launch another attempt regardless of this policy.
+    """
 
     NONE = "none"
     IDEMPOTENT = "idempotent"
+
+
+class TaskKind(StrEnum):
+    """Execution semantics of an environment entrypoint."""
+
+    TASK = "task"
+    WORKFLOW = "workflow"
 
 
 class ConfigError(Exception):
@@ -72,6 +82,34 @@ class ConfigError(Exception):
         """Create a failure with no value diagnostics."""
         super().__init__(code)
         self.code = code
+
+
+class TerminalError(RuntimeError):
+    """A user failure that stops retries for this invocation."""
+
+    def __init__(self, message: str, *, code: int = 500) -> None:
+        """Create a bounded terminal failure with an HTTP-style code.
+
+        Raises:
+            ValueError: If the message or error code is invalid.
+
+        """
+        if not isinstance(message, str) or not message or len(message.encode()) > 64 << 10:
+            error = "terminal error message must contain 1 byte to 64 KiB"
+            raise ValueError(error)
+        if type(code) is not int or not 400 <= code <= 599:  # ruff: ignore[magic-value-comparison] HTTP error code range.
+            error = "terminal error code must be between 400 and 599"
+            raise ValueError(error)
+        super().__init__(message)
+        self.code = code
+
+
+class PromiseRejectedError(RuntimeError):
+    """A durable promise or awakeable was rejected."""
+
+
+class InvocationCanceledError(RuntimeError):
+    """A child invocation was canceled."""
 
 
 @dataclass(frozen=True)
@@ -96,7 +134,7 @@ def normalize_retry(retry: RetryMode | str, max_attempts: int | None) -> tuple[R
     """Normalize a declaration or invocation policy.
 
     Returns:
-        The retry mode and total attempt limit.
+        The retry mode and limit on attempts that report user-code failures.
 
     Raises:
         ValueError: If the mode or limit is invalid.
@@ -112,7 +150,7 @@ def normalize_retry(retry: RetryMode | str, max_attempts: int | None) -> tuple[R
         message = "max_attempts must be between 1 and 100"
         raise ValueError(message)
     if mode is RetryMode.NONE and attempts != 1:
-        message = "retry=none only permits one attempt"
+        message = "retry=none requires max_attempts=1"
         raise ValueError(message)
     return mode, attempts
 
@@ -181,7 +219,7 @@ class Resources:
 
 @dataclass(frozen=True, eq=False)
 class TaskEnvironment:
-    """Own a runtime declaration and its complete task entrypoint set."""
+    """Own a runtime declaration and its task and workflow entrypoints."""
 
     name: str
     image: TaskImage = field(default_factory=TaskImage)
@@ -189,7 +227,7 @@ class TaskEnvironment:
     env: Mapping[str, str | SettingRef] = field(default_factory=dict)
     dependencies: tuple[TaskEnvironment, ...] = ()
     package_managers: tuple[PackageManager, ...] = field(default_factory=lambda: (Uv(),))
-    _tasks: list[Task[..., object]] = field(default_factory=list, init=False, repr=False)
+    _entries: list[Task[..., object]] = field(default_factory=list, init=False, repr=False)
 
     def __post_init__(self) -> None:
         """Copy mutable declarations supplied by the caller."""
@@ -198,16 +236,16 @@ class TaskEnvironment:
         object.__setattr__(self, "package_managers", tuple(self.package_managers))
 
     @property
-    def tasks(self) -> tuple[Task[..., object], ...]:
-        """The declared entrypoints."""
-        return tuple(self._tasks)
+    def entries(self) -> tuple[Task[..., object], ...]:
+        """Tasks and workflows in declaration order, with stable one-based IDs."""
+        return tuple(self._entries)
 
     @property
     def manager_outputs(self) -> tuple[ManagerOutput, ...]:
         """Composed manager outputs for registration."""
         return prepare_managers(
             tuple(self.package_managers),
-            tuple(task.source_file for task in self._tasks),
+            tuple(task.source_file for task in self._entries),
             self.image.platform,
         )
 
@@ -262,7 +300,42 @@ class TaskEnvironment:
                 version=version,
                 config=config,
             )
-            self._tasks.append(wrapped)
+            self._entries.append(wrapped)
+            return wrapped
+
+        return declare(function) if function is not None else declare
+
+    @overload
+    def workflow(
+        self, function: Callable[P, Awaitable[R_co]], *, config: tuple[ConfigBinding, ...] = ()
+    ) -> Task[P, R_co]: ...
+
+    @overload
+    def workflow(
+        self, function: None = None, *, config: tuple[ConfigBinding, ...] = ()
+    ) -> Callable[[Callable[P, Awaitable[R_co]]], Task[P, R_co]]: ...
+
+    def workflow(
+        self,
+        function: Callable[P, Awaitable[R_co]] | None = None,
+        *,
+        config: tuple[ConfigBinding, ...] = (),
+    ) -> Task[P, R_co] | Callable[[Callable[P, Awaitable[R_co]]], Task[P, R_co]]:
+        """Declare an async workflow that replays in fresh sandboxes.
+
+        Use ``lutra.run`` and ``lutra.spawn`` for effects, and durable futures
+        for coordination. Keep command submission order deterministic. Use
+        ``workflow_time``, ``workflow_random``, and ``workflow_uuid`` for
+        replay-stable entropy. Access files and external services inside tasks.
+
+        Returns:
+            The deferred workflow entrypoint.
+
+        """
+
+        def declare(target: Callable[P, Awaitable[R_co]]) -> Task[P, R_co]:
+            wrapped = Task(self, target, config=config, kind=TaskKind.WORKFLOW)
+            self._entries.append(wrapped)
             return wrapped
 
         return declare(function) if function is not None else declare
@@ -305,6 +378,7 @@ class Task(Generic[P, R_co]):
         cache: bool = False,
         version: str | None = None,
         config: tuple[ConfigBinding, ...] = (),
+        kind: TaskKind = TaskKind.TASK,
     ) -> None:
         """Wrap a module-level function.
 
@@ -315,6 +389,15 @@ class Task(Generic[P, R_co]):
         if "<locals>" in function.__qualname__:
             msg = "tasks must be defined at module scope"
             raise ValueError(msg)
+        if kind is TaskKind.WORKFLOW and any((
+            not inspect.iscoroutinefunction(function),
+            retry != RetryMode.NONE,
+            max_attempts not in {None, 1},
+            cache,
+        )):
+            message = "workflows require an async function without task retries, or caching"
+            raise ValueError(message)
+        self.kind = kind
         self.environment = environment
         self.config = tuple(config)
         self.retry, self.max_attempts = normalize_retry(retry, max_attempts)
@@ -341,7 +424,7 @@ class Task(Generic[P, R_co]):
         self.function = function
         self.module = module_name
         self.qualname = function.__qualname__
-        self.entrypoint_id = len(environment.tasks) + 1
+        self.entrypoint_id = len(environment.entries) + 1
         update_wrapper(self, function)
         self.__module__ = module_name
         self.__signature__ = inspect.signature(function)

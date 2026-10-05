@@ -26,9 +26,15 @@ lint:
 
 test:
     go test ./...
-    uv run --package lutra pytest
+    uv run --all-extras --package lutra pytest
     pnpm --filter @lutra/console test
 
 init:
     uv sync --all-packages --all-extras
     pnpm install
+
+# Prove workflow recovery and task parity with disposable real services.
+verify-workflow: generate
+    mkdir -p .data/workflow-proof
+    go build -o .data/workflow-proof/server ./cmd/server
+    LUTRA_WORKFLOW_E2E=1 LUTRA_WORKFLOW_MANAGED=1 uv run --all-extras --package lutra pytest -v sdk/tests/test_workflow_e2e.py

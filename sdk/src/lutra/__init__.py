@@ -3,9 +3,9 @@
 from lutra._context import TaskContext, current_context
 from lutra.blob import BlobStore
 from lutra.checkpoint import CheckpointEvent, CheckpointManager, CheckpointNotFound
-from lutra.client import Client, RunHandle
+from lutra.client import Client, RunHandle, SubmissionError
 from lutra.package_managers import Mise, OciCopy, PackageManager, Uv
-from lutra.runtime import ChildHandle, run, spawn
+from lutra.runtime import ChildHandle, receive, run, sleep, spawn
 from lutra.task import (
     CacheableError,
     ConfigBinding,
@@ -17,11 +17,36 @@ from lutra.task import (
     Task,
     TaskEnvironment,
     TaskImage,
+    TaskKind,
+    TerminalError,
 )
 from lutra.tools import ToolSchema
 from lutra.value import BlobRef
+from lutra.workflow import (
+    Awakeable,
+    Completion,
+    InvocationCanceledError,
+    Promise,
+    PromiseRejectedError,
+    WorkflowState,
+    as_completed,
+    awakeable,
+    cancel_invocation,
+    gather,
+    promise,
+    reject_awakeable,
+    resolve_awakeable,
+    select,
+    timer,
+    wait_completed,
+    workflow_random,
+    workflow_state,
+    workflow_time,
+    workflow_uuid,
+)
 
 __all__ = [
+    "Awakeable",
     "BlobRef",
     "BlobStore",
     "CacheableError",
@@ -30,23 +55,47 @@ __all__ = [
     "CheckpointNotFound",
     "ChildHandle",
     "Client",
+    "Completion",
     "ConfigBinding",
     "ConfigError",
     "Invocation",
+    "InvocationCanceledError",
     "Mise",
     "OciCopy",
     "PackageManager",
+    "Promise",
+    "PromiseRejectedError",
     "Resources",
     "RetryMode",
     "RunHandle",
     "SettingRef",
+    "SubmissionError",
     "Task",
     "TaskContext",
     "TaskEnvironment",
     "TaskImage",
+    "TaskKind",
+    "TerminalError",
     "ToolSchema",
     "Uv",
+    "WorkflowState",
+    "as_completed",
+    "awakeable",
+    "cancel_invocation",
     "current_context",
+    "gather",
+    "promise",
+    "receive",
+    "reject_awakeable",
+    "resolve_awakeable",
     "run",
+    "select",
+    "sleep",
     "spawn",
+    "timer",
+    "wait_completed",
+    "workflow_random",
+    "workflow_state",
+    "workflow_time",
+    "workflow_uuid",
 ]

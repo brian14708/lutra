@@ -46,7 +46,9 @@ func (s RunConfigSnapshot) filter() *redact.Filter {
 func (s RunConfigSnapshot) redactError(err error) error {
 	var config *ConfigError
 	var cacheable *CacheableError
-	if errors.As(err, &config) || errors.As(err, &cacheable) {
+	var task *TaskError
+	var terminal *TerminalTaskError
+	if errors.As(err, &config) || errors.As(err, &cacheable) || errors.As(err, &task) || errors.As(err, &terminal) {
 		return err
 	}
 	return errors.New(s.filter().String(err.Error()))

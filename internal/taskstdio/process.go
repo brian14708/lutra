@@ -48,6 +48,12 @@ func (p *Process) StderrTail() string {
 	return string(p.stderr.data)
 }
 
+func (p *Process) ResetStderrTail() {
+	p.stderr.mu.Lock()
+	p.stderr.data = p.stderr.data[:0]
+	p.stderr.mu.Unlock()
+}
+
 // Start launches a configured command. The caller may set Stderr before Start.
 func Start(command *exec.Cmd) (*Process, error) {
 	stderr := &stderrTail{}

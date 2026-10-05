@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING
 
 import cbor2
 
-from lutra.task import CacheableError, ConfigError
+from lutra.task import CacheableError, ConfigError, TerminalError
 from lutra.value import ValueCodecError, dumps, loads
 
 if TYPE_CHECKING:
@@ -25,14 +25,18 @@ def failure_message(data: bytes) -> str:
     return str(fields["message"]) if fields is not None else ""
 
 
-def encode_failure(*, cacheable: bool, message: str, details: object = None) -> bytes:
-    return cbor2.dumps(
-        cbor2.CBORTag(
-            ERROR_TAG,
-            {"cacheable": cacheable, "message": message, "details": cbor2.loads(dumps(details))},
-        ),
-        canonical=True,
-    )
+def encode_failure(
+    *,
+    cacheable: bool,
+    message: str,
+    details: object = None,
+    terminal: bool = False,
+    code: int = 500,
+) -> bytes:
+    fields = {"cacheable": cacheable, "message": message, "details": cbor2.loads(dumps(details))}
+    if terminal:
+        fields.update(terminal=True, code=code)
+    return cbor2.dumps(cbor2.CBORTag(ERROR_TAG, fields), canonical=True)
 
 
 def _failure(data: bytes) -> dict[str, object] | None:
@@ -53,6 +57,17 @@ def _failure(data: bytes) -> dict[str, object] | None:
     ):
         message = "invalid result failure"
         raise ValueCodecError(message)
+    if "terminal" in fields and (
+        type(fields["terminal"]) is not bool
+        or (
+            fields["terminal"]
+            and (
+                type(fields.get("code")) is not int or not 400 <= fields["code"] <= 599  # ruff: ignore[magic-value-comparison] HTTP error code range.
+            )
+        )
+    ):
+        message = "invalid terminal result failure"
+        raise ValueCodecError(message)
     return fields
 
 
@@ -65,6 +80,12 @@ async def load_result(
     if fields is None:
         return await loads(data, resolver)
     message = str(fields["message"])
+    if fields.get("terminal"):
+        code = fields["code"]
+        if not isinstance(code, int):
+            error = "invalid terminal result code"
+            raise ValueCodecError(error)
+        raise TerminalError(message, code=code)
     if fields["cacheable"]:
         details = await loads(cbor2.dumps(fields["details"]), resolver)
         raise CacheableError(message, details)

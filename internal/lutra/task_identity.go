@@ -3,37 +3,23 @@ package lutra
 import (
 	"context"
 
-	"github.com/brian14708/lutra/internal/tasktree"
 	"github.com/google/uuid"
 )
 
-// TaskIdentity identifies a task attempt and the run lease that owns it.
+// TaskIdentity is attached only to sandbox callbacks by the execution backend.
 type TaskIdentity struct {
-	RunID      uuid.UUID
-	ActionID   uuid.UUID
-	ClaimToken uuid.UUID
-	Attempt    int32
+	RunID    uuid.UUID
+	ActionID uuid.UUID
+	Attempt  int32
 }
 
-// TaskIdentityFromContext returns the identity attached by the worker.
+type taskIdentityKey struct{}
+
+func withTaskIdentity(ctx context.Context, task TaskIdentity) context.Context {
+	return context.WithValue(ctx, taskIdentityKey{}, task)
+}
+
 func TaskIdentityFromContext(ctx context.Context) (TaskIdentity, bool) {
-	task, ok := taskContextFromContext(ctx)
-	return task.TaskIdentity, ok
-}
-
-type taskContext struct {
-	TaskIdentity
-	coordinator *tasktree.Coordinator
-	add         func(context.Context, uuid.UUID) error
-}
-
-type taskContextKey struct{}
-
-func withTaskContext(ctx context.Context, task taskContext) context.Context {
-	return context.WithValue(ctx, taskContextKey{}, task)
-}
-
-func taskContextFromContext(ctx context.Context) (taskContext, bool) {
-	task, ok := ctx.Value(taskContextKey{}).(taskContext)
+	task, ok := ctx.Value(taskIdentityKey{}).(TaskIdentity)
 	return task, ok
 }

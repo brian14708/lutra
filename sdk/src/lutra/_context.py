@@ -8,10 +8,14 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import TYPE_CHECKING
 
+from lutra._gen.lutra.v1.lutra_pb import TaskSignalWorkflowRequest
+from lutra._workflow import encode_signal, validate_signal_name
+
 if TYPE_CHECKING:
     from collections.abc import Mapping
 
     from lutra._gen.lutra.v1.log_connect import LogServiceClient
+    from lutra._gen.lutra.v1.lutra_connect import LutraServiceClient
     from lutra.blob import BlobStore
     from lutra.checkpoint import CheckpointManager
     from lutra.task import RetryMode
@@ -31,6 +35,27 @@ class TaskContext:
 
     workspace: Path = field(default_factory=Path.cwd)
     log: LogServiceClient | None = None
+    _workflow_client: LutraServiceClient | None = field(default=None, repr=False, compare=False)
+
+    async def signal_workflow(self, name: str, value: object) -> None:
+        """Publish a one-shot value to this task's root workflow.
+
+        Return after durable acceptance. Identical repeated values succeed;
+        conflicting values fail. Transport failures should be retried with the
+        same value before advancing task state.
+
+        Raises:
+            RuntimeError: If the task host has no workflow callback client.
+
+        """
+        validate_signal_name(name)
+        data = encode_signal(value)
+        if self._workflow_client is None:
+            message = "task workflow callback is unavailable"
+            raise RuntimeError(message)
+        await self._workflow_client.task_signal_workflow(
+            TaskSignalWorkflowRequest(name=name, value_cbor=data)
+        )
 
 
 task_context: ContextVar[TaskContext] = ContextVar("lutra_task_context")

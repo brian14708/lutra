@@ -20,7 +20,7 @@ func TestTaskCacheKeyContract(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	row := db.LoadRunTasksRow{EnvironmentSpec: encoded, EnvironmentName: "work", EntrypointID: 1, Provider: "local", Version: "registration-a", NamespaceID: uuid.New(), ImageKey: bytes.Repeat([]byte{1}, 32)}
+	row := db.LoadActionRow{EnvironmentSpec: encoded, EnvironmentName: "work", EntrypointID: 1, Provider: "local", Version: "registration-a", NamespaceID: uuid.New(), ImageKey: bytes.Repeat([]byte{1}, 32)}
 	spec := &lutrav1.ActionSpec{Cache: true, InputCbor: []byte{0x82, 0x80, 0xa0}}
 	baseline := cacheKey(row, spec, "docker", nil)
 	if len(baseline) != 32 {

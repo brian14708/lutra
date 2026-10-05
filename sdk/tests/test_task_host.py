@@ -2,6 +2,7 @@
 
 import asyncio
 import io
+import json
 import threading
 from typing import TYPE_CHECKING, cast
 from unittest.mock import AsyncMock
@@ -9,6 +10,7 @@ from unittest.mock import AsyncMock
 import cbor2
 import pytest
 from lutra import BlobStore, CacheableError, RetryMode, _blob, current_context
+from lutra._gen.lutra.task.v1.task_connect import TaskServiceASGIApplication
 from lutra._gen.lutra.task.v1.task_pb import ExecuteRequest, ExecuteResponse
 from lutra.serve import TaskAPIClient, _host, normalize_result
 from lutra.serve._host import _Host, _TaskService
@@ -16,6 +18,46 @@ from lutra.value import BlobRef
 
 if TYPE_CHECKING:
     from connectrpc.request import RequestContext
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fail", [False, True])
+async def test_stdio_unary_request_has_one_response(
+    monkeypatch: pytest.MonkeyPatch, *, fail: bool
+) -> None:
+    def handler(
+        _invocation_id: str, _content_type: str, payload: bytes, _api_client: TaskAPIClient
+    ) -> tuple[str, bytes]:
+        if fail:
+            message = "task failed"
+            raise RuntimeError(message)
+        return "application/cbor", payload
+
+    service = _TaskService(handler)
+    host = _Host(TaskServiceASGIApplication(service, compressions=()))
+    service.api_client = TaskAPIClient(host)
+    output = io.BytesIO()
+    monkeypatch.setattr(_host, "_PROTOCOL_OUTPUT", output)
+    await host.dispatch({
+        "id": "g1",
+        "type": "request",
+        "path": "/lutra.task.v1.TaskService/Execute",
+        "headers": {"Content-Type": ["application/json"]},
+        "value": {"invocationId": "test", "input": "Ym9r"},
+    })
+    task = host.calls["g1"].task
+    assert task is not None
+    await asyncio.wait_for(task, timeout=2)
+    frames = [json.loads(line) for line in output.getvalue().splitlines()]
+    assert len(frames) == 1
+    assert frames[0]["id"] == "g1"
+    assert frames[0]["type"] == "response"
+    if fail:
+        assert frames[0]["status"] == 500
+        assert frames[0]["error"]["code"] == "unknown"
+    else:
+        assert frames[0]["status"] == 200
+        assert frames[0]["value"] == {"contentType": "application/cbor", "resultCbor": "Ym9r"}
 
 
 @pytest.mark.asyncio

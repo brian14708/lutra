@@ -4,9 +4,9 @@ package main
 import (
 	"context"
 	"errors"
-	"flag"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -27,16 +27,14 @@ import (
 )
 
 func main() {
-	embeddedWorker := flag.Bool("dev-worker", false, "run an embedded worker for local development")
-	flag.Parse()
 	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
-	if err := run(logger, *embeddedWorker); err != nil {
+	if err := run(logger); err != nil {
 		logger.Error("server failed", "error", err)
 		os.Exit(1)
 	}
 }
 
-func run(logger *slog.Logger, embeddedWorker bool) error {
+func run(logger *slog.Logger) error {
 	db, err := pgxpool.New(context.Background(), os.Getenv("DATABASE_URL"))
 	if err != nil {
 		return fmt.Errorf("database connection failed: %w", err)
@@ -86,8 +84,20 @@ func run(logger *slog.Logger, embeddedWorker bool) error {
 	if err := logs.ConfigureFromEnv(); err != nil {
 		return fmt.Errorf("log configuration failed: %w", err)
 	}
+	engine, err := lutra.NewEngine(db, logs, blobService, rpcMux)
+	if err != nil {
+		return err
+	}
+	durableHandler, err := engine.Handler()
+	if err != nil {
+		return err
+	}
+	mux.Handle("/durable/", http.StripPrefix("/durable", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		r.RequestURI = r.URL.RequestURI()
+		durableHandler.ServeHTTP(w, r)
+	})))
 	servicePath, serviceHandler := lutrav1connect.NewLutraServiceHandler(
-		lutra.Service{DB: db, Logs: logs},
+		lutra.Service{DB: db, Logs: logs, Durable: engine.Adapter},
 		interceptors,
 		connect.WithReadMaxBytes(64<<20),
 	)
@@ -103,7 +113,7 @@ func run(logger *slog.Logger, embeddedWorker bool) error {
 	)
 	rpcMux.Handle(logPath, logHandler)
 	healthPath, healthHandler := grpchealth.NewHandler(
-		grpchealth.NewStaticChecker(lutrav1connect.LutraServiceName, lutrav1connect.BlobServiceName, lutrav1connect.SettingsServiceName, lutrav1connect.LogServiceName),
+		engine,
 		interceptors,
 	)
 	rpcMux.Handle(healthPath, healthHandler)
@@ -119,20 +129,19 @@ func run(logger *slog.Logger, embeddedWorker bool) error {
 		mux.Handle("/", newSPAHandler(os.DirFS(uiDir)))
 	}
 
-	server := &http.Server{Addr: addr, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	server := &http.Server{Addr: addr, Handler: mux, ReadHeaderTimeout: 5 * time.Second, BaseContext: func(net.Listener) context.Context { return ctx }}
+	if err := engine.Start(ctx); err != nil {
+		stop()
+		return err
+	}
+	defer func() { stop(); engine.Wait() }()
 	serverErr := make(chan error, 1)
 	go func() {
 		logger.Info("starting server", "addr", addr)
 		serverErr <- server.ListenAndServe()
 	}()
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
-	if embeddedWorker {
-		worker := &lutra.RunWorker{DB: db, Logs: logs, Blobs: blobService, TaskAPIHandler: rpcMux}
-		worker.Start(ctx)
-		defer func() { stop(); worker.Wait() }()
-	}
 	select {
 	case err := <-serverErr:
 		if !errors.Is(err, http.ErrServerClosed) {

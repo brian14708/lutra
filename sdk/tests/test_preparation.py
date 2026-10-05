@@ -63,18 +63,11 @@ def run(*args: str, cwd: Path | None = None, env: dict[str, str] | None = None) 
     ).stdout
 
 
-def sync_source(files: Path, env: Path) -> None:
+def sync_source(files: Path, env: Path, command: tuple[str, ...]) -> None:
     run("uv", "venv", "--python", sys.executable, str(env))
-    run(
-        "uv",
-        "sync",
-        "--frozen",
-        "--active",
-        "--no-config",
-        "--script",
-        str(files / "lutra-runtime.py"),
-        env={**os.environ, "VIRTUAL_ENV": str(env)},
-    )
+    args = list(command)
+    args[args.index("--script") + 1] = str(files / "lutra-runtime.py")
+    run(*args, env={**os.environ, "VIRTUAL_ENV": str(env)})
 
 
 def selected_names(script: Path) -> set[str]:
@@ -102,7 +95,7 @@ def test_decoration_has_no_uv_side_effects(
     spec.loader.exec_module(module)
     assert not (tmp_path / "uv.lock").exists()
     assert not Path(f"{task}.lock").exists()
-    assert module.env.tasks[0].source_file == task
+    assert module.env.entries[0].source_file == task
 
 
 def test_missing_stale_locks_and_dependency_identity(tmp_path: Path) -> None:
@@ -270,7 +263,7 @@ def test_editable_metadata_entrypoints_data_and_source_edits(tmp_path: Path, lay
     prepared = prepare_source([task])
     files = unpack(tmp_path, build_source_bundle(prepared.layout, [Path("tasks.py")]))
     env = tmp_path / "venv"
-    sync_source(files, env)
+    sync_source(files, env, prepared.prepare_args)
     code = (
         "import demo, importlib.metadata as m, importlib.resources as r; "
         'print(demo.VALUE, m.version("demo"), '
@@ -334,7 +327,7 @@ def test_runtime_extras_markers_and_nondefault_dev_group(tmp_path: Path) -> None
     files = unpack(tmp_path, build_source_bundle(source.layout, [Path("app/tasks.py")]))
     assert selected_names(files / "lutra-runtime.py") == {"app", "devtool", "shared", "optional"}
     env = tmp_path / "venv"
-    sync_source(files, env)
+    sync_source(files, env, source.prepare_args)
     installed = json.loads(
         run(
             str(env / "bin/python"),
@@ -384,7 +377,7 @@ def test_namespace_package_is_installed_by_backend(tmp_path: Path) -> None:
     source = prepare_source([task])
     files = unpack(tmp_path, build_source_bundle(source.layout, [Path("tasks.py")]))
     env = tmp_path / "venv"
-    sync_source(files, env)
+    sync_source(files, env, source.prepare_args)
     assert (
         run(str(env / "bin/python"), "-c", "import company.team; print(company.team.VALUE)").strip()
         == "namespace"

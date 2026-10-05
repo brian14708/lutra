@@ -22,22 +22,52 @@ import (
 // EnvironmentExecution is the executor-neutral request. Resolved artifact
 // builds are deliberately absent; image builds choose those separately.
 type EnvironmentExecution struct {
-	Environment  *lutrav1.EnvironmentIdentifier
-	Provider     string
-	Spec         *lutrav1.EnvironmentSpec
-	EntrypointID uint32
-	Input        []byte
-	Environments []*lutrav1.EnvironmentIdentifier
-	RunID        string
-	ActionID     string
-	Attempt      int32
-	Config       RunConfigSnapshot
-	// Stderr receives build and task output. TaskAPIHandler answers the
-	// task's callbacks; remote providers may inject direct API access instead.
-	Stderr         io.Writer
-	PullOutput     io.Writer
+	Environment    *lutrav1.EnvironmentIdentifier
+	Provider       string
+	Spec           *lutrav1.EnvironmentSpec
+	EntrypointID   uint32
+	Input          []byte
+	Environments   []*lutrav1.EnvironmentIdentifier
+	RunID          string
+	ActionID       string
+	Attempt        int32
+	Config         RunConfigSnapshot
+	Output         LogSink
 	TaskAPIHandler http.Handler
 }
+
+type LogPhase string
+
+const (
+	LogTask  LogPhase = "task"
+	LogBuild LogPhase = "build"
+	LogPull  LogPhase = "pull"
+)
+
+// LogSink keeps output framing and persistence outside the executor.
+type LogSink interface{ Writer(LogPhase) io.Writer }
+
+type logSinkFunc func(LogPhase) io.Writer
+
+func (f logSinkFunc) Writer(phase LogPhase) io.Writer { return f(phase) }
+
+func (r *EnvironmentExecution) output(phase LogPhase) io.Writer {
+	if r.Output == nil {
+		return io.Discard
+	}
+	return r.Output.Writer(phase)
+}
+
+type TaskError struct{ Message string }
+
+func (e *TaskError) Error() string { return e.Message }
+
+type TerminalTaskError struct {
+	Message string
+	Code    int
+}
+
+func (e *TerminalTaskError) Error() string { return e.Message }
 
 type CacheableError struct {
 	Code    string
@@ -75,16 +105,24 @@ type Job interface {
 }
 
 func executeProcess(ctx context.Context, process *taskstdio.Process, req *EnvironmentExecution) ([]byte, error) {
-	filter := req.Config.filter()
 	response, callErr := process.Client().Execute(ctx, connect.NewRequest(&taskv1.ExecuteRequest{InvocationId: req.ActionID, RunId: req.RunID, ActionId: req.ActionID, Attempt: req.Attempt, ContentType: "application/cbor", Input: req.Input}))
 	closeErr := process.Close()
 	if err := errors.Join(callErr, closeErr); err != nil {
-		if stderr := strings.TrimSpace(process.StderrTail()); stderr != "" {
-			return nil, errors.New(filter.String(fmt.Sprintf("%s\ntask stderr (last 32 KiB):\n%s", err, stderr)))
-		}
-		return nil, errors.New(filter.String(err.Error()))
+		return nil, processError(process, req, err)
 	}
-	raw := response.Msg.GetResultCbor()
+	return decodeTaskResult(response.Msg, req)
+}
+
+func processError(process *taskstdio.Process, req *EnvironmentExecution, err error) error {
+	if stderr := strings.TrimSpace(process.StderrTail()); stderr != "" {
+		return errors.New(req.Config.filter().String(fmt.Sprintf("%s\ntask stderr (last 32 KiB):\n%s", err, stderr)))
+	}
+	return req.Config.redactError(err)
+}
+
+func decodeTaskResult(response *taskv1.ExecuteResponse, req *EnvironmentExecution) ([]byte, error) {
+	filter := req.Config.filter()
+	raw := response.GetResultCbor()
 	failure, tagged, err := result.DecodeFailure(raw)
 	if err != nil {
 		return nil, err
@@ -106,12 +144,19 @@ func executeProcess(ctx context.Context, process *taskstdio.Process, req *Enviro
 			}
 			return encoded, failure
 		}
+		if failure.Terminal {
+			encoded, err := result.EncodeFailure(result.Failure{Terminal: true, Code: failure.Code, Message: message, Details: details})
+			if err != nil {
+				return nil, err
+			}
+			return encoded, &TerminalTaskError{Message: message, Code: failure.Code}
+		}
 		if message == "config.missing" || message == "config.invalid" {
 			return nil, &ConfigError{Code: message}
 		}
-		return nil, errors.New(message)
+		return nil, &TaskError{Message: message}
 	}
-	if response.Msg.GetContentType() != "application/cbor" {
+	if response.GetContentType() != "application/cbor" {
 		return nil, errors.New("task returned unsupported content type")
 	}
 	return filter.CBOR(raw)
@@ -120,7 +165,7 @@ func executeProcess(ctx context.Context, process *taskstdio.Process, req *Enviro
 func unpackSource(ctx context.Context, openBundle func(context.Context, []byte) (io.ReadCloser, error), uri, dir string) error {
 	digest, mimeType, err := blob.ParseURI(uri)
 	if err != nil || mimeType != archiveMIME || uri != sourceURI(digest) {
-		return errors.New("invalid source bundle URI")
+		return invalid("invalid source bundle URI")
 	}
 	if openBundle == nil {
 		return errors.New("source blob store unavailable")
@@ -140,24 +185,24 @@ func unpackSource(ctx context.Context, openBundle func(context.Context, []byte) 
 		return err
 	}
 	if limited.N == 0 {
-		return errors.New("source bundle exceeds size limit")
+		return invalid("source bundle exceeds size limit")
 	}
 	if !bytes.Equal(hash.Sum(nil), digest) {
-		return errors.New("source bundle checksum mismatch")
+		return invalid("source bundle checksum mismatch")
 	}
 	return nil
 }
 
 func ensureImage(ctx context.Context, imageKey []byte, executor Executor, req *EnvironmentExecution) (*Image, error) {
 	if len(imageKey) != 32 {
-		return nil, errors.New("invalid image key")
+		return nil, invalid("invalid image key")
 	}
 	currentKey, err := executor.ImageKey(req.Spec)
 	if err != nil {
-		return nil, err
+		return nil, invalid(err.Error())
 	}
 	if !bytes.Equal(imageKey, currentKey) {
-		return nil, errors.New("image recipe differs from registered environment")
+		return nil, invalid("image recipe differs from registered environment")
 	}
 	return executor.Build(ctx, req)
 }

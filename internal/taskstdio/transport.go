@@ -3,6 +3,7 @@ package taskstdio
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -99,6 +100,13 @@ func NewTransport(input io.ReadCloser, output io.WriteCloser) *Transport {
 	return t
 }
 
+// Err reports a terminal transport failure, including peer exit.
+func (t *Transport) Err() error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.err
+}
+
 func (t *Transport) send(f frame) error {
 	data, err := json.Marshal(f)
 	if err != nil {
@@ -136,7 +144,24 @@ func (t *Transport) Do(req *http.Request) (*http.Response, error) {
 	t.calls[id] = c
 	t.workers.Add(2)
 	t.mu.Unlock()
-	if err := t.send(frame{ID: id, Type: "open", Path: req.URL.Path, Headers: req.Header}); err != nil {
+	request := frame{ID: id, Type: "open", Path: req.URL.Path, Headers: req.Header}
+	if !c.requestStream {
+		body, err := io.ReadAll(io.LimitReader(req.Body, maxLine+1))
+		_ = req.Body.Close()
+		if err == nil && len(body) > maxLine {
+			err = errors.New("stdio request body exceeds limit")
+		}
+		if err != nil {
+			t.remove(id)
+			_ = reader.Close()
+			_ = writer.Close()
+			t.workers.Done()
+			t.workers.Done()
+			return nil, err
+		}
+		request.Type, request.Value = "request", body
+	}
+	if err := t.send(request); err != nil {
 		t.remove(id)
 		_ = reader.Close()
 		_ = writer.Close()
@@ -148,10 +173,14 @@ func (t *Transport) Do(req *http.Request) (*http.Response, error) {
 		defer t.workers.Done()
 		t.receiveCall(id, c, req)
 	}()
-	go func() {
-		defer t.workers.Done()
-		t.sendRequest(id, req, c.requestStream)
-	}()
+	if c.requestStream {
+		go func() {
+			defer t.workers.Done()
+			t.sendRequest(id, req)
+		}()
+	} else {
+		t.workers.Done()
+	}
 	select {
 	case result := <-c.ready:
 		return result.response, result.err
@@ -161,37 +190,25 @@ func (t *Transport) Do(req *http.Request) (*http.Response, error) {
 	}
 }
 
-func (t *Transport) sendRequest(id string, req *http.Request, stream bool) {
+func (t *Transport) sendRequest(id string, req *http.Request) {
 	defer func() { _ = req.Body.Close() }()
-	if stream {
-		for {
-			var prefix [5]byte
-			_, err := io.ReadFull(req.Body, prefix[:])
-			if errors.Is(err, io.EOF) {
-				break
-			}
-			if err != nil || prefix[0] != 0 {
-				t.cancel(id)
-				return
-			}
-			size := binary.BigEndian.Uint32(prefix[1:])
-			if size >= maxLine {
-				t.cancel(id)
-				return
-			}
-			body := make([]byte, size)
-			if _, err := io.ReadFull(req.Body, body); err != nil {
-				t.cancel(id)
-				return
-			}
-			if err := t.send(frame{ID: id, Type: "message", Value: body}); err != nil {
-				t.fail(err)
-				return
-			}
+	for {
+		var prefix [5]byte
+		_, err := io.ReadFull(req.Body, prefix[:])
+		if errors.Is(err, io.EOF) {
+			break
 		}
-	} else {
-		body, err := io.ReadAll(io.LimitReader(req.Body, maxLine))
-		if err != nil {
+		if err != nil || prefix[0] != 0 {
+			t.cancel(id)
+			return
+		}
+		size := binary.BigEndian.Uint32(prefix[1:])
+		if size >= maxLine {
+			t.cancel(id)
+			return
+		}
+		body := make([]byte, size)
+		if _, err := io.ReadFull(req.Body, body); err != nil {
 			t.cancel(id)
 			return
 		}
@@ -224,6 +241,10 @@ func (t *Transport) receiveCall(id string, c *call, req *http.Request) {
 				t.cancel(id)
 				return
 			case <-c.done:
+				f, hasFrame = c.pop()
+				if hasFrame {
+					break
+				}
 				_ = c.writer.CloseWithError(errors.New("stdio connection closed"))
 				_ = req.Body.Close()
 				return
@@ -232,6 +253,22 @@ func (t *Transport) receiveCall(id string, c *call, req *http.Request) {
 			}
 		}
 		switch f.Type {
+		case "response":
+			if started || c.requestStream {
+				return
+			}
+			started = true
+			headers := make(http.Header, len(f.Headers))
+			for key, values := range f.Headers {
+				headers[textproto.CanonicalMIMEHeaderKey(key)] = values
+			}
+			body := f.Value
+			if len(f.Error) > 0 && string(f.Error) != "null" {
+				body = f.Error
+			}
+			_ = c.reader.Close()
+			c.ready <- callResult{response: &http.Response{StatusCode: f.Status, Proto: "HTTP/2.0", ProtoMajor: 2, Header: headers, Body: io.NopCloser(bytes.NewReader(body)), Request: req}}
+			return
 		case "headers":
 			if started {
 				return
@@ -320,8 +357,16 @@ func (t *Transport) remove(id string) {
 }
 
 func (t *Transport) cancel(id string) {
+	t.mu.Lock()
+	c := t.calls[id]
+	if c == nil {
+		t.mu.Unlock()
+		return
+	}
+	delete(t.calls, id)
+	c.close()
+	t.mu.Unlock()
 	_ = t.send(frame{ID: id, Type: "cancel"})
-	t.remove(id)
 }
 
 func (t *Transport) fail(err error) {

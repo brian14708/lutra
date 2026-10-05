@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import shlex
+import uuid
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Generic, Literal, TypeVar
 
 import pyqwest
+from connectrpc.code import Code
+from connectrpc.errors import ConnectError
 from protobuf import Oneof
 
 from lutra._blob import upload_blob
@@ -28,20 +31,31 @@ from lutra._gen.lutra.v1.lutra_pb import (
     ImageSpec,
     OciCopy,
     RegisterEnvironmentRequest,
+    ResolveAwakeableRequest,
     Resources,
+    RetryRunRequest,
     Run,
+    RunDispatchFailure,
+    SignalRunRequest,
     TaskAction,
     TaskActionStatus,
     WatchRunRequest,
+    WorkflowInspectRequest,
 )
 from lutra._gen.lutra.v1.lutra_pb import ConfigBinding as WireConfigBinding
 from lutra._gen.lutra.v1.settings_connect import SettingsServiceClient
 from lutra._gen.lutra.v1.settings_pb import ListNamespacesRequest
 from lutra._result import failure_message, load_result
 from lutra._source_bundle import build_source_bundle
+from lutra._workflow import (
+    decode_signal,
+    encode_signal,
+    validate_rejection_reason,
+    validate_signal_name,
+)
 from lutra.blob import BlobStore
 from lutra.package_managers import wrap
-from lutra.task import normalize_retry
+from lutra.task import PromiseRejectedError, TaskKind, normalize_retry
 from lutra.value import dumps, loads
 
 if TYPE_CHECKING:
@@ -52,6 +66,7 @@ if TYPE_CHECKING:
     from lutra.task import Invocation, TaskEnvironment
 
 R = TypeVar("R")
+V = TypeVar("V")
 _ID_SUFFIX_LENGTH = 8
 
 
@@ -148,7 +163,8 @@ class _RunLogger:
         name = (
             self.task_name
             if self.task_name and event.action_id == self.root_action_id
-            else _entrypoint_name(self.entrypoint_names, event.entrypoint_id)
+            else event.entrypoint_name
+            or _entrypoint_name(self.entrypoint_names, event.entrypoint_id)
         )
         self.action_names[event.action_id] = name
         previous = self.actions.get(event.action_id)
@@ -324,7 +340,7 @@ def _prepare_bundle(environment: TaskEnvironment) -> _BundleInputs:
     prefix = next(output.entrypoint_prefix for output in outputs if output.entrypoint_prefix)
     root = source.bundle_root
     bundle = build_source_bundle(
-        source, tuple(task.source_file.relative_to(root) for task in environment.tasks)
+        source, tuple(task.source_file.relative_to(root) for task in environment.entries)
     )
     return _BundleInputs(
         bundle,
@@ -332,7 +348,7 @@ def _prepare_bundle(environment: TaskEnvironment) -> _BundleInputs:
             name: value for output in outputs for name, value in output.build_files.items()
         }),
         source.root.relative_to(root).as_posix(),
-        tuple(wrap((*prefix, task.entrypoint(source)), outputs) for task in environment.tasks),
+        tuple(wrap((*prefix, task.entrypoint(source)), outputs) for task in environment.entries),
         (
             "sh",
             "-c",
@@ -365,7 +381,7 @@ def _entrypoint_names(environment: TaskEnvironment) -> dict[int, str]:
         if current in visited:
             return
         visited.add(current)
-        for task in current.tasks:
+        for task in current.entries:
             candidates.setdefault(task.entrypoint_id, set()).add(task.qualname)
         for dependency in current.dependencies:
             visit(dependency)
@@ -505,6 +521,106 @@ class RunHandle(Generic[R]):
         """Request cancellation of this run."""
         await self.client.rpc.cancel_run(CancelRunRequest(id=self.id))
 
+    async def retry_submission(self) -> RunHandle[R]:
+        """Retry delivery of this run without changing its input or configuration.
+
+        Returns:
+            This run handle after Restate accepts the submission.
+
+        """
+        await self.client.rpc.retry_run(RetryRunRequest(id=self.id))
+        return self
+
+    async def signal(self, name: str, value: object, *, idempotency_key: str = "") -> None:
+        """Deliver a named one-shot value to this run's root workflow.
+
+        Delivery may precede the workflow's receive call. Reuse an idempotency
+        key when retrying delivery of the same event.
+        """
+        validate_signal_name(name)
+        await self.client.rpc.signal_run(
+            SignalRunRequest(
+                id=self.id,
+                name=name,
+                value_cbor=encode_signal(value),
+                idempotency_key=idempotency_key,
+            )
+        )
+
+    async def state_get(self, key: str, value_type: type[V]) -> V | None:
+        """Read the root workflow's state from a shared handler.
+
+        Returns:
+            The strictly typed value, or None for a missing key.
+
+        """
+        validate_signal_name(key)
+        response = await self.client.rpc.workflow_inspect(
+            WorkflowInspectRequest(
+                run_id=self.id, operation=WorkflowInspectRequest.Operation.STATE_GET, key=key
+            )
+        )
+        return await decode_signal(response.value_cbor, value_type) if response.found else None
+
+    async def state_keys(self) -> list[str]:
+        """List root workflow state keys through a shared handler.
+
+        Returns:
+            User state keys in sorted order.
+
+        """
+        response = await self.client.rpc.workflow_inspect(
+            WorkflowInspectRequest(
+                run_id=self.id, operation=WorkflowInspectRequest.Operation.STATE_KEYS
+            )
+        )
+        return response.keys
+
+    async def resolve_promise(self, name: str, value: object) -> None:
+        """Resolve a named promise on the root workflow idempotently."""
+        validate_signal_name(name)
+        await self.client.rpc.workflow_inspect(
+            WorkflowInspectRequest(
+                run_id=self.id,
+                operation=WorkflowInspectRequest.Operation.PROMISE_RESOLVE,
+                key=name,
+                value_cbor=encode_signal(value),
+            )
+        )
+
+    async def reject_promise(self, name: str, reason: str) -> None:
+        """Reject a named promise on the root workflow idempotently."""
+        validate_signal_name(name)
+        validate_rejection_reason(reason)
+        await self.client.rpc.workflow_inspect(
+            WorkflowInspectRequest(
+                run_id=self.id,
+                operation=WorkflowInspectRequest.Operation.PROMISE_REJECT,
+                key=name,
+                reason=reason,
+            )
+        )
+
+    async def peek_promise(self, name: str, value_type: type[V]) -> V | None:
+        """Read a named promise without waiting.
+
+        Returns:
+            The typed value, or None if pending or resolved with null.
+
+        Raises:
+            PromiseRejectedError: If the promise has been rejected.
+
+        """
+        validate_signal_name(name)
+        response = await self.client.rpc.workflow_inspect(
+            WorkflowInspectRequest(
+                run_id=self.id, operation=WorkflowInspectRequest.Operation.PROMISE_PEEK, key=name
+            )
+        )
+        if response.rejected:
+            raise PromiseRejectedError(response.reason)
+        return await decode_signal(response.value_cbor, value_type) if response.completed else None
+
     async def logs(
         self, stream: str = "task_log", *, after_seq: int = 0, key_prefix: bytes = b""
     ) -> AsyncIterator[LogEvent]:
@@ -549,6 +665,16 @@ class RunHandle(Generic[R]):
             )
 
 
+class SubmissionError(RuntimeError, Generic[R]):
+    """A run committed, but delivery failed. Retry with ``run.retry_submission()``."""
+
+    def __init__(self, run: RunHandle[R], idempotency_key: str) -> None:
+        """Create an error containing the committed run and its request key."""
+        super().__init__(f"run {run.id} committed but could not be submitted")
+        self.run = run
+        self.idempotency_key = idempotency_key
+
+
 class Client:
     """Submit tasks to a Lutra server and retrieve their results."""
 
@@ -562,6 +688,21 @@ class Client:
         self.namespace = namespace
         self.settings = SettingsServiceClient(url, http_client=pyqwest.Client())
         self._namespace_id: str | None = None
+
+    async def resolve_awakeable(self, awakeable_id: str, value: object) -> None:
+        """Resolve an awakeable idempotently from outside its workflow."""
+        validate_signal_name(awakeable_id)
+        await self.rpc.resolve_awakeable(
+            ResolveAwakeableRequest(id=awakeable_id, value_cbor=encode_signal(value))
+        )
+
+    async def reject_awakeable(self, awakeable_id: str, reason: str) -> None:
+        """Reject an awakeable idempotently from outside its workflow."""
+        validate_signal_name(awakeable_id)
+        validate_rejection_reason(reason)
+        await self.rpc.resolve_awakeable(
+            ResolveAwakeableRequest(id=awakeable_id, reason=reason, reject=True)
+        )
 
     async def _resolve_namespace_id(self) -> str:
         if self._namespace_id is None:
@@ -668,8 +809,9 @@ class Client:
                                 max_attempts=task.max_attempts,
                                 cache=task.cache,
                                 task_version=task.version or "" if task.cache else "",
+                                workflow=task.kind is TaskKind.WORKFLOW,
                             )
-                            for index, task in enumerate(current.tasks)
+                            for index, task in enumerate(current.entries)
                         ],
                     )
                 )
@@ -698,8 +840,16 @@ class Client:
     ) -> RunHandle[R]:
         """Submit an invocation and return a handle for its run.
 
+        A delivery failure raises SubmissionError with the committed run handle.
+        Retry its delivery with ``error.run.retry_submission()``. Explicit
+        idempotency keys also allow repeating submit after a lost response.
+
         Returns:
             A handle for the submitted run.
+
+        Raises:
+            SubmissionError: If the run committed but Restate delivery failed.
+            ConnectError: If validation or another RPC error fails.
 
         """
         _, attempts = normalize_retry(
@@ -710,14 +860,28 @@ class Client:
         action_spec = invocation.action_spec(attempts)
         if config_overrides is not None:
             action_spec.config_overrides_cbor = dumps(config_overrides)
-        result = await self.rpc.create_run(
-            CreateRunRequest(
-                environment=environment,
-                entrypoint_id=invocation.task.entrypoint_id,
-                action_spec=action_spec,
-                idempotency_key=idempotency_key,
-            )
+        key = idempotency_key or uuid.uuid4().hex
+        request = CreateRunRequest(
+            environment=environment,
+            entrypoint_id=invocation.task.entrypoint_id,
+            action_spec=action_spec,
+            idempotency_key=key,
         )
+        try:
+            result = await self.rpc.create_run(request)
+        except ConnectError as error:
+            if error.code == Code.UNAVAILABLE:
+                for detail in error.details:
+                    committed = detail.value(RunDispatchFailure)
+                    if committed is not None:
+                        handle: RunHandle[R] = RunHandle(
+                            self,
+                            committed.run_id,
+                            invocation.task.qualname,
+                            _entrypoint_names(invocation.task.environment),
+                        )
+                        raise SubmissionError(handle, key) from error
+            raise
         return RunHandle(
             self,
             _require_run(result.run).id,

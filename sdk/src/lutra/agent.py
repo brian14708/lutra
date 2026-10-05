@@ -18,9 +18,7 @@ from typing import TYPE_CHECKING, Any, Generic, Protocol, Self, TypeVar, overloa
 from lutra._context import current_context
 from lutra._gen.lutra.v1.log_pb import AppendRequest, LogEntry
 from lutra.archive import ArchiveError
-from lutra.runtime import spawn
-from lutra.task import Task
-from lutra.value import BlobRef, dumps, value_hash
+from lutra.value import BlobRef, dumps
 
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
@@ -33,7 +31,7 @@ if TYPE_CHECKING:
 
 T = TypeVar("T")
 S = TypeVar("S")
-Tool = Task[..., object] | Callable[..., Awaitable[object]]
+Tool = Callable[..., Awaitable[object]]
 _CLEANUP_SECONDS = 10
 
 
@@ -114,7 +112,7 @@ class Agent(Generic[S]):
     """Reusable configuration for independent task-scoped sessions."""
 
     def __init__(self, *, adapter: AgentAdapter[S], tools: Sequence[Tool] = ()) -> None:
-        """Register annotated async functions and Lutra tasks.
+        """Register annotated async functions that run in the session sandbox.
 
         Raises:
             TypeError: If a tool is synchronous or has an unsupported signature.
@@ -126,9 +124,9 @@ class Agent(Generic[S]):
         self._adapter = adapter
         self._tools: dict[str, _Tool] = {}
         for target in tools:
-            function = target.function if isinstance(target, Task) else target
-            if not isinstance(target, Task) and not inspect.iscoroutinefunction(function):
-                message = "agent tools must be Lutra tasks or async functions"
+            function = target
+            if not inspect.iscoroutinefunction(function):
+                message = "agent tools must be async functions running in the session sandbox"
                 raise TypeError(message)
             name = function.__name__
             if name in self._tools:
@@ -301,13 +299,7 @@ class AgentSession(Generic[S]):
         try:  # ruff: ignore[too-many-statements-in-try-clause]
             tool = self._agent._tools[name]
             validated = tool.model.model_validate(dict(arguments)).model_dump(by_alias=True)
-            if isinstance(tool.target, Task):
-                key = "agent:" + value_hash([self._id, self._turn, occurrence]).hex()
-                child = await spawn(tool.target(**validated), key=key)
-                await self.emit("tool.child", {"id": occurrence, "action_id": child.id})
-                value = await child.result()
-            else:
-                value = await tool.target(**validated)
+            value = await tool.target(**validated)
             if not isinstance(value, BlobRef):
                 json_value(value)
             result = ToolResult(value=value)

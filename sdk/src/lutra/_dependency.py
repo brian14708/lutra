@@ -159,11 +159,6 @@ class UvSource:
             "--script",
             "/workspace/lutra-runtime.py",
         ]
-        if self.dependency_groups is not None:
-            args.append("--no-default-groups")
-            args.extend(arg for group in self.dependency_groups for arg in ("--group", group))
-        if self.extras:
-            args.extend(arg for extra in self.extras for arg in ("--extra", extra))
         return tuple(args)
 
     @property
@@ -310,26 +305,12 @@ def _selected_projects(root: Path, locked: dict[str, Any], stub: bytes) -> tuple
     return projects, installable
 
 
-def _sync_inputs(  # ruff: ignore[too-many-arguments]
-    root: Path,
-    bundle_root: Path,
-    locked: dict[str, Any],
-    stub: bytes,
-    *,
-    installable: bool,
-    dependency_groups: tuple[str, ...] | None,
-    extras: tuple[str, ...] | None,
-    selected_groups: tuple[str, ...],
+def _sync_inputs(
+    root: Path, bundle_root: Path, locked: dict[str, Any], stub: bytes, *, installable: bool
 ) -> tuple[dict[str, bytes], dict[str, bytes], tuple[str, ...]]:
     locations = {location: name for name, location in _local_sources(locked)}
     # These stable image paths have no relationship to the submitter's directory.
     image_paths = {location: "local/" + name for location, name in locations.items()}
-    selectors: list[str] = []
-    if dependency_groups is not None:
-        selectors.append("--no-default-groups")
-    selectors.extend(arg for group in selected_groups for arg in ("--group", group))
-    if extras:
-        selectors.extend(arg for extra in extras for arg in ("--extra", extra))
     # Sync arguments stay structured until the manager renders its script.
     sync_args = (
         "uv",
@@ -339,7 +320,6 @@ def _sync_inputs(  # ruff: ignore[too-many-arguments]
         "--no-config",
         "--script",
         "/opt/lutra/dependencies/environment.py",
-        *selectors,
         *(
             arg
             for name in sorted(set(locations.values()))
@@ -446,14 +426,7 @@ def prepare_source(  # ruff: ignore[too-many-locals]
         }
     bundle_root, includes = _bundle_layout(root, projects, script)
     build_files, runtime_files, sync_args = _sync_inputs(
-        root,
-        bundle_root,
-        locked,
-        stub,
-        installable=installable,
-        dependency_groups=dependency_groups,
-        extras=extras,
-        selected_groups=groups,
+        root, bundle_root, locked, stub, installable=installable
     )
     build_files["uv.lock"] = original_lock
     build_files["selection.json"] = json.dumps(

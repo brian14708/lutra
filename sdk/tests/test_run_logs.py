@@ -3,18 +3,42 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from typing import TYPE_CHECKING
 
 import pytest
 from lutra._gen.lutra.v1.log_pb import LogRecord
-from lutra._gen.lutra.v1.lutra_pb import Run, WatchRunResponse
-from lutra.client import Client, LogEvent, RunHandle
+from lutra._gen.lutra.v1.lutra_pb import Run, TaskActionStatus, WatchRunResponse
+from lutra._live import LiveDisplay
+from lutra.client import Client, LogEvent, RunHandle, _RunLogger
 from lutra.value import dumps
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
 
     from lutra._gen.lutra.v1.lutra_pb import WatchRunRequest
+
+
+def test_entrypoint_names_disambiguate_child_environments(caplog: pytest.LogCaptureFixture) -> None:
+    logger = logging.getLogger("lutra-test-names")
+    writer = _RunLogger(logger, "run", "training_workflow", {1: "ambiguous"})
+    view = LiveDisplay("run", "training_workflow", {1: "ambiguous"})
+    with caplog.at_level(logging.INFO, logger=logger.name):
+        for action, name in [("training", "train"), ("evaluation", "evaluate")]:
+            event = TaskActionStatus(
+                action_id=action, entrypoint_id=1, entrypoint_name=name, status="running"
+            )
+            writer.event(event)
+            view.event(event)
+            assert writer.action_names[action] == name
+            assert view.tasks[action].name == name
+    assert "train [" in caplog.text
+    assert "evaluate [" in caplog.text
+    legacy = TaskActionStatus(action_id="legacy", entrypoint_id=2, status="running")
+    writer.event(legacy)
+    view.event(legacy)
+    assert writer.action_names["legacy"] == "entrypoint #2"
+    assert view.tasks["legacy"].name == "entrypoint #2"
 
 
 @pytest.mark.asyncio

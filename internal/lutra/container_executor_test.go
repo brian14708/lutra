@@ -85,7 +85,7 @@ func TestContainerBuildStreamsEngineOutput(t *testing.T) {
 			dir := t.TempDir()
 			engine := filepath.Join(dir, runtime)
 			script := "#!/bin/sh\ncase \"$1\" in\n" +
-				"image) exit 1 ;;\n" +
+				"image) if [ \"$3\" = \"--format\" ]; then printf 'sha256:%064d\\n' 0; else exit 1; fi ;;\n" +
 				"pull) echo 'pulling layer'; echo 'pull complete' >&2 ;;\n" +
 				"build) cat >/dev/null; echo 'building image'; echo 'build complete' >&2 ;;\n" +
 				"esac\n"
@@ -102,8 +102,12 @@ func TestContainerBuildStreamsEngineOutput(t *testing.T) {
 				Spec: &lutrav1.EnvironmentSpec{Image: &lutrav1.ImageSpec{
 					FromImage: "python:3.12-slim", BuildContextUri: uri,
 				}},
-				Stderr:     &logs,
-				PullOutput: &pullLogs,
+				Output: logSinkFunc(func(phase LogPhase) io.Writer {
+					if phase == LogPull {
+						return &pullLogs
+					}
+					return &logs
+				}),
 			})
 			if err != nil || image == nil {
 				t.Fatalf("build = %v, error = %v", image, err)
@@ -149,7 +153,7 @@ func TestCanceledContainerCreateReturnsAndCleansUp(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	done := make(chan error, 1)
 	go func() {
-		_, err := executor.Run(ctx, &Image{ArtifactURI: "container://lutra:sha-" + strings.Repeat("0", 64)}, req)
+		_, err := executor.Run(ctx, &Image{ArtifactURI: "container://sha256:" + strings.Repeat("0", 64)}, req)
 		done <- err
 	}()
 	deadline := time.After(5 * time.Second)
@@ -249,24 +253,20 @@ func testContainerBuildAndRun(t *testing.T, runtime, base string) {
 task_id = None
 for line in sys.stdin:
     frame = json.loads(line)
-    if frame.get("type") == "half_close":
+    if frame.get("type") == "request":
         task_id = frame["id"]
         print(json.dumps({"id": "p1", "type": "request", "path": "/test.Callback/Check", "headers": {"Content-Type": ["application/json"]}, "value": {}}), flush=True)
     elif frame.get("id") == "p1" and frame.get("type") == "response":
         if frame.get("status") != 200:
             raise RuntimeError("callback failed")
-        for response in (
-            {"id": task_id, "type": "headers", "status": 200, "headers": {"Content-Type": ["application/json"]}},
-            {"id": task_id, "type": "message", "value": {"contentType": "application/cbor", "output": "AQ=="}},
-            {"id": task_id, "type": "end"},
-        ):
-            print(json.dumps(response), flush=True)
+        print(json.dumps({"id": task_id, "type": "response", "status": 200, "headers": {"Content-Type": ["application/json"]}, "value": {"contentType": "application/cbor", "resultCbor": "AQ=="}}), flush=True)
 `})
 	bundles := map[string][]byte{buildURI: build, taskURI: source}
 	var callbackCalled atomic.Bool
 	executor := &ContainerExecutor{Runtime: runtime, OpenBundle: func(_ context.Context, digest []byte) (io.ReadCloser, error) {
 		return io.NopCloser(bytes.NewReader(bundles[sourceURI(digest)])), nil
 	}}
+	logs := &bytes.Buffer{}
 	request := &EnvironmentExecution{
 		Environment: &lutrav1.EnvironmentIdentifier{NamespaceId: "test", Name: "container", Version: "test"},
 		Spec: &lutrav1.EnvironmentSpec{
@@ -288,11 +288,11 @@ for line in sys.stdin:
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = io.WriteString(w, "{}")
 		}),
-		Stderr: &bytes.Buffer{},
+		Output: logSinkFunc(func(LogPhase) io.Writer { return logs }),
 	}
 	image, err := executor.Build(t.Context(), request)
 	if err != nil {
-		t.Fatalf("build: %v: %s", err, request.Stderr.(*bytes.Buffer).String())
+		t.Fatalf("build: %v: %s", err, logs.String())
 	}
 	job, err := executor.Run(t.Context(), image, request)
 	if err != nil {
@@ -304,10 +304,10 @@ for line in sys.stdin:
 	}
 	output, err := job.Wait(t.Context())
 	if err != nil || !bytes.Equal(output, []byte{1}) {
-		t.Fatalf("task output = %x, error = %v, stderr = %s", output, err, request.Stderr.(*bytes.Buffer).String())
+		t.Fatalf("task output = %x, error = %v, stderr = %s", output, err, logs.String())
 	}
-	if !strings.Contains(request.Stderr.(*bytes.Buffer).String(), "container "+job.ID()+" stopped\n") {
-		t.Fatalf("missing container stop log: %s", request.Stderr.(*bytes.Buffer).String())
+	if !strings.Contains(logs.String(), "container "+job.ID()+" stopped\n") {
+		t.Fatalf("missing container stop log: %s", logs.String())
 	}
 	if !callbackCalled.Load() {
 		t.Fatal("task callback was not handled")
@@ -316,13 +316,21 @@ for line in sys.stdin:
 		t.Fatalf("container was not removed: %v: %s", err, output)
 	}
 	tag := strings.TrimPrefix(image.ArtifactURI, "container://")
-	if output, err := exec.Command(runtime, "image", "rm", tag).CombinedOutput(); err != nil {
+	if output, err := exec.Command(runtime, "image", "rm", "--force", tag).CombinedOutput(); err != nil {
 		t.Fatalf("remove cached image: %v: %s", err, output)
 	}
+	restoredJob, err := executor.Run(t.Context(), image, request)
+	if err != nil {
+		t.Fatal("restore missing runtime image:", err)
+	}
+	if output, err := restoredJob.Wait(t.Context()); err != nil || !bytes.Equal(output, []byte{1}) {
+		t.Fatalf("restored output = %x, error = %v", output, err)
+	}
 	rebuilt, err := executor.Build(t.Context(), request)
-	if err != nil || rebuilt == nil || rebuilt.ArtifactURI != image.ArtifactURI {
+	if err != nil || rebuilt == nil {
 		t.Fatalf("rebuild missing image: %v, image = %v", err, rebuilt)
 	}
+	image = rebuilt
 	openBundle := executor.OpenBundle
 	executor.OpenBundle = func(context.Context, []byte) (io.ReadCloser, error) {
 		return nil, errors.New("cached image fetched its build context")
@@ -345,21 +353,18 @@ source = {editable = "missing"}
 	bundles[failedURI] = failedSource
 	request.Spec.SourceUri = failedURI
 	request.Spec.PrepareCommand = &lutrav1.Command{Args: []string{"uv", "sync", "--frozen", "--active", "--no-config", "--script", "/workspace/lutra-runtime.py"}}
-	failedJob, err := executor.Run(t.Context(), image, request)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := failedJob.Wait(t.Context()); err == nil {
-		t.Fatal("editable setup failure was not propagated")
-	}
-	if err := exec.Command(runtime, "container", "inspect", failedJob.ID()).Run(); err == nil {
-		t.Fatal("container with failed setup was not removed")
+	if _, err := executor.Build(t.Context(), request); err == nil {
+		t.Fatal("runtime preparation failure was not propagated")
 	}
 	hangingSource, hangingURI := containerTestBundle(t, map[string]string{"task.py": "import sys\nfor line in sys.stdin: pass\n"})
 	bundles[hangingURI] = hangingSource
 	request.Spec.SourceUri = hangingURI
 	request.Spec.PrepareCommand = &lutrav1.Command{Args: []string{"true"}}
-	hangingJob, err := executor.Run(t.Context(), image, request)
+	hangingImage, err := executor.Build(t.Context(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hangingJob, err := executor.Run(t.Context(), hangingImage, request)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -375,144 +380,6 @@ source = {editable = "missing"}
 		t.Fatalf("canceled container was not removed: %v: %s", err, output)
 	}
 }
-
-/*
-func TestContainerSourceOverlay(t *testing.T) {
-	base := os.Getenv("LUTRA_TEST_CONTAINER_BASE")
-	if base == "" {
-		t.Skip("set LUTRA_TEST_CONTAINER_BASE to run container integration tests")
-	}
-	for _, test := range []struct{ runtime, manager string }{{"docker", "uv"}, {"podman", "uv"}, {"docker", "mise"}, {"docker", "mise-python"}} {
-		runtime := test.runtime
-		t.Run(runtime+"-"+test.manager, func(t *testing.T) {
-			if err := exec.Command(runtime, "info").Run(); err != nil {
-				t.Skipf("%s unavailable: %v", runtime, err)
-			}
-			root, err := filepath.Abs("../..")
-			if err != nil {
-				t.Fatal(err)
-			}
-			temporary := t.TempDir()
-			prepare := `import json, runpy, shutil, sys
-from pathlib import Path
-from lutra.client import _prepare_bundle
-root, target = map(Path, sys.argv[1:3])
-mode = sys.argv[3]
-shutil.copytree(root / "sdk", target / "sdk", ignore=shutil.ignore_patterns("*.lock", "__pycache__"))
-script = target / "sdk/examples/hello.py"
-if mode != "uv":
-    tools = '[tools]\nnode="22.16.0"\n'
-    if mode == "mise-python":
-        tools += 'python="3.12.11"\n'
-    (script.parent / "mise.toml").write_text(tools)
-    text = script.read_text().replace('name="greetings",', 'name="greetings",\n    package_managers=(lutra.Mise(config="mise.toml"), lutra.Uv()),')
-    checks = '    import subprocess\n    from rich.console import Console\n    assert Console is not None\n    assert subprocess.check_output(["node", "--version"], text=True).strip() == "v22.16.0"\n'
-    if mode == "mise-python":
-        checks += '    import sys\n    assert sys.version_info[:3] == (3, 12, 11)\n'
-    script.write_text(text.replace('    return f"Hello, {name}!"', checks + '    return f"Hello, {name}!"'))
-for revision in ("first", "second"):
-    if revision == "second":
-        script.write_text(script.read_text().replace("Hello, {name}!", "Updated, {name}!"))
-    environment = runpy.run_path(str(script))["environment"]
-    inputs = _prepare_bundle(environment)
-    (target / (revision + ".source")).write_bytes(inputs.source)
-    (target / (revision + ".build")).write_bytes(inputs.build_context)
-    (target / (revision + ".json")).write_text(json.dumps({"workdir": inputs.workdir, "copies": [{"image": c.image, "source": c.source, "destination": c.destination} for c in inputs.oci_copies], "build_commands": inputs.build_commands, "build_env": inputs.build_env, "prepare": inputs.prepare_command, "command": inputs.entrypoints[0]}))
-`
-			command := exec.CommandContext(t.Context(), filepath.Join(root, ".venv/bin/python"), "-c", prepare, root, temporary, test.manager)
-			if output, err := command.CombinedOutput(); err != nil {
-				t.Fatalf("prepare: %v: %s", err, output)
-			}
-			bundles := map[string][]byte{}
-			load := func(name string) string {
-				contents, err := os.ReadFile(filepath.Join(temporary, name))
-				if err != nil {
-					t.Fatal(err)
-				}
-				digest := sha256.Sum256(contents)
-				uri := sourceURI(digest[:])
-				bundles[uri] = contents
-				return uri
-			}
-			buildURI := load("first.build")
-			if load("second.build") != buildURI {
-				t.Fatal("source edit changed dependency image inputs")
-			}
-			metadata, err := os.ReadFile(filepath.Join(temporary, "first.json"))
-			if err != nil {
-				t.Fatal(err)
-			}
-			var inputs struct {
-				Workdir       string             `json:"workdir"`
-				Copies        []*lutrav1.OciCopy `json:"copies"`
-				BuildCommands [][]string         `json:"build_commands"`
-				BuildEnv      map[string]string  `json:"build_env"`
-				Prepare       []string           `json:"prepare"`
-				Command       []string           `json:"command"`
-			}
-			if err := json.Unmarshal(metadata, &inputs); err != nil {
-				t.Fatal(err)
-			}
-			executor := &ContainerExecutor{Runtime: runtime, OpenBundle: func(_ context.Context, digest []byte) (io.ReadCloser, error) {
-				return io.NopCloser(bytes.NewReader(bundles[sourceURI(digest)])), nil
-			}}
-			input, err := cbor.Marshal([]any{[]any{"Lutra"}, map[string]any{}})
-			if err != nil {
-				t.Fatal(err)
-			}
-			var logs bytes.Buffer
-			req := &EnvironmentExecution{
-				Environment: &lutrav1.EnvironmentIdentifier{NamespaceId: uuid.NewString(), Name: "greetings", Version: strings.Repeat("1", 64)},
-				Spec: &lutrav1.EnvironmentSpec{
-					SourceUri: load("first.source"), Workdir: inputs.Workdir,
-					PrepareCommand: &lutrav1.Command{Args: inputs.Prepare},
-					Image:          &lutrav1.ImageSpec{Name: "container", FromImage: base, BuildContextUri: buildURI, OciCopies: inputs.Copies, BuildEnv: inputs.BuildEnv, Resources: &lutrav1.Resources{CpuMillis: 1000, MemoryBytes: 512 << 20}},
-					Entrypoints:    []*lutrav1.Entrypoint{{Command: &lutrav1.Command{Args: inputs.Command}}},
-				},
-				Input:        input,
-				EntrypointID: 1, RunID: uuid.NewString(), ActionID: uuid.NewString(), Attempt: 1, Stderr: &logs,
-			}
-			for _, args := range inputs.BuildCommands {
-				req.Spec.Image.BuildCommands = append(req.Spec.Image.BuildCommands, &lutrav1.Command{Args: args})
-			}
-			image, err := executor.Build(t.Context(), req)
-			if err != nil {
-				t.Fatalf("build: %v: %s", err, logs.String())
-			}
-			for index, want := range []string{"Hello, Lutra!", "Updated, Lutra!"} {
-				if index == 1 {
-					req.Spec.SourceUri = load("second.source")
-					open := executor.OpenBundle
-					executor.OpenBundle = func(context.Context, []byte) (io.ReadCloser, error) {
-						return nil, errors.New("source edit rebuilt dependency image")
-					}
-					cached, err := executor.Build(t.Context(), req)
-					executor.OpenBundle = open
-					if err != nil || cached.ArtifactURI != image.ArtifactURI {
-						t.Fatalf("reuse image: %v", err)
-					}
-				}
-				job, err := executor.Run(t.Context(), image, req)
-				if err != nil {
-					t.Fatal(err)
-				}
-				output, err := job.Wait(t.Context())
-				if err != nil {
-					t.Fatalf("run: %v: %s", err, logs.String())
-				}
-				if strings.Contains(logs.String(), "experimental") {
-					t.Fatalf("unexpected experimental install: %s", logs.String())
-				}
-
-				var result string
-				if err := cbor.Unmarshal(output, &result); err != nil || result != want {
-					t.Fatalf("result = %q, want %q: %v", result, want, err)
-				}
-			}
-		})
-	}
-}
-*/
 
 func TestImageKeySeparatesBuildAndRuntimeInputs(t *testing.T) {
 	uri := sourceURI(bytes.Repeat([]byte{3}, 32))
@@ -554,7 +421,7 @@ func TestImageKeySeparatesBuildAndRuntimeInputs(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(file, "/opt/lutra/bootstrap") || strings.Contains(file, "uv") {
+	if !strings.Contains(file, "WORKDIR /workspace") || strings.Contains(file, "uv") {
 		t.Fatalf("unexpected dependency recipe: %s", file)
 	}
 }

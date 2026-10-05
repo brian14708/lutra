@@ -26,6 +26,12 @@
         { pkgs, ... }:
         let
           containerRuntime = if pkgs.stdenv.hostPlatform.isLinux then "podman" else "docker";
+          restateServer = pkgs.callPackage ./nix/restate-server.nix { };
+          restateEnvironment = {
+            LUTRA_RESTATE_INGRESS = "http://127.0.0.1:8081";
+            LUTRA_RESTATE_ADMIN = "http://127.0.0.1:9070";
+            LUTRA_RESTATE_CALLBACK = "http://127.0.0.1:8080/durable";
+          };
           corsFile = pkgs.writeText "lutra-blob-cors.xml" ''
             <CORSConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
               <CORSRule>
@@ -40,16 +46,30 @@
             </CORSConfiguration>
           '';
           commonProcesses = {
+            restate = {
+              command = ''
+                export RESTATE_BASE_DIR="$(pwd)/.data/restate"
+                exec ${restateServer}/bin/restate-server --no-logo --listen-mode=tcp
+              '';
+              environment = {
+                RESTATE_NODE_NAME = "lutra";
+                RESTATE_CLUSTER_NAME = "lutra";
+                RESTATE_BIND_ADDRESS = "127.0.0.1:5122";
+                RESTATE_ADVERTISED_ADDRESS = "http://127.0.0.1:5122";
+                RESTATE_ADMIN__BIND_ADDRESS = "127.0.0.1:9070";
+                RESTATE_INGRESS__BIND_ADDRESS = "127.0.0.1:8081";
+              };
+              readiness_probe.exec.command = "${pkgs.curl}/bin/curl -fsS http://127.0.0.1:9070/health";
+            };
+
             pgsql = {
               command = ''
                 data_dir="$(pwd)/.data/postgres"
-                socket_dir="$data_dir/socket"
                 if [ ! -f "$data_dir/PG_VERSION" ]; then
                   mkdir -p "$data_dir"
                   ${pkgs.postgresql}/bin/initdb --auth=trust --no-locale -D "$data_dir"
                 fi
-                mkdir -p "$socket_dir"
-                exec ${pkgs.postgresql}/bin/postgres -D "$data_dir" -k "$socket_dir" -p 5432
+                exec ${pkgs.postgresql}/bin/postgres -D "$data_dir" -k "" -p 5432
               '';
               readiness_probe.exec.command = "${pkgs.postgresql}/bin/pg_isready -h 127.0.0.1 -p 5432 -d postgres";
             };
@@ -87,7 +107,9 @@
           };
         in
         {
-          devShells.default = pkgs.mkShell {
+          packages.restate-server = restateServer;
+
+          devShells.default = pkgs.mkShell (restateEnvironment // {
             shellHook = ''
               export DATABASE_URL="postgres://$USER@127.0.0.1:5432/postgres?sslmode=disable"
               export LUTRA_URL="http://127.0.0.1:8080/api"
@@ -101,10 +123,12 @@
               just
               process-compose
               postgresql
+              rustfs
+              minio-client
               curl
               docker-client
-            ]) ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [ pkgs.podman ];
-          };
+            ]) ++ [ restateServer ] ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [ pkgs.podman ];
+          });
 
           process-compose.dev = {
             cli.options.no-server = true;
@@ -119,14 +143,15 @@
               server = {
                 command = ''
                   export LUTRA_CONTAINER_RUNTIME="''${LUTRA_CONTAINER_RUNTIME:-${containerRuntime}}"
-                  exec go run ./cmd/server -dev-worker
+                  exec go run ./cmd/server
                 '';
                 depends_on = {
                   build.condition = "process_completed_successfully";
                   pgsql.condition = "process_healthy";
                   blob-init.condition = "process_completed_successfully";
+                  restate.condition = "process_healthy";
                 };
-                environment = commonProcesses.blob-init.environment;
+                environment = commonProcesses.blob-init.environment // restateEnvironment;
               };
             };
           };

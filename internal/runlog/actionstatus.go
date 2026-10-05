@@ -18,6 +18,7 @@ type actionStatusEvent struct {
 	ActionID       string `cbor:"action_id"`
 	CallerActionID string `cbor:"caller_action_id"`
 	EntrypointID   uint32 `cbor:"entrypoint_id"`
+	EntrypointName string `cbor:"entrypoint_name,omitempty"`
 	Status         string `cbor:"status"`
 	Attempt        int32  `cbor:"attempt"`
 	ResultCBOR     []byte `cbor:"result_cbor"`
@@ -54,7 +55,7 @@ func (s Service) DecodeActionStatus(ctx context.Context, value []byte) (*lutrav1
 	default:
 		return nil, errors.New("invalid task status event")
 	}
-	return &lutrav1.TaskActionStatus{ActionId: event.ActionID, CallerActionId: event.CallerActionID, EntrypointId: event.EntrypointID, Status: event.Status, Attempt: event.Attempt, ResultCbor: event.ResultCBOR, UpdatedAt: event.UpdatedAt, MaxAttempts: event.MaxAttempts, CacheHit: event.CacheHit}, nil
+	return &lutrav1.TaskActionStatus{ActionId: event.ActionID, CallerActionId: event.CallerActionID, EntrypointId: event.EntrypointID, EntrypointName: event.EntrypointName, Status: event.Status, Attempt: event.Attempt, ResultCbor: event.ResultCBOR, UpdatedAt: event.UpdatedAt, MaxAttempts: event.MaxAttempts, CacheHit: event.CacheHit}, nil
 }
 
 func (s Service) AppendActionStatus(ctx context.Context, tx pgx.Tx, id uuid.UUID, cacheHit bool) error {
@@ -73,11 +74,19 @@ func (s Service) AppendActionStatus(ctx context.Context, tx pgx.Tx, id uuid.UUID
 	if err := proto.Unmarshal(row.ActionSpec, &spec); err != nil {
 		return err
 	}
+	var environment lutrav1.EnvironmentSpec
+	if err := proto.Unmarshal(row.EnvironmentSpec, &environment); err != nil {
+		return err
+	}
+	if row.EntrypointID < 1 || row.EntrypointID > int64(len(environment.Entrypoints)) {
+		return errors.New("invalid action entrypoint")
+	}
+	name := environment.Entrypoints[row.EntrypointID-1].GetName()
 	mode, err := cbor.CanonicalEncOptions().EncMode()
 	if err != nil {
 		return err
 	}
-	value, err := mode.Marshal(actionStatusEvent{Type: "task.status.v2", ActionID: id.String(), CallerActionID: caller, EntrypointID: uint32(row.EntrypointID), Status: string(row.Status), Attempt: row.Attempts, ResultCBOR: row.ResultCbor, UpdatedAt: row.UpdatedAt.Time.UTC().Format(time.RFC3339Nano), MaxAttempts: spec.MaxAttempts, CacheHit: cacheHit})
+	value, err := mode.Marshal(actionStatusEvent{Type: "task.status.v2", ActionID: id.String(), CallerActionID: caller, EntrypointID: uint32(row.EntrypointID), EntrypointName: name, Status: string(row.Status), Attempt: row.Attempts, ResultCBOR: row.ResultCbor, UpdatedAt: row.UpdatedAt.Time.UTC().Format(time.RFC3339Nano), MaxAttempts: spec.MaxAttempts, CacheHit: cacheHit})
 	if err != nil {
 		return err
 	}

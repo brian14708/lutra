@@ -9,12 +9,26 @@ option go_package = "github.com/brian14708/lutra/gen/lutra/v1;lutrav1";
 service LutraService {
   rpc RegisterEnvironment(RegisterEnvironmentRequest) returns (RegisterEnvironmentResponse);
   rpc CreateRun(CreateRunRequest) returns (CreateRunResponse);
+  // Retry direct delivery of an existing run without changing its configuration.
+  rpc RetryRun(RetryRunRequest) returns (RetryRunResponse);
   rpc CreateTaskAction(CreateTaskActionRequest) returns (CreateTaskActionResponse);
   rpc GetRun(GetRunRequest) returns (GetRunResponse);
   rpc GetTaskAction(GetTaskActionRequest) returns (GetTaskActionResponse);
   rpc ListTaskActions(ListTaskActionsRequest) returns (ListTaskActionsResponse);
   rpc CancelRun(CancelRunRequest) returns (CancelRunResponse);
   rpc WatchRun(WatchRunRequest) returns (stream WatchRunResponse);
+  rpc WorkflowTimer(WorkflowTimerRequest) returns (WorkflowTimerResponse);
+  rpc WorkflowWait(WorkflowWaitRequest) returns (WorkflowWaitResponse);
+  rpc WorkflowState(WorkflowStateRequest) returns (WorkflowStateResponse);
+  rpc WorkflowPromise(WorkflowPromiseRequest) returns (WorkflowPromiseResponse);
+  rpc WorkflowAwakeable(WorkflowAwakeableRequest) returns (WorkflowAwakeableResponse);
+  rpc WorkflowEntropy(WorkflowEntropyRequest) returns (WorkflowEntropyResponse);
+  rpc WorkflowCancel(WorkflowCancelRequest) returns (WorkflowCancelResponse);
+  rpc WorkflowInspect(WorkflowInspectRequest) returns (WorkflowInspectResponse);
+  rpc ResolveAwakeable(ResolveAwakeableRequest) returns (ResolveAwakeableResponse);
+  rpc SignalRun(SignalRunRequest) returns (SignalRunResponse);
+  // Task-only callback; the destination is derived from the task identity.
+  rpc TaskSignalWorkflow(TaskSignalWorkflowRequest) returns (TaskSignalWorkflowResponse);
 }
 
 // ImageSpec declares the runtime image and its execution settings.
@@ -80,6 +94,8 @@ message Entrypoint {
   bool cache = 4;
   string task_version = 5;
   repeated ConfigBinding config = 6;
+  // Replay the entrypoint from the beginning after durable waits.
+  bool workflow = 7;
 }
 
 message ConfigBinding {
@@ -112,10 +128,22 @@ message CreateRunRequest {
   EnvironmentIdentifier environment = 1;
   uint32 entrypoint_id = 2;
   ActionSpec action_spec = 3;
+  // Reuse this key when delivery fails after the run commits.
   string idempotency_key = 4;
+}
+message RetryRunRequest {
+  string id = 1;
+}
+message RetryRunResponse {
+  Run run = 1;
 }
 message CreateRunResponse {
   Run run = 1;
+}
+// Unavailable detail after a run commits but direct Restate delivery fails.
+// Retry CreateRun using the original idempotency key, or RetryRun using this ID.
+message RunDispatchFailure {
+  string run_id = 1;
 }
 message CreateTaskActionRequest {
   EnvironmentIdentifier environment = 1;
@@ -123,9 +151,14 @@ message CreateTaskActionRequest {
   ActionSpec action_spec = 3;
   // Stable within the parent task across retries and replay.
   string idempotency_key = 4;
+  uint64 sequence = 5;
+  optional int64 delay_millis = 6;
+  // Replay-stable observability labels; not part of child execution identity.
+  map<string, string> metadata = 7;
 }
 message CreateTaskActionResponse {
   TaskAction action = 1;
+  WorkflowCommandMeta workflow_meta = 100;
 }
 message GetRunRequest {
   string id = 1;
@@ -136,7 +169,6 @@ message GetRunResponse {
 }
 message GetTaskActionRequest {
   string id = 1;
-  bool wait = 2;
 }
 message GetTaskActionResponse {
   TaskAction action = 1;
@@ -156,6 +188,179 @@ message CancelRunRequest {
 message CancelRunResponse {
   Run run = 1;
 }
+// Workflow operations use the authenticated task context to select the action.
+message WorkflowCommandMeta {
+  uint64 delivery = 1;
+  string error_code = 2;
+  string error_message = 3;
+}
+message WorkflowFuture {
+  enum Kind {
+    KIND_UNSPECIFIED = 0;
+    KIND_CHILD = 1;
+    KIND_PROMISE = 2;
+    KIND_TIMER = 3;
+    KIND_AWAKEABLE = 4;
+  }
+  Kind kind = 1;
+  string key = 2;
+  string id = 3;
+}
+message WorkflowCompletion {
+  enum Failure {
+    FAILURE_UNSPECIFIED = 0;
+    FAILURE_REJECTED = 1;
+    FAILURE_CANCELED = 2;
+    FAILURE_TIMEOUT = 3;
+    FAILURE_CHILD = 4;
+  }
+  WorkflowFuture future = 1;
+  bytes value_cbor = 2;
+  Failure failure = 3;
+  string message = 4;
+}
+message WorkflowTimerRequest {
+  uint64 sequence = 1;
+  string key = 2;
+  int64 duration_millis = 3;
+}
+message WorkflowTimerResponse {
+  WorkflowCommandMeta workflow_meta = 100;
+}
+message WorkflowWaitRequest {
+  uint64 sequence = 1;
+  repeated WorkflowFuture futures = 2;
+  bool all = 3;
+}
+message WorkflowWaitResponse {
+  repeated WorkflowCompletion completions = 1;
+  WorkflowCommandMeta workflow_meta = 100;
+}
+message WorkflowStateRequest {
+  enum Operation {
+    OPERATION_UNSPECIFIED = 0;
+    OPERATION_GET = 1;
+    OPERATION_SET = 2;
+    OPERATION_CLEAR = 3;
+    OPERATION_KEYS = 4;
+  }
+  uint64 sequence = 1;
+  Operation operation = 2;
+  string key = 3;
+  bytes value_cbor = 4;
+}
+message WorkflowStateResponse {
+  bool found = 1;
+  bytes value_cbor = 2;
+  repeated string keys = 3;
+  WorkflowCommandMeta workflow_meta = 100;
+}
+message WorkflowPromiseRequest {
+  enum Operation {
+    OPERATION_UNSPECIFIED = 0;
+    OPERATION_PEEK = 1;
+    OPERATION_RESOLVE = 2;
+    OPERATION_REJECT = 3;
+  }
+  uint64 sequence = 1;
+  Operation operation = 2;
+  string name = 3;
+  bytes value_cbor = 4;
+  string reason = 5;
+}
+message WorkflowPromiseResponse {
+  bool completed = 1;
+  bytes value_cbor = 2;
+  bool rejected = 3;
+  string reason = 4;
+  WorkflowCommandMeta workflow_meta = 100;
+}
+message WorkflowAwakeableRequest {
+  enum Operation {
+    OPERATION_UNSPECIFIED = 0;
+    OPERATION_CREATE = 1;
+    OPERATION_RESOLVE = 2;
+    OPERATION_REJECT = 3;
+  }
+  uint64 sequence = 1;
+  Operation operation = 2;
+  string key = 3;
+  string id = 4;
+  bytes value_cbor = 5;
+  string reason = 6;
+}
+message WorkflowAwakeableResponse {
+  string id = 1;
+  WorkflowCommandMeta workflow_meta = 100;
+}
+message WorkflowEntropyRequest {
+  enum Kind {
+    KIND_UNSPECIFIED = 0;
+    KIND_TIME = 1;
+    KIND_SEED = 2;
+    KIND_UUID_SEED = 3;
+  }
+  uint64 sequence = 1;
+  Kind kind = 2;
+}
+message WorkflowEntropyResponse {
+  int64 time_millis = 1;
+  bytes seed = 2;
+  WorkflowCommandMeta workflow_meta = 100;
+}
+message WorkflowCancelRequest {
+  uint64 sequence = 1;
+  string id = 2;
+}
+message WorkflowCancelResponse {
+  WorkflowCommandMeta workflow_meta = 100;
+}
+message WorkflowInspectRequest {
+  enum Operation {
+    OPERATION_UNSPECIFIED = 0;
+    OPERATION_STATE_GET = 1;
+    OPERATION_STATE_KEYS = 2;
+    OPERATION_PROMISE_PEEK = 3;
+    OPERATION_PROMISE_RESOLVE = 4;
+    OPERATION_PROMISE_REJECT = 5;
+  }
+  string run_id = 1;
+  Operation operation = 2;
+  string key = 3;
+  bytes value_cbor = 4;
+  string reason = 5;
+}
+message WorkflowInspectResponse {
+  bool found = 1;
+  bytes value_cbor = 2;
+  repeated string keys = 3;
+  bool completed = 4;
+  bool rejected = 5;
+  string reason = 6;
+  WorkflowCommandMeta workflow_meta = 100;
+}
+message ResolveAwakeableRequest {
+  string id = 1;
+  bytes value_cbor = 2;
+  string reason = 3;
+  bool reject = 4;
+}
+message ResolveAwakeableResponse {}
+// Signals are one-shot named values on the root workflow of a run.
+message SignalRunRequest {
+  string id = 1;
+  string name = 2;
+  bytes value_cbor = 3;
+  string idempotency_key = 4;
+}
+message SignalRunResponse {}
+
+message TaskSignalWorkflowRequest {
+  string name = 1;
+  bytes value_cbor = 2;
+}
+
+message TaskSignalWorkflowResponse {}
 message WatchRunRequest {
   string id = 1;
   // Optional task_log or agent cursor. Include to receive logs and child status history.
@@ -178,6 +383,8 @@ message TaskActionStatus {
   string updated_at = 7;
   int32 max_attempts = 8;
   bool cache_hit = 9;
+  // Registered name, disambiguating entrypoint IDs across environments.
+  string entrypoint_name = 10;
 }
 message Run {
   string id = 1;

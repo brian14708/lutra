@@ -7,22 +7,27 @@ import asyncio
 import base64
 import binascii
 import importlib
+import importlib.util
 import inspect
 import json
 import os
 import re
-import runpy
+import sys
 from dataclasses import replace
 from pathlib import Path
 from types import MappingProxyType
 from typing import TYPE_CHECKING
 
+from connectrpc.code import Code
+from connectrpc.errors import ConnectError
+
 from lutra._context import current_context, task_context
 from lutra._gen.lutra.v1.lutra_pb import EnvironmentIdentifier
+from lutra._result import encode_failure
 from lutra.runtime import RunContext, run_context
 from lutra.serve import TaskAPIClient, serve
 from lutra.serve._host import _redirect_user_stdout
-from lutra.task import ConfigError, RetryMode, Task
+from lutra.task import CacheableError, ConfigError, RetryMode, Task, TaskKind, TerminalError
 from lutra.value import dumps, loads
 
 if TYPE_CHECKING:
@@ -91,7 +96,14 @@ def _load_entrypoint(entrypoint: str) -> Task[..., object]:
             message = "entrypoint file must be a relative bundle path"
             raise ValueError(message)
         bundle_root = Path(os.environ.get("LUTRA_BUNDLE_ROOT", "."))
-        target: object = runpy.run_path(str(bundle_root / path), run_name="__lutra_task__")
+        spec = importlib.util.spec_from_file_location("__lutra_task__", bundle_root / path)
+        if spec is None or spec.loader is None:
+            message = "cannot load bundled task module"
+            raise ImportError(message)
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = module
+        spec.loader.exec_module(module)
+        target: object = module
     else:
         module_name, separator, qualname = entrypoint.partition(":")
         if not separator or not module_name or not qualname:
@@ -112,8 +124,11 @@ def _bundled_handler(
     environments = _load_environments()
 
     async def handler(
-        run_id: str, content_type: str, payload: bytes, api_client: TaskAPIClient
+        _invocation_id: str, content_type: str, payload: bytes, api_client: TaskAPIClient
     ) -> tuple[str, bytes]:
+        if not api_client.run_id:
+            message = "run_id is required"
+            raise ValueError(message)
         config = await _load_config()
         task_context.set(replace(current_context(), config=MappingProxyType(config)))
         target = _load_entrypoint(entrypoint)
@@ -138,20 +153,43 @@ def _bundled_handler(
             raise ValueError(message)
         args, kwargs = arguments
         token = run_context.set(
-            RunContext(api_client, environments, api_client.run_id or run_id, api_client.action_id)
+            RunContext(
+                api_client,
+                environments,
+                api_client.run_id,
+                api_client.action_id,
+                workflow=target.kind is TaskKind.WORKFLOW,
+            )
         )
         try:
-            if inspect.iscoroutinefunction(target.function):
-                result = target.function(*args, **kwargs)
-            else:
-                result = await asyncio.to_thread(target.function, *args, **kwargs)
-            if inspect.isawaitable(result):
-                result = await result
-            return "application/cbor", dumps(result)
+            return await _invoke_task(target, args, kwargs)
         finally:
             run_context.reset(token)
 
     return handler, RetryMode.NONE
+
+
+async def _invoke_task(
+    target: Task[..., object], args: list[object], kwargs: dict[str, object]
+) -> tuple[str, bytes]:
+    try:  # ruff: ignore[too-many-statements-in-try-clause] User code boundary.
+        if inspect.iscoroutinefunction(target.function):
+            result = target.function(*args, **kwargs)
+        else:
+            result = await asyncio.to_thread(target.function, *args, **kwargs)
+        if inspect.isawaitable(result):
+            result = await result
+        return "application/cbor", dumps(result)
+    except (CacheableError, ConfigError, TerminalError):
+        raise
+    except Exception as exc:
+        if isinstance(exc, ConnectError) and exc.code in {
+            Code.INTERNAL,
+            Code.UNAVAILABLE,
+            Code.UNKNOWN,
+        }:
+            raise
+        return "application/cbor", encode_failure(cacheable=False, message=str(exc))
 
 
 def main() -> None:

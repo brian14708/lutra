@@ -20,6 +20,8 @@ message ExecuteRequest {
   string run_id = 4;
   string action_id = 5;
   int32 attempt = 6;
+  // The host flushes stderr and emits this completion token before responding.
+  string output_token = 7;
 }
 
 message ExecuteResponse {

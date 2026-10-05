@@ -3,6 +3,8 @@ package lutra
 import (
 	"bytes"
 	"context"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"strings"
 	"testing"
@@ -106,7 +108,11 @@ func TestRunConfigurationSnapshot(t *testing.T) {
 	if _, err := q.CreateNamespace(ctx, db.CreateNamespaceParams{ID: namespace, Slug: "config-test", Name: "Config test"}); err != nil {
 		t.Fatal(err)
 	}
-	service := Service{DB: pool, Logs: runlog.Service{DB: pool}}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"invocationId":"inv_config"}`))
+	}))
+	defer server.Close()
+	service := Service{DB: pool, Logs: runlog.Service{DB: pool}, Durable: &DurableAdapter{Dispatch: &Dispatcher{Ingress: server.URL}}}
 	upsert := func(value string) {
 		t.Helper()
 		res, err := service.UpsertSetting(ctx, connect.NewRequest(&lutrav1.UpsertSettingRequest{NamespaceId: namespace.String(), Path: "service/token", ValueCbor: configBytes(t, value), Sensitive: true}))

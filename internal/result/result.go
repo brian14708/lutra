@@ -13,6 +13,8 @@ const MaxResultSize = 1 << 20
 
 type Failure struct {
 	Cacheable bool
+	Terminal  bool
+	Code      int
 	Message   string
 	Details   cbor.RawMessage
 }
@@ -35,9 +37,16 @@ func EncodeFailure(f Failure) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	encoded, err := mode.Marshal(cbor.Tag{Number: ErrorTag, Content: map[string]any{
+	fields := map[string]any{
 		"cacheable": f.Cacheable, "message": f.Message, "details": details,
-	}})
+	}
+	if f.Terminal {
+		if f.Cacheable || f.Code < 400 || f.Code > 599 {
+			return nil, errors.New("invalid terminal failure")
+		}
+		fields["terminal"], fields["code"] = true, f.Code
+	}
+	encoded, err := mode.Marshal(cbor.Tag{Number: ErrorTag, Content: fields})
 	if err != nil {
 		return nil, err
 	}
@@ -60,8 +69,22 @@ func DecodeFailure(encoded []byte) (Failure, bool, error) {
 		return Failure{}, true, errors.New("invalid result failure")
 	}
 	var f Failure
+	if terminal, exists := fields["terminal"]; exists {
+		if len(terminal) != 1 || (terminal[0] != 0xf4 && terminal[0] != 0xf5) {
+			return Failure{}, true, errors.New("invalid result failure terminal flag")
+		}
+		f.Terminal = terminal[0] == 0xf5
+		if f.Terminal {
+			if err := cbor.Unmarshal(fields["code"], &f.Code); err != nil || f.Code < 400 || f.Code > 599 {
+				return Failure{}, true, errors.New("invalid result failure terminal code")
+			}
+		}
+	}
 	if err := cbor.Unmarshal(fields["cacheable"], &f.Cacheable); err != nil {
 		return Failure{}, true, errors.New("invalid result failure cacheability")
+	}
+	if f.Terminal && f.Cacheable {
+		return Failure{}, true, errors.New("terminal failure cannot be cacheable")
 	}
 	if err := cbor.Unmarshal(fields["message"], &f.Message); err != nil || f.Message == "" {
 		return Failure{}, true, errors.New("invalid result failure message")

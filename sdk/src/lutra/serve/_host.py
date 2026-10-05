@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import os
 import struct
 import sys
 from contextvars import ContextVar, Token
@@ -21,10 +22,11 @@ from lutra._gen.lutra.task.v1.task_connect import TaskService, TaskServiceASGIAp
 from lutra._gen.lutra.task.v1.task_pb import ExecuteRequest, ExecuteResponse
 from lutra._gen.lutra.v1.blob_connect import BlobServiceClient
 from lutra._gen.lutra.v1.log_connect import LogServiceClient
+from lutra._gen.lutra.v1.lutra_connect import LutraServiceClient
 from lutra._result import encode_failure
 from lutra.blob import BlobStore
 from lutra.checkpoint import CheckpointManager
-from lutra.task import CacheableError, ConfigError, RetryMode
+from lutra.task import CacheableError, ConfigError, RetryMode, TerminalError
 from lutra.value import BlobRef, dumps
 
 if TYPE_CHECKING:
@@ -75,7 +77,7 @@ class _TaskService:
     def desc(cls) -> DescService:
         return TaskService.desc()
 
-    async def execute(
+    async def execute(  # ruff: ignore[complex-structure] Task outcome and execution lifecycle boundary.
         self, request: ExecuteRequest, _ctx: RequestContext[ExecuteRequest, ExecuteResponse]
     ) -> ExecuteResponse:
         if not request.invocation_id:
@@ -94,9 +96,17 @@ class _TaskService:
                 CheckpointManager(self.api_client, request.run_id, request.action_id),
                 BlobStore(self.api_client.blob),
                 log=self.api_client.log,
+                _workflow_client=self.api_client.workflow,
             )
         )
         args = (request.invocation_id, request.content_type, request.input, self.api_client)
+        previous_tasks = asyncio.all_tasks() if request.output_token else set()
+        if request.output_token:
+            os.environ.update(
+                LUTRA_TASK_RUN_ID=request.run_id,
+                LUTRA_TASK_ACTION_ID=request.action_id,
+                LUTRA_ATTEMPT=str(request.attempt),
+            )
         try:  # ruff: ignore[too-many-statements-in-try-clause]
             if inspect.iscoroutinefunction(self._handler):
                 result = self._handler(*args)
@@ -105,6 +115,9 @@ class _TaskService:
             if inspect.isawaitable(result):
                 result = await result
             content_type, output = await normalize_result(result, self.api_client)
+            background = asyncio.all_tasks() - previous_tasks if request.output_token else set()
+            for task in background:
+                task.cancel()
             return ExecuteResponse(content_type=content_type, result_cbor=output)
         except ConfigError as exc:
             return ExecuteResponse(
@@ -115,7 +128,17 @@ class _TaskService:
                 content_type="",
                 result_cbor=encode_failure(cacheable=True, message=exc.code, details=exc.details),
             )
+        except TerminalError as exc:
+            return ExecuteResponse(
+                content_type="",
+                result_cbor=encode_failure(
+                    cacheable=False, message=str(exc), terminal=True, code=exc.code
+                ),
+            )
         finally:
+            if request.output_token:
+                sys.stderr.flush()
+                os.write(2, b"\x1eLUTRA_END:" + request.output_token.encode("ascii") + b"\x1f")
             task_context.reset(context_token)
             self.api_client.reset_execution_context(run_token, action_token)
 
@@ -177,6 +200,13 @@ class TaskAPIClient:
             accept_compression=(),
             http_client=pyqwest.Client(transport=StdioTransport(self)),
         )
+        self.workflow = LutraServiceClient(
+            "http://stdio",
+            codec=proto_json_codec(),
+            send_compression=None,
+            accept_compression=(),
+            http_client=pyqwest.Client(transport=StdioTransport(self)),
+        )
 
     @property
     def run_id(self) -> str:
@@ -203,7 +233,10 @@ class TaskAPIClient:
                 "id": call_id,
                 "type": "request",
                 "path": path,
-                "headers": {"Content-Type": ["application/json"]},
+                "headers": {
+                    "Content-Type": ["application/json"],
+                    "X-Lutra-Action-ID": [self.action_id],
+                },
                 "value": value,
             })
             return await self._read_unary(queue)
@@ -261,7 +294,9 @@ class StdioTransport:
 
 
 class _Call:
-    def __init__(self, call_id: str, path: str, headers: dict[str, list[str]], host: _Host) -> None:
+    def __init__(
+        self, call_id: str, path: str, headers: dict[str, list[str]], host: _Host, *, unary: bool
+    ) -> None:
         self.id = call_id
         self.path = path
         self.headers = headers
@@ -273,11 +308,41 @@ class _Call:
         self.response_started = False
         self.ended = False
         self.status = _HTTP_OK
+        self.unary = unary
+        self.response_headers: dict[str, list[str]] = {}
 
     async def receive(self) -> dict[str, Any]:
         return await self.input.get()
 
-    async def send(self, event: dict[str, Any]) -> None:  # ruff: ignore[complex-structure]
+    async def send_unary(self, event: dict[str, Any]) -> None:
+        if event["type"] == "http.response.start":
+            self.status = event["status"]
+            for key, value in event.get("headers", []):
+                self.response_headers.setdefault(key.decode().lower(), []).append(value.decode())
+            self.response_started = True
+        elif event["type"] == "http.response.body":
+            self.buffer.extend(event.get("body", b""))
+            if len(self.buffer) >= _MAX_LINE:
+                message = "stdio response exceeds limit"
+                raise ValueError(message)
+            if not event.get("more_body"):
+                payload: dict[str, Any] = json.loads(self.buffer) if self.buffer else {}
+                await self.host.write({
+                    "id": self.id,
+                    "type": "response",
+                    "status": self.status,
+                    "headers": self.response_headers,
+                    "error" if self.status != _HTTP_OK else "value": payload,
+                })
+                self.ended = True
+
+    async def send(self, event: dict[str, Any]) -> None:
+        if self.unary:
+            await self.send_unary(event)
+        else:
+            await self.send_stream(event)
+
+    async def send_stream(self, event: dict[str, Any]) -> None:  # ruff: ignore[complex-structure]
         if event["type"] == "http.response.start":
             self.status = event["status"]
             headers: dict[str, list[str]] = {}
@@ -351,6 +416,15 @@ class _Call:
             raise
         except Exception as exc:  # ruff: ignore[blind-except]
             if not self.ended:
+                if self.unary:
+                    await self.host.write({
+                        "id": self.id,
+                        "type": "response",
+                        "status": 500,
+                        "headers": {"content-type": ["application/json"]},
+                        "error": {"code": "internal", "message": str(exc)},
+                    })
+                    return
                 if not self.response_started:
                     await self.host.write({
                         "id": self.id,
@@ -393,7 +467,32 @@ class _Host:
         _PROTOCOL_OUTPUT.write(data)
         _PROTOCOL_OUTPUT.flush()
 
-    async def dispatch(self, frame: dict[str, Any]) -> None:  # ruff: ignore[complex-structure]
+    async def open_call(self, frame: dict[str, Any]) -> None:
+        call_id = frame["id"]
+        if call_id in self.calls:
+            message = "duplicate call id"
+            raise ValueError(message)
+        path = frame.get("path")
+        headers = frame.get("headers", {})
+        if not isinstance(path, str) or not isinstance(headers, dict):
+            message = "invalid open frame"
+            raise TypeError(message)
+        headers = {key.lower(): values for key, values in headers.items()}
+        unary = frame["type"] == "request"
+        if unary and headers.get("content-type") != ["application/json"]:
+            message = "stdio requests require unary Connect JSON"
+            raise ValueError(message)
+        call = _Call(call_id, path, headers, self, unary=unary)
+        if unary:
+            await call.input.put({
+                "type": "http.request",
+                "body": json.dumps(frame["value"], separators=(",", ":")).encode(),
+                "more_body": False,
+            })
+        self.calls[call_id] = call
+        call.task = asyncio.create_task(call.run(self.app))
+
+    async def dispatch(self, frame: dict[str, Any]) -> None:
         call_id = frame.get("id")
         kind = frame.get("type")
         if not isinstance(call_id, str) or not call_id:
@@ -403,19 +502,8 @@ class _Host:
         if queue is not None:
             await queue.put(frame)
             return
-        if kind == "open":
-            if call_id in self.calls:
-                message = "duplicate call id"
-                raise ValueError(message)
-            path = frame.get("path")
-            headers = frame.get("headers", {})
-            if not isinstance(path, str) or not isinstance(headers, dict):
-                message = "invalid open frame"
-                raise ValueError(message)
-            headers = {key.lower(): values for key, values in headers.items()}
-            call = _Call(call_id, path, headers, self)
-            self.calls[call_id] = call
-            call.task = asyncio.create_task(call.run(self.app))
+        if kind in {"open", "request"}:
+            await self.open_call(frame)
         else:
             call = self.calls.get(call_id)
             if call is None:

@@ -194,7 +194,18 @@ func TestConnectModes(t *testing.T) {
 						return
 					}
 					switch f.Type {
+					case "request":
+						if mode != "unary" || string(f.Value) != `{"input":"YQ=="}` {
+							serverDone <- fmt.Errorf("unexpected unary request: %+v", f)
+							return
+						}
+						serverDone <- write(frame{ID: f.ID, Type: "response", Status: 200, Headers: http.Header{"content-type": {"application/json"}}, Value: json.RawMessage(`{"resultCbor":"YQ=="}`)})
+						return
 					case "open":
+						if mode == "unary" {
+							serverDone <- errors.New("unary call used streaming frames")
+							return
+						}
 						id = f.ID
 						contentType := "application/connect+json"
 						if mode == "unary" {
@@ -291,6 +302,65 @@ func TestConnectModes(t *testing.T) {
 				}
 			}
 			if err := <-serverDone; err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestUnaryBodyLimit(t *testing.T) {
+	fromServer, serverOutput := io.Pipe()
+	serverInput, toServer := io.Pipe()
+	defer func() { _ = serverInput.Close(); _ = serverOutput.Close() }()
+	transport := NewTransport(fromServer, toServer)
+	defer func() { _ = transport.Close() }()
+	req := httptest.NewRequest(http.MethodPost, "http://stdio/test.Service/Method", strings.NewReader(strings.Repeat(" ", maxLine+1)))
+	req.Header.Set("Content-Type", "application/json")
+	if _, err := transport.Do(req); err == nil || !strings.Contains(err.Error(), "exceeds limit") {
+		t.Fatalf("expected body limit error, got %v", err)
+	}
+}
+
+func TestUnaryErrorAndCancellation(t *testing.T) {
+	for _, cancelCall := range []bool{false, true} {
+		t.Run(fmt.Sprintf("cancel=%t", cancelCall), func(t *testing.T) {
+			fromServer, serverOutput := io.Pipe()
+			serverInput, toServer := io.Pipe()
+			transport := NewTransport(fromServer, toServer)
+			defer func() { _ = transport.Close() }()
+			defer func() { _ = serverInput.Close(); _ = serverOutput.Close() }()
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			peerDone := make(chan error, 1)
+			go func() {
+				decoder := json.NewDecoder(serverInput)
+				var request frame
+				if err := decoder.Decode(&request); err != nil {
+					peerDone <- err
+					return
+				}
+				if cancelCall {
+					cancel()
+					var canceled frame
+					err := decoder.Decode(&canceled)
+					if err == nil && (canceled.ID != request.ID || canceled.Type != "cancel") {
+						err = fmt.Errorf("unexpected cancellation: %+v", canceled)
+					}
+					peerDone <- err
+					return
+				}
+				peerDone <- json.NewEncoder(serverOutput).Encode(frame{ID: request.ID, Type: "response", Status: http.StatusBadRequest, Headers: http.Header{"Content-Type": {"application/json"}}, Error: json.RawMessage(`{"code":"invalid_argument","message":"bad input"}`)})
+			}()
+			client := connect.NewClient[taskv1.ExecuteRequest, taskv1.ExecuteResponse](transport, "http://stdio/test.Service/Method", connect.WithProtoJSON())
+			_, err := client.CallUnary(ctx, connect.NewRequest(&taskv1.ExecuteRequest{}))
+			code := connect.CodeInvalidArgument
+			if cancelCall {
+				code = connect.CodeCanceled
+			}
+			if connect.CodeOf(err) != code {
+				t.Fatalf("expected %s, got %v", code, err)
+			}
+			if err := <-peerDone; err != nil {
 				t.Fatal(err)
 			}
 		})

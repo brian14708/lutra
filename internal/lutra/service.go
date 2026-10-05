@@ -11,8 +11,9 @@ import (
 
 // Service implements the core Lutra ConnectRPC API.
 type Service struct {
-	DB   *pgxpool.Pool
-	Logs runlog.Service
+	Durable *DurableAdapter
+	DB      *pgxpool.Pool
+	Logs    runlog.Service
 }
 
 func invalid(message string) error {

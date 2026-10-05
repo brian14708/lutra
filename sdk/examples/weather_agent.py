@@ -33,8 +33,7 @@ class WeatherResult(TypedDict):
     recommendation: lutra.BlobRef
 
 
-@environment.task(cache=True, version="1.0.0")
-def forecast() -> dict[str, object]:
+async def forecast() -> dict[str, object]:  # ruff: ignore[unused-async] Agent tools use async functions.
     """Return a fictional forecast for Tokyo.
 
     Returns:
@@ -120,7 +119,7 @@ async def recommendation(report: lutra.BlobRef) -> lutra.BlobRef:
         return artifacts["recommendation.txt"]
 
 
-@environment.task
+@environment.workflow
 async def weather() -> WeatherResult:
     """Load mock weather, write a report with Codex, and get advice from Claude.
 
